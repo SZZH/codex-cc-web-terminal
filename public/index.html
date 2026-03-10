@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Web Term</title>
+    <link rel="stylesheet" href="/vendor/xterm.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <section class="view view-connect" id="view-connect">
+        <div class="connect-card">
+          <div class="brand">
+            <h1>Codex Web Term</h1>
+            <p>Connect first, then manage sessions in the workspace page.</p>
+          </div>
+          <label class="field">
+            <span>Access token</span>
+            <input id="token" type="password" placeholder="Enter token" />
+          </label>
+          <div class="actions single">
+            <button id="connect">Connect</button>
+          </div>
+          <p class="hint">After connecting, you will enter a separate workspace page for session selection and terminal control.</p>
+        </div>
+      </section>
+
+      <section class="view view-workspace hidden" id="view-workspace">
+        <aside class="session-panel hidden" id="session-panel">
+          <div class="session-panel-header">
+            <div>
+              <h2>All Sessions</h2>
+              <p>Pick a session to switch, or start a fresh Codex run.</p>
+            </div>
+            <button id="close-panel" class="ghost">Close</button>
+          </div>
+          <label class="field">
+            <span>Working directory</span>
+            <input id="cwd" type="text" placeholder="Leave blank to use your home directory" />
+          </label>
+          <label class="field">
+            <span>Session name</span>
+            <input id="session-name" type="text" placeholder="Optional label" />
+          </label>
+          <div class="actions">
+            <button id="new-session" disabled>New Session</button>
+            <button id="refresh" disabled>Refresh</button>
+          </div>
+          <div id="sessions" class="sessions"></div>
+        </aside>
+
+        <main class="main">
+          <div class="toolbar">
+            <div class="toolbar-left">
+              <button id="back-to-connect" class="ghost">Back</button>
+              <button id="open-panel" class="ghost">Sessions</button>
+            </div>
+            <div id="status">Disconnected</div>
+            <button id="close-session" disabled>Close Session</button>
+          </div>
+          <div class="terminal-shell">
+            <div id="terminal" class="terminal"></div>
+            <textarea
+              id="ime-bridge"
+              class="ime-bridge"
+              autocapitalize="off"
+              autocomplete="off"
+              autocorrect="off"
+              spellcheck="false"
+              enterkeyhint="send"
+              aria-label="Terminal input"
+            ></textarea>
+            <button id="esc-key" type="button" aria-label="Send Escape">Esc</button>
+          </div>
+        </main>
+      </section>
+    </div>
+
+    <script src="/vendor/xterm.js"></script>
+    <script src="/vendor/xterm-addon-fit.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

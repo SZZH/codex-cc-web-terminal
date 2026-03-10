@@ -1,0 +1,31 @@
+{
+  "name": "codex-web-term",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-based multi-session Codex terminal for Windows.",
+  "scripts": {
+    "start": "node ./src/server.js",
+    "check": "node --check ./src/server.js && node --check ./public/app.js",
+    "pm2:dev": "pm2 startOrReload ecosystem.config.cjs --only codex-web-term-dev --update-env",
+    "pm2:prod": "pm2 startOrReload ecosystem.config.cjs --only codex-web-term --update-env",
+    "pm2:stop": "pm2 delete codex-web-term codex-web-term-dev",
+    "pm2:status": "pm2 status",
+    "pm2:logs": "pm2 logs codex-web-term --lines 120",
+    "dev": "npm run pm2:dev",
+    "prod": "npm run pm2:prod"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "dotenv": "^17.2.3",
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.3",
+    "xterm": "^5.3.0"
+  },
+  "devDependencies": {
+    "pm2": "^6.0.8"
+  }
+}
