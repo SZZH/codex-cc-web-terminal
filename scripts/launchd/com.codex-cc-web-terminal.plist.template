@@ -3,7 +3,7 @@
 <plist version="1.0">
   <dict>
     <key>Label</key>
-    <string>com.codex-web-term</string>
+    <string>com.codex-cc-web-terminal</string>
 
     <key>ProgramArguments</key>
     <array>

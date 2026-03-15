@@ -572,6 +572,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/api/archived-sessions" && req.method === "GET") {
+    if (!isAuthorized(req)) {
+      clearAuthCookie(res);
+      unauthorized(res);
+      return;
+    }
+
+    json(res, 200, { sessions: sessionManager.listArchived() });
+    return;
+  }
+
   if (url.pathname === "/api/fs" && req.method === "GET") {
     if (!isAuthorized(req)) {
       clearAuthCookie(res);
@@ -640,6 +651,65 @@ const server = http.createServer(async (req, res) => {
 
     const id = url.pathname.split("/").at(-1);
     json(res, 200, { ok: sessionManager.close(id) });
+    return;
+  }
+
+  if (url.pathname === "/api/history-sessions/archive" && req.method === "POST") {
+    if (forbidCrossOrigin(req, res)) {
+      return;
+    }
+    if (!isAuthorized(req)) {
+      clearAuthCookie(res);
+      unauthorized(res);
+      return;
+    }
+
+    try {
+      const body = parseJson(await readBody(req));
+      const session = sessionManager.archiveHistoricalSession(body.provider, body.resumeSessionId);
+      json(res, 200, { session });
+    } catch (err) {
+      json(res, 400, { error: err?.message || String(err) });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/history-sessions/restore" && req.method === "POST") {
+    if (forbidCrossOrigin(req, res)) {
+      return;
+    }
+    if (!isAuthorized(req)) {
+      clearAuthCookie(res);
+      unauthorized(res);
+      return;
+    }
+
+    try {
+      const body = parseJson(await readBody(req));
+      const session = sessionManager.restoreHistoricalSession(body.provider, body.resumeSessionId);
+      json(res, 200, { session });
+    } catch (err) {
+      json(res, 400, { error: err?.message || String(err) });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/history-sessions" && req.method === "DELETE") {
+    if (forbidCrossOrigin(req, res)) {
+      return;
+    }
+    if (!isAuthorized(req)) {
+      clearAuthCookie(res);
+      unauthorized(res);
+      return;
+    }
+
+    try {
+      const body = parseJson(await readBody(req));
+      json(res, 200, { ok: sessionManager.deleteHistoricalSession(body.provider, body.resumeSessionId) });
+    } catch (err) {
+      json(res, 400, { error: err?.message || String(err) });
+    }
     return;
   }
 
@@ -758,7 +828,7 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(config.port, config.host, () => {
   const displayHost = config.host === "0.0.0.0" ? "localhost" : config.host;
-  console.log(`Codex Web Term listening on http://${displayHost}:${config.port}`);
+  console.log(`Codex/CC Web Terminal listening on http://${displayHost}:${config.port}`);
   console.log("Authentication: session cookie enabled");
 });
 

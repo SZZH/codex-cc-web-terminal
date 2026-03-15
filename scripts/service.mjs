@@ -10,8 +10,8 @@ const logsDir = path.join(root, "logs");
 const pm2Script = path.join(root, "node_modules", "pm2", "bin", "pm2");
 const ecosystemFile = path.join(root, "ecosystem.config.cjs");
 const appNames = {
-  prod: "codex-web-term",
-  dev: "codex-web-term-dev"
+  prod: "codex-cc-web-terminal",
+  dev: "codex-cc-web-terminal-dev"
 };
 const managedAppSet = new Set(Object.values(appNames));
 
@@ -218,7 +218,7 @@ function handleList(options) {
   }
 
   if (apps.length === 0) {
-    console.log("No codex-web-term PM2 apps found.");
+    console.log("No codex-cc-web-terminal PM2 apps found.");
     return;
   }
 

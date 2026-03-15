@@ -247,6 +247,10 @@ function customNameKey(providerId, resumeSessionId) {
   return `${String(providerId || "codex").trim()}:${String(resumeSessionId || "").trim()}`;
 }
 
+function archivedSessionKey(providerId, resumeSessionId) {
+  return customNameKey(providerId, resumeSessionId);
+}
+
 function normalizeCustomNameKey(key) {
   const text = String(key || "").trim();
   if (!text) {
@@ -391,9 +395,15 @@ export class SessionManager {
     this.sessions = new Map();
     this.providers = new Map(buildProviders(config).map((provider) => [provider.id, provider]));
     this.customNamesPath = path.join(this.config.dataDir, "session-names.json");
+    this.archivedSessionsPath = path.join(this.config.dataDir, "archived-sessions.json");
     this.customNames = new Map(
       Object.entries(readJsonFile(this.customNamesPath, {}))
         .map(([key, value]) => [normalizeCustomNameKey(key), value])
+        .filter((entry) => entry[0] && entry[1])
+    );
+    this.archivedSessions = new Map(
+      Object.entries(readJsonFile(this.archivedSessionsPath, {}))
+        .map(([key, value]) => [normalizeCustomNameKey(key), String(value || "").trim()])
         .filter((entry) => entry[0] && entry[1])
     );
     fs.mkdirSync(this.config.dataDir, { recursive: true });
@@ -436,12 +446,16 @@ export class SessionManager {
         .map((session) => this.resumeKey(session.provider, session.resumeSessionId))
         .filter(Boolean)
     );
-    const historySessions = this.listHistoricalSessions().filter((session) => {
+    const historySessions = this.listHistoricalSessions({ archived: false }).filter((session) => {
       return !liveByResumeId.has(this.resumeKey(session.provider, session.resumeSessionId));
     });
     return [...liveSessions, ...historySessions].sort((a, b) =>
       String(b.updatedAt).localeCompare(String(a.updatedAt))
     );
+  }
+
+  listArchived() {
+    return this.listHistoricalSessions({ archived: true });
   }
 
   get(id) {
@@ -656,15 +670,34 @@ export class SessionManager {
     };
   }
 
-  listHistoricalSessions() {
+  listHistoricalSessions({ archived = null } = {}) {
     return [...this.providers.values()]
-      .flatMap((provider) => this.listHistoricalSessionsForProvider(provider))
+      .flatMap((provider) => this.listHistoricalSessionsForProvider(provider, { archived }))
       .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   }
 
-  listHistoricalSessionsForProvider(provider) {
-    const files = walkJsonlFiles(provider.sessionsDir);
+  listHistoricalSessionsForProvider(provider, { archived = null } = {}) {
     const byResumeId = new Map();
+
+    for (const entry of this.scanHistoricalSessionsForProvider(provider)) {
+      const isArchived = this.isArchived(provider.id, entry.resumeSessionId);
+      if (archived !== null && isArchived !== archived) {
+        continue;
+      }
+
+      const session = this.buildHistoricalSession(provider, entry, isArchived ? "archived" : "history");
+      const existing = byResumeId.get(entry.resumeSessionId);
+      if (!existing || existing.updatedAt < session.updatedAt) {
+        byResumeId.set(entry.resumeSessionId, session);
+      }
+    }
+
+    return [...byResumeId.values()].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  }
+
+  scanHistoricalSessionsForProvider(provider) {
+    const files = walkJsonlFiles(provider.sessionsDir);
+    const entries = [];
 
     for (const filePath of files) {
       try {
@@ -728,46 +761,52 @@ export class SessionManager {
           continue;
         }
 
-        const effectivePreview = firstInput || fallbackInput || title;
-        const derivedName = deriveSessionTitle(
-          effectivePreview || title,
-          `${provider.fallbackPrefix}-${id.slice(0, 8)}`
-        );
-        const fallbackSavedName = `Saved ${path.basename(cwd || this.config.defaultCwd)} ${formatShortTimestamp(
-          stat.mtime,
-          this.config.timezone
-        )}`;
-        const finalName = isLowSignalTitle(derivedName) ? fallbackSavedName : derivedName;
-        const customName = this.getCustomName(provider.id, id);
-        const session = {
-          id: `history:${provider.id}:${id}`,
-          provider: provider.id,
-          providerLabel: provider.label,
-          cliLabel: provider.cliLabel,
-          name: customName || finalName,
+        entries.push({
+          filePath,
+          stat,
+          resumeSessionId: id,
           cwd,
-          kind: "history",
-          status: "saved",
-          createdAt: stat.birthtime.toISOString(),
-          updatedAt: stat.mtime.toISOString(),
-          exitCode: null,
-          autoNamed: false,
-          inputPreview: isLowSignalTitle(derivedName) ? "" : effectivePreview,
-          resumeSessionId: id
-        };
-
-        const existing = byResumeId.get(id);
-        if (!existing || existing.updatedAt < session.updatedAt) {
-          byResumeId.set(id, session);
-        }
+          title,
+          firstInput,
+          fallbackInput
+        });
       } catch {
         // Ignore malformed or unreadable session files.
       }
     }
 
-    return [...byResumeId.values()].sort((a, b) =>
-      String(b.updatedAt).localeCompare(String(a.updatedAt))
+    return entries;
+  }
+
+  buildHistoricalSession(provider, entry, kind = "history") {
+    const effectivePreview = entry.firstInput || entry.fallbackInput || entry.title;
+    const derivedName = deriveSessionTitle(
+      effectivePreview || entry.title,
+      `${provider.fallbackPrefix}-${entry.resumeSessionId.slice(0, 8)}`
     );
+    const fallbackSavedName = `Saved ${path.basename(entry.cwd || this.config.defaultCwd)} ${formatShortTimestamp(
+      entry.stat.mtime,
+      this.config.timezone
+    )}`;
+    const finalName = isLowSignalTitle(derivedName) ? fallbackSavedName : derivedName;
+    const customName = this.getCustomName(provider.id, entry.resumeSessionId);
+    return {
+      id: `history:${provider.id}:${entry.resumeSessionId}`,
+      provider: provider.id,
+      providerLabel: provider.label,
+      cliLabel: provider.cliLabel,
+      name: customName || finalName,
+      cwd: entry.cwd,
+      kind,
+      status: kind === "archived" ? "archived" : "saved",
+      createdAt: entry.stat.birthtime.toISOString(),
+      updatedAt: entry.stat.mtime.toISOString(),
+      exitCode: null,
+      autoNamed: false,
+      inputPreview: isLowSignalTitle(derivedName) ? "" : effectivePreview,
+      resumeSessionId: entry.resumeSessionId,
+      archivedAt: this.getArchivedAt(provider.id, entry.resumeSessionId)
+    };
   }
 
   maybeAutoRename(session, chunk) {
@@ -839,6 +878,13 @@ export class SessionManager {
     fs.writeFileSync(this.customNamesPath, JSON.stringify(payload, null, 2), "utf8");
   }
 
+  saveArchivedSessions() {
+    const payload = Object.fromEntries(
+      [...this.archivedSessions.entries()].sort((left, right) => left[0].localeCompare(right[0]))
+    );
+    fs.writeFileSync(this.archivedSessionsPath, JSON.stringify(payload, null, 2), "utf8");
+  }
+
   getCustomName(providerId, resumeSessionId) {
     const key = customNameKey(providerId, resumeSessionId);
     return this.customNames.get(key) || null;
@@ -851,6 +897,77 @@ export class SessionManager {
       this.customNames.set(key, value);
       this.saveCustomNames();
     }
+  }
+
+  removeCustomName(providerId, resumeSessionId) {
+    const key = customNameKey(providerId, resumeSessionId);
+    if (this.customNames.delete(key)) {
+      this.saveCustomNames();
+    }
+  }
+
+  isArchived(providerId, resumeSessionId) {
+    return this.archivedSessions.has(archivedSessionKey(providerId, resumeSessionId));
+  }
+
+  getArchivedAt(providerId, resumeSessionId) {
+    return this.archivedSessions.get(archivedSessionKey(providerId, resumeSessionId)) || null;
+  }
+
+  setArchived(providerId, resumeSessionId, archivedAt = nowIso()) {
+    const key = archivedSessionKey(providerId, resumeSessionId);
+    this.archivedSessions.set(key, archivedAt);
+    this.saveArchivedSessions();
+  }
+
+  clearArchived(providerId, resumeSessionId) {
+    const key = archivedSessionKey(providerId, resumeSessionId);
+    if (this.archivedSessions.delete(key)) {
+      this.saveArchivedSessions();
+    }
+  }
+
+  getHistoricalSession(providerId, resumeSessionId, { archived = null } = {}) {
+    const provider = this.getProvider(providerId);
+    return this.listHistoricalSessionsForProvider(provider, { archived }).find(
+      (session) => session.resumeSessionId === String(resumeSessionId || "").trim()
+    ) || null;
+  }
+
+  archiveHistoricalSession(providerId, resumeSessionId) {
+    const session = this.getHistoricalSession(providerId, resumeSessionId, { archived: false });
+    if (!session) {
+      throw new Error(`Historical session not found: ${providerId}/${resumeSessionId}`);
+    }
+
+    this.setArchived(providerId, resumeSessionId);
+    return this.getHistoricalSession(providerId, resumeSessionId, { archived: true });
+  }
+
+  restoreHistoricalSession(providerId, resumeSessionId) {
+    const session = this.getHistoricalSession(providerId, resumeSessionId, { archived: true });
+    if (!session) {
+      throw new Error(`Archived session not found: ${providerId}/${resumeSessionId}`);
+    }
+
+    this.clearArchived(providerId, resumeSessionId);
+    return this.getHistoricalSession(providerId, resumeSessionId, { archived: false });
+  }
+
+  deleteHistoricalSession(providerId, resumeSessionId) {
+    const provider = this.getProvider(providerId);
+    const targetId = String(resumeSessionId || "").trim();
+    const entries = this.scanHistoricalSessionsForProvider(provider).filter((entry) => entry.resumeSessionId === targetId);
+    if (!entries.length) {
+      throw new Error(`Historical session not found: ${providerId}/${resumeSessionId}`);
+    }
+
+    for (const entry of entries) {
+      fs.rmSync(entry.filePath, { force: true });
+    }
+    this.clearArchived(providerId, resumeSessionId);
+    this.removeCustomName(providerId, resumeSessionId);
+    return true;
   }
 
   resumeKey(providerId, resumeSessionId) {

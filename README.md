@@ -1,4 +1,4 @@
-# Codex Web Term
+# Codex/CC Web Terminal
 
 Browser-based multi-session terminal for running native `codex` and `cc`/`claude` on your Windows or macOS machine.
 
@@ -92,7 +92,7 @@ npm run service:start:dev
 
 - `stop` only stops the service. It does not restart it.
 - `restart` waits for `/api/health` before returning.
-- `list` shows the managed `codex-web-term` PM2 apps without the extra health output from `status`.
+- `list` shows the managed `codex-cc-web-terminal` PM2 apps without the extra health output from `status`.
 - `scripts/service.mjs` is the shared implementation used by both Windows and macOS.
 - On Windows, `service.ps1`, `start.ps1`, `stop.ps1`, `restart.ps1`, `status.ps1`, and `logs.ps1` still exist as thin wrappers if you prefer PowerShell.
 
@@ -130,7 +130,7 @@ npm run service:resurrect
   - install the agent with `npm run launchd:install`
   - verify it with `npm run launchd:list`
   - remove it with `npm run launchd:uninstall`
-  - the installer renders `scripts/launchd/com.codex-web-term.plist.template` into `~/Library/LaunchAgents/com.codex-web-term.plist` using the current Node executable and repo path
+  - the installer renders `scripts/launchd/com.codex-cc-web-terminal.plist.template` into `~/Library/LaunchAgents/com.codex-cc-web-terminal.plist` using the current Node executable and repo path
 
 ## Session Behavior
 
