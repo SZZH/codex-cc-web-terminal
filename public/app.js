@@ -1,795 +1,252 @@
-const term = new window.Terminal({
-  cursorBlink: false,
-  convertEol: true,
-  customGlyphs: false,
-  fontSize: 14,
-  fontFamily: '"Cascadia Mono", Consolas, monospace',
-  scrollback: 5000,
-  smoothScrollDuration: 0,
-  theme: {
-    background: "#111318",
-    foreground: "#f3f4f6",
-    selectionBackground: "#3b82f655",
-    selectionInactiveBackground: "#3b82f633"
+let createApp;
+let computed;
+let nextTick;
+let onMounted;
+let reactive;
+let ref;
+let watch;
+
+async function resolveVueRuntime() {
+  if (window.Vue?.createApp) {
+    return window.Vue;
   }
-});
 
-const fitAddon = new window.FitAddon.FitAddon();
-term.loadAddon(fitAddon);
-term.open(document.getElementById("terminal"));
-fitAddon.fit();
+  try {
+    const moduleRuntime = await import("/vendor/vue.js");
+    if (moduleRuntime?.createApp) {
+      return moduleRuntime;
+    }
+    if (moduleRuntime?.default?.createApp) {
+      return moduleRuntime.default;
+    }
+  } catch (error) {
+    console.warn("dynamic Vue import failed", error);
+  }
 
-const tokenInput = document.getElementById("token");
-const cwdInput = document.getElementById("cwd");
-const nameInput = document.getElementById("session-name");
-const providerSelect = document.getElementById("session-provider");
-const connectButton = document.getElementById("connect");
-const newSessionButton = document.getElementById("new-session");
-const closeSessionButton = document.getElementById("close-session");
-const cwdPickerRoot = document.getElementById("cwd-picker");
-const cwdPickerMetaRoot = document.getElementById("cwd-picker-meta");
-const cwdPickerListRoot = document.getElementById("cwd-picker-list");
-const browseUpButton = document.getElementById("browse-up");
-const syncBrowserPathButton = document.getElementById("sync-browser-path");
-const sessionsRoot = document.getElementById("sessions");
-const sessionHistoryToolbarRoot = document.getElementById("session-history-toolbar");
-const homeStatusRoot = document.getElementById("home-status");
-const browserCurrentRoot = document.getElementById("browser-current");
-const directoryTreeRoot = document.getElementById("directory-tree");
-const activeSessionNameRoot = document.getElementById("active-session-name");
-const editSessionNameButton = document.getElementById("edit-session-name");
-const sessionNameEditorRoot = document.getElementById("session-name-editor");
-const sessionNameInlineInput = document.getElementById("session-name-inline");
-const saveSessionNameButton = document.getElementById("save-session-name");
-const cancelSessionNameButton = document.getElementById("cancel-session-name");
-const activeSessionMetaRoot = document.getElementById("active-session-meta");
-const activeSessionProviderRoot = document.getElementById("active-session-provider");
-const viewConnect = document.getElementById("view-connect");
-const viewWorkspace = document.getElementById("view-workspace");
-const workspaceHome = document.getElementById("workspace-home");
-const workspaceTerminal = document.getElementById("workspace-terminal");
-const terminalTopbar = workspaceTerminal?.querySelector(".terminal-topbar");
-const sessionPanel = document.getElementById("session-panel");
-const panelBackdrop = document.getElementById("panel-backdrop");
-const openPanelButton = document.getElementById("open-panel");
-const closePanelButton = document.getElementById("close-panel");
-const backToConnectButton = document.getElementById("back-to-connect");
-const backToSessionsButton = document.getElementById("back-to-sessions");
-const terminalRoot = document.getElementById("terminal");
-const mobileComposer = document.getElementById("mobile-composer");
-const imeBridge = document.getElementById("ime-bridge");
-const composerEscButton = document.getElementById("composer-esc");
-const composerSendButton = document.getElementById("composer-send");
-const escKeyButton = document.getElementById("esc-key");
-const copyTerminalButton = document.getElementById("copy-terminal");
-const pasteTerminalButton = document.getElementById("paste-terminal");
-const clipboardSheet = document.getElementById("clipboard-sheet");
-const clipboardTitle = document.getElementById("clipboard-title");
-const clipboardHint = document.getElementById("clipboard-hint");
-const clipboardBuffer = document.getElementById("clipboard-buffer");
-const clipboardPrimaryButton = document.getElementById("clipboard-primary");
-const clipboardCloseButton = document.getElementById("clipboard-close");
+  if (window.Vue?.createApp) {
+    return window.Vue;
+  }
 
-let accessToken = "";
-let activeSessionId = "";
-let activeSession = null;
-let socket = null;
-let sessions = [];
-let reconnectTimer = null;
-let isManualDisconnect = false;
-const ignoredSocketEvents = new WeakSet();
-let isAuthenticated = false;
-let pendingOutput = "";
-let outputFrame = null;
-let viewportFrame = null;
-let keyboardWasOpen = false;
-let imeComposing = false;
-let clipboardMode = "";
-let latestStatus = "Disconnected";
-let mobileComposerValue = "";
-let defaultCwd = "";
-let displayTimezone = "Australia/Melbourne";
-let displayTimeFormatter = null;
-let displayCardTimeFormatter = null;
-let cwdPickerRequestId = 0;
-let editingSessionName = false;
-let defaultProvider = "codex";
-let providerCatalog = [
-  { id: "codex", label: "Codex", cliLabel: "Codex CLI", historyLabel: "Saved Codex sessions" },
-  { id: "cc", label: "Claude", cliLabel: "Claude CLI", historyLabel: "Saved Claude sessions" }
+  await new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "/vendor/vue.js";
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+
+  if (window.Vue?.createApp) {
+    return window.Vue;
+  }
+
+  throw new Error("Vue runtime failed to load");
+}
+
+const GENERIC_TITLES = new Set(["codex", "claude", "session", "会话", "untitled workspace"]);
+const TITLE_NOISE_PATTERNS = [
+  /^saved\b/i,
+  /^-\s/,
+  /若必须做较大重构/,
+  /accessibility override/i,
+  /auth-required override/i,
+  /automatic routing rule/i,
+  /global instructions/i,
+  /approval policy/i,
+  /filesystem sandboxing/i,
+  /current user accessibility context/i,
+  /environment_context/i,
+  /AGENTS\.md/i
 ];
-let historyProviderFilter = "";
-let browserState = {
-  path: "",
-  parentPath: "",
-  entries: [],
-  totalEntries: 0,
-  truncated: false
+const PREVIEW_FALLBACK = {
+  history: "恢复这个 Codex 会话",
+  live: "继续当前会话"
 };
 
-const useImeBridge = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
-const enableMobileComposer = false;
-document.documentElement.classList.toggle("touch-input-mode", useImeBridge);
-document.documentElement.classList.toggle("mobile-composer-disabled", !enableMobileComposer);
+let historyApiAvailable = null;
 
-function getDisplayTimeFormatter() {
-  if (!displayTimeFormatter) {
-    displayTimeFormatter = new Intl.DateTimeFormat("en-AU", {
-      timeZone: displayTimezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-      timeZoneName: "short"
-    });
-  }
-  return displayTimeFormatter;
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-function getDisplayCardTimeFormatter() {
-  if (!displayCardTimeFormatter) {
-    displayCardTimeFormatter = new Intl.DateTimeFormat("en-AU", {
-      timeZone: displayTimezone,
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false
-    });
-  }
-  return displayCardTimeFormatter;
+function stripAnsi(value) {
+  return String(value || "")
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b[@-_]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
 }
 
-function getProviderInfo(providerId) {
-  return (
-    providerCatalog.find((provider) => provider.id === providerId) ||
-    providerCatalog[0] || {
-      id: providerId || "codex",
-      label: String(providerId || "codex").toUpperCase(),
-      cliLabel: "CLI",
-      historyLabel: "Saved sessions"
+function normalizeLine(value) {
+  return stripAnsi(value)
+    .replace(/\t/g, "  ")
+    .replace(/\u0000/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function filterTerminalNoise(value) {
+  const lines = stripAnsi(value)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n");
+
+  const filtered = lines.filter((line) => {
+    const text = line.trim();
+    if (!text) {
+      return false;
     }
-  );
-}
-
-function applyProviderCatalog(nextProviders = []) {
-  const availableProviders = Array.isArray(nextProviders) && nextProviders.length ? nextProviders : providerCatalog;
-  providerCatalog = availableProviders.map((provider) => ({
-    id: provider.id,
-    label: provider.label,
-    cliLabel: provider.cliLabel,
-    historyLabel: provider.historyLabel
-  }));
-
-  const currentValue = providerSelect.value || defaultProvider;
-  providerSelect.innerHTML = "";
-  for (const provider of providerCatalog) {
-    const option = document.createElement("option");
-    option.value = provider.id;
-    option.textContent = provider.label;
-    providerSelect.appendChild(option);
-  }
-
-  const preferredValue = providerCatalog.some((provider) => provider.id === currentValue)
-    ? currentValue
-    : providerCatalog[0]?.id || "codex";
-  providerSelect.value = preferredValue;
-}
-
-function clearReconnectTimer() {
-  if (reconnectTimer) {
-    window.clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-}
-
-function normalizeTextForTerminalPaste(value) {
-  return String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
-
-function getSessionInterruptConfig() {
-  if (activeSession?.provider === "cc") {
-    return {
-      label: "Interrupt",
-      composerLabel: "Stop",
-      ariaLabel: "Interrupt Claude",
-      data: "\u0003"
-    };
-  }
-
-  return {
-    label: "Esc",
-    composerLabel: "Esc",
-    ariaLabel: "Send Escape",
-    data: "\u001b"
-  };
-}
-
-function formatTextForSessionPaste(value) {
-  const normalized = normalizeTextForTerminalPaste(value);
-  if (activeSession?.provider === "cc") {
-    return `\u001b[200~${normalized}\u001b[201~`;
-  }
-  return normalized.replace(/\n/g, "\r");
-}
-
-function updateInterruptButtons() {
-  const control = getSessionInterruptConfig();
-  escKeyButton.textContent = control.label;
-  escKeyButton.setAttribute("aria-label", control.ariaLabel);
-  composerEscButton.textContent = control.composerLabel;
-  composerEscButton.setAttribute("aria-label", control.ariaLabel);
-}
-
-function sendInterruptControl() {
-  sendToSession(getSessionInterruptConfig().data);
-}
-
-function readTerminalBufferText() {
-  const buffer = term.buffer.active;
-  const lines = [];
-  let currentLine = "";
-  let hasLine = false;
-
-  for (let index = 0; index < buffer.length; index += 1) {
-    const line = buffer.getLine(index);
-    if (!line) {
-      continue;
+    if (/codex\s+resume/i.test(text)) {
+      return false;
     }
-
-    const text = line.translateToString(true);
-    if (!hasLine) {
-      currentLine = text;
-      hasLine = true;
-      continue;
+    if (/dangerously-bypass-approvals-and-sandbox/i.test(text)) {
+      return false;
     }
-
-    if (line.isWrapped) {
-      currentLine += text;
-      continue;
+    if (/--no-alt-screen/i.test(text)) {
+      return false;
     }
-
-    lines.push(currentLine);
-    currentLine = text;
-  }
-
-  if (hasLine) {
-    lines.push(currentLine);
-  }
-
-  return lines.join("\n");
-}
-
-function closeClipboardSheet({ restoreFocus = true } = {}) {
-  clipboardMode = "";
-  clipboardSheet.classList.add("hidden");
-  clipboardSheet.setAttribute("aria-hidden", "true");
-  clipboardBuffer.value = "";
-  clipboardBuffer.readOnly = false;
-
-  if (!restoreFocus) {
-    return;
-  }
-
-  if (useImeBridge) {
-    focusImeBridge();
-    return;
-  }
-
-  term.focus();
-}
-
-function openClipboardSheet(mode) {
-  clipboardMode = mode;
-  blurImeBridge();
-  clipboardSheet.classList.remove("hidden");
-  clipboardSheet.setAttribute("aria-hidden", "false");
-
-  if (mode === "copy") {
-    const text = readTerminalBufferText();
-    if (!text.trim()) {
-      closeClipboardSheet({ restoreFocus: false });
-      setStatus("No terminal output available to copy.");
-      return;
+    if (/^➜/.test(text) || /^%$/.test(text) || /^>$/.test(text)) {
+      return false;
     }
-
-    clipboardTitle.textContent = "Copy Terminal Text";
-    clipboardHint.textContent = "Long-press below to select any part of the terminal output.";
-    clipboardPrimaryButton.textContent = "Copy All";
-    clipboardBuffer.readOnly = true;
-    clipboardBuffer.value = text;
-  } else {
-    clipboardTitle.textContent = "Paste Into Terminal";
-    clipboardHint.textContent = "Long-press inside the box, paste text, then send it to the terminal.";
-    clipboardPrimaryButton.textContent = "Send to Terminal";
-    clipboardBuffer.readOnly = false;
-    clipboardBuffer.value = "";
-  }
-
-  window.requestAnimationFrame(() => {
-    clipboardBuffer.focus({ preventScroll: true });
-    const length = clipboardBuffer.value.length;
-    clipboardBuffer.setSelectionRange(length, length);
-    if (mode === "copy") {
-      clipboardBuffer.scrollTop = clipboardBuffer.scrollHeight;
-    }
+    return true;
   });
+
+  return filtered.join("\n");
 }
 
-async function handleClipboardPrimaryAction() {
-  if (clipboardMode === "copy") {
-    clipboardBuffer.focus({ preventScroll: true });
-    clipboardBuffer.select();
-    try {
-      if (window.isSecureContext && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(clipboardBuffer.value);
-        setStatus("Terminal text copied.");
-      } else {
-        setStatus("Text selected. Use your browser copy action.");
-      }
-    } catch {
-      setStatus("Text selected. Use your browser copy action.");
-    }
-    return;
-  }
+function compactLine(value) {
+  return normalizeLine(value).replace(/\s+/g, " ").trim();
+}
 
-  const text = clipboardBuffer.value;
+function clampText(value, max = 54) {
+  const text = compactLine(value);
   if (!text) {
-    setStatus("Paste text into the box first.");
-    return;
-  }
-
-  sendToSession(formatTextForSessionPaste(text));
-  closeClipboardSheet();
-  scrollTerminalToLatest();
-  setStatus("Clipboard text sent to terminal.");
-}
-
-function flushPendingOutput() {
-  outputFrame = null;
-  if (!pendingOutput) {
-    return;
-  }
-
-  term.write(pendingOutput);
-  pendingOutput = "";
-  if (keyboardWasOpen) {
-    scrollTerminalToLatest();
-  }
-}
-
-function queueTerminalOutput(chunk) {
-  if (!chunk) {
-    return;
-  }
-
-  pendingOutput += chunk;
-  if (outputFrame === null) {
-    outputFrame = window.requestAnimationFrame(flushPendingOutput);
-  }
-}
-
-function scrollTerminalToLatest({ ensureVisible = false } = {}) {
-  window.requestAnimationFrame(() => {
-    if (ensureVisible) {
-      terminalRoot.scrollIntoView({
-        block: "end",
-        inline: "nearest"
-      });
-    }
-
-    term.scrollToBottom?.();
-    const viewport = terminalRoot.querySelector(".xterm-viewport");
-    if (viewport) {
-      viewport.scrollTop = viewport.scrollHeight;
-    }
-  });
-}
-
-function lockRootScrollPosition() {
-  if (!useImeBridge || !document.documentElement.classList.contains("terminal-layer-mode")) {
-    return;
-  }
-
-  const scrollingRoot = document.scrollingElement;
-  if (scrollingRoot) {
-    scrollingRoot.scrollTop = 0;
-    scrollingRoot.scrollLeft = 0;
-  }
-  window.scrollTo(0, 0);
-}
-
-function deferRootScrollLock() {
-  if (!useImeBridge || !document.documentElement.classList.contains("terminal-layer-mode")) {
-    return;
-  }
-
-  window.requestAnimationFrame(() => {
-    lockRootScrollPosition();
-  });
-}
-
-function setComposerExpanded(expanded) {
-  if (!enableMobileComposer) {
-    workspaceTerminal.classList.remove("composer-active");
-    return;
-  }
-  workspaceTerminal.classList.toggle("composer-active", Boolean(expanded));
-}
-
-function syncTerminalChromeBounds() {
-  if (!workspaceTerminal) {
-    return;
-  }
-
-  if (!useImeBridge || !document.documentElement.classList.contains("terminal-layer-mode")) {
-    workspaceTerminal.style.removeProperty("--terminal-header-height");
-    workspaceTerminal.style.removeProperty("--terminal-composer-height");
-    return;
-  }
-
-  const headerHeight = Math.ceil(terminalTopbar?.getBoundingClientRect().height || 0);
-  const composerHeight = enableMobileComposer
-    ? Math.ceil(mobileComposer?.getBoundingClientRect().height || 0)
-    : 0;
-  const headerOffset = headerHeight > 0 ? headerHeight + 6 : 0;
-  const composerOffset = composerHeight > 0 ? composerHeight + 6 : 0;
-  workspaceTerminal.style.setProperty("--terminal-header-height", `${headerOffset}px`);
-  workspaceTerminal.style.setProperty("--terminal-composer-height", `${composerOffset}px`);
-
-  if (!workspaceTerminal.classList.contains("hidden")) {
-    window.requestAnimationFrame(() => {
-      syncTerminalSize();
-    });
-  }
-}
-
-function syncComposerLayout() {
-  if (!useImeBridge || !enableMobileComposer) {
-    return;
-  }
-
-  imeBridge.style.height = "0px";
-  const minHeight = workspaceTerminal.classList.contains("composer-active") ? 84 : 44;
-  const nextHeight = Math.min(140, Math.max(minHeight, imeBridge.scrollHeight || 0));
-  imeBridge.style.height = `${nextHeight}px`;
-  syncTerminalChromeBounds();
-}
-
-function resetImeBridge() {
-  imeBridge.value = "";
-  mobileComposerValue = "";
-  imeComposing = false;
-  syncComposerLayout();
-}
-
-function focusImeBridge() {
-  if (!useImeBridge || !hasLiveSession()) {
-    return;
-  }
-
-  setComposerExpanded(true);
-  imeBridge.focus({ preventScroll: true });
-  const length = imeBridge.value.length;
-  imeBridge.setSelectionRange(length, length);
-  syncComposerLayout();
-}
-
-function blurImeBridge() {
-  if (!useImeBridge) {
-    return;
-  }
-
-  imeBridge.blur();
-  if (!imeBridge.value) {
-    setComposerExpanded(false);
-  }
-}
-
-function syncImeBridgeValue() {
-  if (imeComposing) {
-    return;
-  }
-
-  const nextValue = String(imeBridge.value || "").replace(/\r/g, "");
-  if (imeBridge.value !== nextValue) {
-    imeBridge.value = nextValue;
-  }
-
-  if (nextValue === mobileComposerValue) {
-    syncComposerLayout();
-    return;
-  }
-
-  if (nextValue.startsWith(mobileComposerValue)) {
-    sendToSession(nextValue.slice(mobileComposerValue.length));
-  } else if (mobileComposerValue.startsWith(nextValue)) {
-    sendToSession("\u007f".repeat(mobileComposerValue.length - nextValue.length));
-  } else {
-    if (mobileComposerValue.length) {
-      sendToSession("\u007f".repeat(mobileComposerValue.length));
-    }
-    if (nextValue) {
-      sendToSession(nextValue);
-    }
-  }
-
-  mobileComposerValue = nextValue;
-  syncComposerLayout();
-  scrollTerminalToLatest();
-}
-
-function submitImeBridge() {
-  if (!hasLiveSession()) {
-    setStatus("Open a session first.");
-    return;
-  }
-
-  syncImeBridgeValue();
-  sendToSession("\r");
-  resetImeBridge();
-  blurImeBridge();
-  requestViewportMetrics();
-  scrollTerminalToLatest();
-}
-
-function flushImeBridgeValue() {
-  syncImeBridgeValue();
-}
-
-function applyViewportMetrics() {
-  viewportFrame = null;
-  const viewport = window.visualViewport;
-  const viewportHeight = Math.round(viewport?.height || window.innerHeight);
-  const keyboardInset = Math.max(0, window.innerHeight - viewportHeight);
-  const keyboardOpen = keyboardInset > 120;
-  document.documentElement.style.setProperty("--vvh", `${viewportHeight}px`);
-  document.documentElement.style.setProperty("--keyboard-inset", `${keyboardInset}px`);
-  document.documentElement.classList.toggle("keyboard-open", keyboardOpen);
-  if (keyboardOpen) {
-    deferRootScrollLock();
-  }
-  if (useImeBridge) {
-    if (keyboardOpen) {
-      setComposerExpanded(true);
-    } else if (!imeBridge.matches(":focus") && !imeBridge.value) {
-      setComposerExpanded(false);
-    }
-    syncComposerLayout();
-  }
-  syncTerminalSize();
-  if (keyboardOpen) {
-    scrollTerminalToLatest();
-  }
-  keyboardWasOpen = keyboardOpen;
-}
-
-function requestViewportMetrics() {
-  if (viewportFrame !== null) {
-    return;
-  }
-
-  viewportFrame = window.requestAnimationFrame(applyViewportMetrics);
-}
-
-function hasLiveSession() {
-  return Boolean(socket && socket.readyState === WebSocket.OPEN && activeSessionId);
-}
-
-function setView(name) {
-  const workspace = name === "workspace";
-  viewConnect.classList.toggle("hidden", workspace);
-  viewWorkspace.classList.toggle("hidden", !workspace);
-}
-
-function setWorkspaceScreen(name) {
-  const terminal = name === "terminal";
-  workspaceHome.classList.toggle("hidden", terminal);
-  workspaceTerminal.classList.toggle("hidden", !terminal);
-  document.documentElement.classList.toggle("terminal-layer-mode", terminal && useImeBridge);
-  if (!terminal) {
-    setComposerExpanded(false);
-  }
-  deferRootScrollLock();
-  syncTerminalChromeBounds();
-  syncComposerLayout();
-}
-
-function setPanelOpen(open) {
-  sessionPanel.classList.toggle("open", open);
-  panelBackdrop.classList.toggle("hidden", !open);
-  sessionPanel.setAttribute("aria-hidden", String(!open));
-  document.body.classList.toggle("panel-open", open);
-}
-
-function updateInputControls() {
-  const enabled = hasLiveSession();
-  updateInterruptButtons();
-  escKeyButton.disabled = !enabled;
-  imeBridge.disabled = !enabled;
-  composerEscButton.disabled = !enabled || !enableMobileComposer;
-  composerSendButton.disabled = !enabled || !enableMobileComposer;
-  copyTerminalButton.disabled = !activeSessionId;
-  pasteTerminalButton.disabled = !enabled;
-  closeSessionButton.disabled = !activeSessionId;
-  editSessionNameButton.disabled = !activeSessionId;
-
-  if (!enabled) {
-    resetImeBridge();
-    blurImeBridge();
-    setComposerExpanded(false);
-    clearReconnectTimer();
-    editingSessionName = false;
-    sessionNameEditorRoot.classList.add("hidden");
-  }
-}
-
-function setStatus(text) {
-  latestStatus = String(text || "").trim() || "Disconnected";
-  if (homeStatusRoot) {
-    homeStatusRoot.textContent = latestStatus;
-  }
-  updateWorkspaceSummary();
-}
-
-function headers() {
-  return {
-    "Content-Type": "application/json"
-  };
-}
-
-function formatTime(value) {
-  try {
-    return getDisplayTimeFormatter().format(new Date(value));
-  } catch {
-    return value || "";
-  }
-}
-
-function formatCardTime(value) {
-  try {
-    return getDisplayCardTimeFormatter().format(new Date(value));
-  } catch {
-    return value || "";
-  }
-}
-
-function humanFileSize(bytes) {
-  if (!Number.isFinite(bytes) || bytes < 0) {
     return "";
   }
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${Math.round(bytes / 102.4) / 10} KB`;
-  }
-  return `${Math.round(bytes / 104857.6) / 10} MB`;
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…` : text;
 }
 
-async function copyText(text, fallbackStatus) {
-  const value = String(text || "");
+function createMessage(role, text, timestamp = "", extra = {}) {
+  return {
+    id: `${role}-${timestamp || Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    role,
+    text: normalizeLine(text),
+    timestamp,
+    ...extra
+  };
+}
+
+function workspaceName(cwd) {
+  const parts = String(cwd || "")
+    .split("/")
+    .filter(Boolean);
+  return parts[parts.length - 1] || String(cwd || "").trim() || "未命名项目";
+}
+
+function isInstructionLike(value) {
+  const text = compactLine(value);
+  if (!text) {
+    return true;
+  }
+  return TITLE_NOISE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function isLowSignalTitle(title, session) {
+  const text = compactLine(title);
+  if (!text) {
+    return true;
+  }
+  if (GENERIC_TITLES.has(text.toLowerCase())) {
+    return true;
+  }
+  if (TITLE_NOISE_PATTERNS.some((pattern) => pattern.test(text))) {
+    return true;
+  }
+  const folder = workspaceName(session?.cwd).toLowerCase();
+  return text.toLowerCase() === folder;
+}
+
+function normalizeHistoryMessages(messages) {
+  return (messages || [])
+    .map((item) => {
+      const role = item?.role === "user" ? "user" : "assistant";
+      const text = normalizeLine(item?.text || "");
+      if (!text || isInstructionLike(text)) {
+        return null;
+      }
+      return createMessage(role, text, item?.timestamp || "", { source: "history" });
+    })
+    .filter(Boolean);
+}
+
+function pickRealTitle(messages, fallback, session) {
+  const firstUser = messages.find((message) => message.role === "user" && !isInstructionLike(message.text));
+  if (firstUser?.text) {
+    return clampText(firstUser.text, 36);
+  }
+  if (!isLowSignalTitle(fallback, session)) {
+    return clampText(fallback, 36);
+  }
+  return clampText(fallback || workspaceName(session?.cwd), 36) || workspaceName(session?.cwd);
+}
+
+function pickPreview(messages, session, title) {
+  const assistant = messages.find((message) => message.role === "assistant" && !isInstructionLike(message.text));
+  const userFollowup = messages.find((message) => message.role === "user" && clampText(message.text, 52) !== title);
+  const candidate = assistant?.text || userFollowup?.text || session?.inputPreview || "";
+  return clampText(candidate, 58) || PREVIEW_FALLBACK[session?.kind] || "继续这个会话";
+}
+
+function fallbackTitleForSession(session) {
+  if (!isLowSignalTitle(session?.name, session)) {
+    return clampText(session.name, 36);
+  }
+
+  if (!isLowSignalTitle(session?.inputPreview, session)) {
+    return clampText(session.inputPreview, 36);
+  }
+
+  if (session?.kind === "history") {
+    return "历史会话";
+  }
+  return clampText(session?.name || session?.providerLabel || "当前会话", 36) || "当前会话";
+}
+
+function fallbackPreviewForSession(session) {
+  if (!isLowSignalTitle(session?.inputPreview, session)) {
+    return clampText(session.inputPreview, 58);
+  }
+  if (!isLowSignalTitle(session?.name, session)) {
+    return clampText(session.name, 58);
+  }
+  return PREVIEW_FALLBACK[session?.kind] || "继续这个会话";
+}
+
+function formatRelativeTime(value) {
   if (!value) {
-    return false;
+    return "";
+  }
+  const parsed = new Date(value).getTime();
+  if (Number.isNaN(parsed)) {
+    return "";
   }
 
-  try {
-    if (window.isSecureContext && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(value);
-      return true;
-    }
-  } catch {
-    // Fallback to selection-based copy below.
+  const diff = Date.now() - parsed;
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  const week = 7 * day;
+
+  if (diff < hour) {
+    return `${Math.max(1, Math.round(diff / minute))} 分钟前`;
   }
-
-  clipboardTitle.textContent = "Copy Path";
-  clipboardHint.textContent = "Select the path below and use your browser copy action.";
-  clipboardPrimaryButton.textContent = "Select All";
-  clipboardMode = "copy";
-  clipboardSheet.classList.remove("hidden");
-  clipboardSheet.setAttribute("aria-hidden", "false");
-  clipboardBuffer.readOnly = true;
-  clipboardBuffer.value = value;
-
-  window.requestAnimationFrame(() => {
-    clipboardBuffer.focus({ preventScroll: true });
-    clipboardBuffer.select();
-  });
-
-  if (fallbackStatus) {
-    setStatus(fallbackStatus);
+  if (diff < day) {
+    return `${Math.max(1, Math.round(diff / hour))} 小时前`;
   }
-  return false;
-}
-
-function updateWorkspaceSummaryLegacy() {
-  return;
-
-  if (activeSession) {
-    const parts = [activeSession.status || "unknown"];
-    if (activeSession.cwd) {
-      parts.push(activeSession.cwd);
-    }
-    activeSessionMetaRoot.textContent = parts.join(" · ");
-  } else {
-    activeSessionMetaRoot.textContent = "Connect, then open a session.";
+  if (diff < week) {
+    return `${Math.max(1, Math.round(diff / day))} 天前`;
   }
-
-  browserPillRoot.textContent = browserState.path || "Not loaded";
-}
-
-function openSessionNameEditor() {
-  if (!activeSessionId || !activeSession) {
-    return;
-  }
-
-  editingSessionName = true;
-  sessionNameInlineInput.value = activeSession.name || "";
-  sessionNameEditorRoot.classList.remove("hidden");
-  window.requestAnimationFrame(() => {
-    sessionNameInlineInput.focus({ preventScroll: true });
-    sessionNameInlineInput.select();
-  });
-}
-
-function closeSessionNameEditor() {
-  editingSessionName = false;
-  sessionNameEditorRoot.classList.add("hidden");
-  sessionNameInlineInput.value = "";
-}
-
-function updateWorkspaceSummary() {
-  activeSessionProviderRoot.textContent = activeSession?.cliLabel || getProviderInfo(providerSelect.value).cliLabel || "CLI";
-  activeSessionNameRoot.textContent = activeSession?.name || "No active session";
-  sessionNameEditorRoot.classList.toggle("hidden", !editingSessionName);
-
-  if (activeSession) {
-    const parts = [];
-    if (latestStatus) {
-      parts.push(latestStatus);
-    }
-    if (activeSession.status && activeSession.status !== latestStatus) {
-      parts.push(activeSession.status);
-    }
-    if (activeSession.cwd) {
-      parts.push(activeSession.cwd);
-    }
-    activeSessionMetaRoot.textContent = parts.join(" | ");
-    return;
-  }
-
-  activeSessionMetaRoot.textContent = "Open a session to start.";
-}
-
-async function renameActiveSession() {
-  if (!activeSessionId) {
-    return;
-  }
-
-  const nextName = String(sessionNameInlineInput.value || "").trim();
-  if (!nextName) {
-    setStatus("Enter a session name.");
-    sessionNameInlineInput.focus({ preventScroll: true });
-    return;
-  }
-
-  try {
-    const payload = await request(`/api/sessions/${activeSessionId}`, {
-      method: "PATCH",
-      body: JSON.stringify({ name: nextName })
-    });
-    const updatedSession = payload.session;
-    sessions = sessions.map((session) => (session.id === updatedSession.id ? updatedSession : session));
-    activeSession = updatedSession;
-    renderSessions();
-    closeSessionNameEditor();
-    updateWorkspaceSummary();
-    setStatus(`Session renamed to ${updatedSession.name}`);
-  } catch (err) {
-    setStatus(err.message || String(err));
-  }
+  return `${Math.max(1, Math.round(diff / week))} 周前`;
 }
 
 async function request(url, options = {}) {
@@ -797,1100 +254,527 @@ async function request(url, options = {}) {
     ...options,
     credentials: "same-origin",
     headers: {
-      ...(options.headers || {}),
-      ...headers()
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {})
     }
   });
 
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
-    if (response.status === 401) {
-      isAuthenticated = false;
-    }
     throw new Error(payload.error || response.statusText);
   }
 
   return response.json();
 }
 
-async function loginWithToken(token) {
-  await request("/api/login", {
-    method: "POST",
-    body: JSON.stringify({ token })
-  });
-  isAuthenticated = true;
-}
-
-async function logoutSession() {
-  try {
-    await request("/api/logout", { method: "POST" });
-  } catch {
-    // Ignore logout failures during local UI reset.
-  }
-  isAuthenticated = false;
-}
-
-function buildSectionLabel(text) {
-  const label = document.createElement("div");
-  label.className = "session-section-label";
-  label.textContent = text;
-  return label;
-}
-
-function buildSectionHead(text, extraNode = null) {
-  const head = document.createElement("div");
-  head.className = "session-section-head";
-  head.appendChild(buildSectionLabel(text));
-  if (extraNode) {
-    head.appendChild(extraNode);
-  }
-  return head;
-}
-
-function buildEmptyState(title, description) {
-  const empty = document.createElement("div");
-  empty.className = "session-empty";
-
-  const heading = document.createElement("h3");
-  heading.textContent = title;
-  empty.appendChild(heading);
-
-  const body = document.createElement("p");
-  body.textContent = description;
-  empty.appendChild(body);
-  return empty;
-}
-
-function buildBadge(text, extraClass = "") {
-  const badge = document.createElement("span");
-  badge.className = `session-badge${extraClass ? ` ${extraClass}` : ""}`;
-  badge.textContent = text;
-  return badge;
-}
-
-function getHistoryProviderFilter(savedSessions) {
-  const availableProviders = providerCatalog.filter((provider) =>
-    savedSessions.some((session) => session.provider === provider.id)
-  );
-  if (!availableProviders.length) {
-    historyProviderFilter = "";
-    return "";
-  }
-
-  if (historyProviderFilter && availableProviders.some((provider) => provider.id === historyProviderFilter)) {
-    return historyProviderFilter;
-  }
-
-  if (activeSession?.provider && availableProviders.some((provider) => provider.id === activeSession.provider)) {
-    historyProviderFilter = activeSession.provider;
-    return historyProviderFilter;
-  }
-
-  historyProviderFilter = availableProviders[0].id;
-  return historyProviderFilter;
-}
-
-function buildHistoryToggle(savedSessions) {
-  const availableProviders = providerCatalog.filter((provider) =>
-    savedSessions.some((session) => session.provider === provider.id)
-  );
-  if (availableProviders.length <= 1) {
+async function requestHistoryMessages(session) {
+  if (!session?.resumeSessionId || historyApiAvailable === false) {
     return null;
   }
 
-  const currentFilter = getHistoryProviderFilter(savedSessions);
-  const toggle = document.createElement("div");
-  toggle.className = "session-history-toggle";
+  const params = new URLSearchParams({
+    provider: session.provider,
+    resumeSessionId: session.resumeSessionId
+  });
 
-  for (const provider of availableProviders) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `ghost session-history-toggle-button${provider.id === currentFilter ? " active" : ""}`;
-    button.textContent = provider.label;
-    button.addEventListener("click", () => {
-      historyProviderFilter = provider.id;
-      renderSessions();
+  const response = await fetch(`/api/history-messages?${params.toString()}`, {
+    credentials: "same-origin"
+  });
+
+  if (response.status === 404) {
+    historyApiAvailable = false;
+    return null;
+  }
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(payload.error || response.statusText);
+  }
+
+  historyApiAvailable = true;
+  return response.json();
+}
+
+async function bootstrapApp() {
+  const vueRuntime = await resolveVueRuntime();
+  ({ createApp, computed, nextTick, onMounted, reactive, ref, watch } = vueRuntime);
+
+  createApp({
+  setup() {
+    const messageListRef = ref(null);
+    const composerRef = ref(null);
+    const sessionCache = reactive({});
+    const state = reactive({
+      ready: false,
+      isAuthenticated: false,
+      accessToken: "",
+      statusText: "",
+      sessions: [],
+      view: "list",
+      activeSessionId: "",
+      activeLiveSessionId: "",
+      activeSessionMeta: null,
+      activeMessages: [],
+      activeSocket: null,
+      activeStreamBuffer: "",
+      draft: "",
+      pendingSessionId: "",
     });
-    toggle.appendChild(button);
-  }
 
-  return toggle;
-}
+    const pendingHydrations = new Map();
 
-function renderSessions() {
-  sessionsRoot.innerHTML = "";
-  if (sessionHistoryToolbarRoot) {
-    sessionHistoryToolbarRoot.innerHTML = "";
-    sessionHistoryToolbarRoot.classList.add("hidden");
-  }
-  const liveSessions = sessions.filter((session) => session.kind === "live");
-  const savedSessions = sessions.filter((session) => session.kind === "history");
-
-  if (!sessions.length) {
-    sessionsRoot.appendChild(
-      buildEmptyState(
-        "No sessions yet",
-        "Create a new session here. If the name is blank, the first prompt will become the title."
-      )
-    );
-    return;
-  }
-
-  if (liveSessions.length) {
-    sessionsRoot.appendChild(buildSectionLabel("Live"));
-    for (const session of liveSessions) {
-      sessionsRoot.appendChild(buildSessionCard(session));
-    }
-  }
-
-  if (savedSessions.length) {
-    const currentFilter = getHistoryProviderFilter(savedSessions);
-    const toggle = buildHistoryToggle(savedSessions);
-    const provider = getProviderInfo(currentFilter);
-    const filteredHistory = savedSessions.filter((session) => session.provider === currentFilter);
-    sessionsRoot.appendChild(buildSectionHead("History", toggle));
-    if (!filteredHistory.length) {
-      sessionsRoot.appendChild(
-        buildEmptyState(`No saved ${provider.label} sessions`, "Switch providers or create a new session.")
-      );
-      return;
+    function cacheKey(session) {
+      return session?.kind === "history"
+        ? `history:${session.provider}:${session.resumeSessionId}`
+        : `live:${session?.id || "unknown"}`;
     }
 
-    for (const session of filteredHistory) {
-      sessionsRoot.appendChild(buildSessionCard(session));
+    function decorateSession(session) {
+      const cache = sessionCache[cacheKey(session)] || {};
+      const displayTitle = cache.title || fallbackTitleForSession(session);
+      const displayPreview = cache.preview || fallbackPreviewForSession(session);
+      return {
+        ...session,
+        displayTitle,
+        displayPreview,
+        groupName: workspaceName(session.cwd)
+      };
     }
-  }
-}
 
-function buildCompactSessionMeta(text, extraClass = "") {
-  const item = document.createElement("p");
-  item.className = `session-meta-line compact${extraClass ? ` ${extraClass}` : ""}`;
+    const groupedSessions = computed(() => {
+      const groups = new Map();
+      for (const session of state.sessions.map(decorateSession)) {
+        if (!groups.has(session.groupName)) {
+          groups.set(session.groupName, []);
+        }
+        groups.get(session.groupName).push(session);
+      }
 
-  const body = document.createElement("span");
-  body.className = "session-meta-value";
-  body.textContent = text || "--";
-  item.appendChild(body);
+      return [...groups.entries()]
+        .map(([name, sessions]) => ({
+          name,
+          sessions: [...sessions].sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+        }))
+        .sort((left, right) => String(right.sessions[0]?.updatedAt || "").localeCompare(String(left.sessions[0]?.updatedAt || "")));
+    });
 
-  return item;
-}
+    const activeSessionTitle = computed(() => {
+      if (!state.activeSessionMeta) {
+        return "会话";
+      }
+      const cached = sessionCache[cacheKey(state.activeSessionMeta)] || {};
+      return cached.title || state.activeSessionMeta.displayTitle || state.activeSessionMeta.name || "会话";
+    });
 
-function buildSessionCard(session) {
-  const card = document.createElement("button");
-  const isCurrent = session.kind === "live" && session.id === activeSessionId;
-  card.className = `session-card${isCurrent ? " active" : ""}`;
+    const activeWorkspaceName = computed(() => workspaceName(state.activeSessionMeta?.cwd || ""));
+    const activeAssistantName = computed(() => state.activeSessionMeta?.providerLabel || "Codex");
+    const canSend = computed(() => Boolean(state.draft.trim()));
 
-  const head = document.createElement("div");
-  head.className = "session-card-head";
-
-  const title = document.createElement("h3");
-  title.textContent = session.name;
-  head.appendChild(title);
-
-  const badgeRow = document.createElement("div");
-  badgeRow.className = "session-badge-row";
-  badgeRow.appendChild(buildBadge(session.providerLabel || getProviderInfo(session.provider).label, "ghost-badge"));
-  if (isCurrent) {
-    badgeRow.appendChild(buildBadge("Current"));
-  }
-  if (session.kind === "history") {
-    badgeRow.appendChild(buildBadge("Saved", "ghost-badge"));
-  }
-  head.appendChild(badgeRow);
-  card.appendChild(head);
-
-  if (session.inputPreview) {
-    const preview = document.createElement("p");
-    preview.className = "session-preview";
-    preview.textContent = session.inputPreview;
-    card.appendChild(preview);
-  }
-
-  const metaGrid = document.createElement("div");
-  metaGrid.className = "session-meta-grid";
-  const summaryParts = [];
-  if (session.status) {
-    summaryParts.push(session.status);
-  }
-  if (session.updatedAt) {
-    summaryParts.push(formatCardTime(session.updatedAt));
-  }
-  if (summaryParts.length) {
-    metaGrid.appendChild(buildCompactSessionMeta(summaryParts.join(" · ")));
-  }
-  if (session.cwd) {
-    metaGrid.appendChild(buildCompactSessionMeta(session.cwd, "session-meta-path"));
-  }
-  card.appendChild(metaGrid);
-
-  card.addEventListener("click", () => activateSessionFromList(session));
-  return card;
-}
-
-function buildSessionMeta(label, value) {
-  const item = document.createElement("p");
-  item.className = "session-meta-line";
-
-  const caption = document.createElement("span");
-  caption.className = "session-meta-label";
-  caption.textContent = `${label}: `;
-  item.appendChild(caption);
-
-  const body = document.createElement("span");
-  body.className = "session-meta-value";
-  /*
-  body.textContent = value || "—";
-  item.appendChild(body);
-  */
-  body.textContent = value || "--";
-  item.appendChild(body);
-
-  return item;
-}
-
-async function activateSessionFromList(session) {
-  if (session.kind === "history") {
-    try {
-      const payload = await request("/api/sessions", {
-        method: "POST",
-        body: JSON.stringify({
-          provider: session.provider,
-          cwd: session.cwd,
-          name: session.name,
-          resumeSessionId: session.resumeSessionId
-        })
+    function scrollMessagesToBottom() {
+      nextTick(() => {
+        const el = messageListRef.value;
+        if (el) {
+          el.scrollTop = el.scrollHeight;
+        }
       });
-      await refreshSessions();
-      await openSession(payload.session.id);
-      await loadDirectory(session.cwd);
-    } catch (err) {
-      setStatus(err.message || String(err));
-    }
-    return;
-  }
-
-  await openSession(session.id);
-  await loadDirectory(session.cwd);
-}
-
-async function refreshSessions() {
-  const payload = await request("/api/sessions");
-  sessions = payload.sessions || [];
-  activeSession = sessions.find((session) => session.id === activeSessionId) || activeSession;
-  if (activeSessionId && !sessions.some((session) => session.id === activeSessionId)) {
-    activeSession = null;
-    activeSessionId = "";
-  }
-  renderSessions();
-  updateWorkspaceSummary();
-  updateInputControls();
-}
-
-function syncTerminalSize() {
-  fitAddon.fit();
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(
-      JSON.stringify({
-        type: "resize",
-        cols: term.cols,
-        rows: term.rows
-      })
-    );
-  }
-}
-
-function disconnectSocket() {
-  clearReconnectTimer();
-  if (socket) {
-    const currentSocket = socket;
-    socket = null;
-    ignoredSocketEvents.add(currentSocket);
-    currentSocket.close();
-  }
-  updateInputControls();
-}
-
-function scheduleReconnect(sessionId = activeSessionId) {
-  const targetSessionId = String(sessionId || "").trim();
-  if (!targetSessionId || !isAuthenticated || document.hidden || reconnectTimer || hasLiveSession()) {
-    return;
-  }
-
-  reconnectTimer = window.setTimeout(async () => {
-    reconnectTimer = null;
-    if (
-      !targetSessionId ||
-      !isAuthenticated ||
-      document.hidden ||
-      hasLiveSession() ||
-      activeSessionId !== targetSessionId
-    ) {
-      return;
     }
 
-    try {
-      await connectToSession(targetSessionId, { resetTerminal: true, allowReconnect: true });
-    } catch (err) {
-      setStatus(err.message || String(err));
-      scheduleReconnect(targetSessionId);
-    }
-  }, 600);
-}
-
-async function connectToSession(sessionId, { resetTerminal = true, allowReconnect = false } = {}) {
-  clearReconnectTimer();
-  if (socket) {
-    const currentSocket = socket;
-    socket = null;
-    ignoredSocketEvents.add(currentSocket);
-    currentSocket.close();
-  }
-
-  activeSessionId = sessionId;
-  activeSession = sessions.find((session) => session.id === sessionId) || activeSession;
-  closeSessionNameEditor();
-  renderSessions();
-  updateWorkspaceSummary();
-  setWorkspaceScreen("terminal");
-  setPanelOpen(false);
-
-  if (resetTerminal) {
-    pendingOutput = "";
-    if (outputFrame !== null) {
-      window.cancelAnimationFrame(outputFrame);
-      outputFrame = null;
-    }
-    term.reset();
-  }
-
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(
-    `${protocol}://${window.location.host}/ws?sessionId=${encodeURIComponent(sessionId)}`
-  );
-  socket = ws;
-
-  ws.addEventListener("open", async () => {
-    setStatus("connected");
-    syncTerminalSize();
-    if (!useImeBridge) {
-      term.focus();
-    }
-    updateInputControls();
-    await refreshSessions();
-  });
-
-  ws.addEventListener("message", async (event) => {
-    const payload = JSON.parse(event.data);
-    if (payload.type === "snapshot") {
-      activeSession = payload.session || activeSession;
-      updateWorkspaceSummary();
-      queueTerminalOutput(payload.buffer || "");
-      scrollTerminalToLatest();
-      setStatus(payload.session.status || "running");
-      return;
-    }
-    if (payload.type === "data") {
-      queueTerminalOutput(payload.data || "");
-      return;
-    }
-    if (payload.type === "exit") {
-      setStatus(`exited ${payload.exitCode}`);
-      await refreshSessions();
-      return;
-    }
-    if (payload.type === "error") {
-      setStatus(payload.error || "Session error");
-    }
-  });
-
-  ws.addEventListener("close", () => {
-    if (ignoredSocketEvents.has(ws)) {
-      return;
-    }
-    if (socket === ws) {
-      socket = null;
-    }
-    setStatus("disconnected");
-    updateInputControls();
-    if (!isManualDisconnect && allowReconnect) {
-      scheduleReconnect(sessionId);
-    }
-  });
-
-  ws.addEventListener("error", () => {
-    if (ignoredSocketEvents.has(ws)) {
-      return;
-    }
-    if (!isManualDisconnect && allowReconnect) {
-      scheduleReconnect(sessionId);
-    }
-  });
-}
-
-async function openSession(sessionId) {
-  isManualDisconnect = false;
-  await connectToSession(sessionId, { resetTerminal: true, allowReconnect: true });
-  await loadDirectory(activeSession?.cwd || "");
-}
-
-function sendToSession(data) {
-  if (!hasLiveSession()) {
-    setStatus("Open a session first.");
-    return;
-  }
-
-  socket.send(JSON.stringify({ type: "input", data }));
-}
-
-function buildDirectoryEntry(entry) {
-  const item = document.createElement("button");
-  item.type = "button";
-  item.className = `directory-entry ${entry.type}`;
-
-  const icon = document.createElement("span");
-  icon.className = "directory-icon";
-  icon.textContent = entry.type === "directory" ? "DIR" : "FILE";
-  item.appendChild(icon);
-
-  const copy = document.createElement("div");
-  copy.className = "directory-copy";
-
-  const name = document.createElement("strong");
-  name.textContent = entry.name;
-  copy.appendChild(name);
-
-  const meta = document.createElement("span");
-  if (entry.type === "directory") {
-    meta.textContent = entry.path;
-  } else {
-    const sizeText = humanFileSize(entry.size);
-    meta.textContent = sizeText ? `${sizeText} · ${entry.path}` : entry.path;
-  }
-  copy.appendChild(meta);
-  item.appendChild(copy);
-
-  item.addEventListener("click", async () => {
-    if (entry.type === "directory") {
-      await loadDirectory(entry.path);
-      return;
+    function autoGrowComposer() {
+      const el = composerRef.value;
+      if (!el) {
+        return;
+      }
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
     }
 
-    const copied = await copyText(entry.path, "Path selected. Use your browser copy action.");
-    if (copied) {
-      setStatus(`Copied ${entry.path}`);
-      return;
-    }
-    setStatus(entry.path);
-  });
-
-  return item;
-}
-
-function renderDirectoryBrowser() {
-  directoryTreeRoot.innerHTML = "";
-
-  if (!browserState.path) {
-    directoryTreeRoot.appendChild(
-      buildEmptyState("No folder loaded", "Open a session first, then use the menu to browse files.")
-    );
-    updateWorkspaceSummary();
-    return;
-  }
-
-  const summary = document.createElement("div");
-  summary.className = "directory-summary";
-  summary.textContent = browserState.truncated
-    ? `Showing first ${browserState.entries.length} of ${browserState.totalEntries} entries.`
-    : `${browserState.totalEntries} entries`;
-  directoryTreeRoot.appendChild(summary);
-
-  if (!browserState.entries.length) {
-    directoryTreeRoot.appendChild(
-      buildEmptyState("This folder is empty", "Go up one level or sync back to the session directory.")
-    );
-    updateWorkspaceSummary();
-    return;
-  }
-
-  for (const entry of browserState.entries) {
-    directoryTreeRoot.appendChild(buildDirectoryEntry(entry));
-  }
-
-  updateWorkspaceSummary();
-}
-
-function closeCwdPicker() {
-  cwdPickerRoot.classList.add("hidden");
-  cwdPickerRoot.setAttribute("aria-hidden", "true");
-}
-
-function openCwdPicker() {
-  cwdPickerRoot.classList.remove("hidden");
-  cwdPickerRoot.setAttribute("aria-hidden", "false");
-}
-
-function normalizeDirectoryInput(value) {
-  const trimmed = String(value || "").trim();
-  if (!trimmed) {
-    return "";
-  }
-  if (/^[A-Za-z]:[\\/]?$/.test(trimmed)) {
-    return `${trimmed[0]}:\\`;
-  }
-  return trimmed;
-}
-
-function splitDirectoryInput(value) {
-  const candidate = normalizeDirectoryInput(value);
-  if (!candidate) {
-    return { path: "", prefix: "" };
-  }
-  if (/^[A-Za-z]:\\$/.test(candidate) || candidate === "\\" || candidate === "/") {
-    return { path: candidate, prefix: "" };
-  }
-
-  const normalized = candidate.replace(/[\\/]+$/, "");
-  const slashIndex = Math.max(normalized.lastIndexOf("\\"), normalized.lastIndexOf("/"));
-  if (slashIndex < 0) {
-    return { path: normalized, prefix: "" };
-  }
-
-  let pathValue = normalized.slice(0, slashIndex);
-  if (/^[A-Za-z]:$/.test(pathValue)) {
-    pathValue = `${pathValue}\\`;
-  }
-  return {
-    path: pathValue,
-    prefix: normalized.slice(slashIndex + 1)
-  };
-}
-
-function buildCwdPickerItem(label, pathValue, action) {
-  const item = document.createElement("button");
-  item.type = "button";
-  item.className = "cwd-picker-item";
-
-  const title = document.createElement("strong");
-  title.textContent = label;
-  item.appendChild(title);
-
-  const meta = document.createElement("span");
-  meta.textContent = pathValue;
-  item.appendChild(meta);
-
-  item.addEventListener("click", async () => {
-    cwdInput.value = pathValue;
-    await action(pathValue);
-  });
-
-  return item;
-}
-
-async function requestDirectoryPayload(pathValue) {
-  const targetPath = String(pathValue || "").trim();
-  const query = targetPath ? `?path=${encodeURIComponent(targetPath)}` : "";
-  return request(`/api/fs${query}`);
-}
-
-function renderCwdPickerEmpty(message) {
-  cwdPickerMetaRoot.textContent = message;
-  cwdPickerListRoot.innerHTML = "";
-}
-
-async function loadCwdPicker(pathValue = "") {
-  const requestedPath =
-    String(pathValue || "").trim() || cwdInput.value.trim() || defaultCwd || browserState.path || activeSession?.cwd;
-
-  if (!requestedPath) {
-    renderCwdPickerEmpty("No folder loaded.");
-    openCwdPicker();
-    return;
-  }
-
-  const requestId = ++cwdPickerRequestId;
-  openCwdPicker();
-
-  try {
-    const payload = await requestDirectoryPayload(requestedPath);
-    if (requestId !== cwdPickerRequestId) {
-      return;
+    function closeSocket() {
+      if (state.activeSocket) {
+        state.activeSocket.close();
+        state.activeSocket = null;
+      }
     }
 
-    cwdPickerMetaRoot.textContent = payload.path || "No folder loaded.";
-    cwdPickerListRoot.innerHTML = "";
-
-    if (payload.parentPath) {
-      cwdPickerListRoot.appendChild(
-        buildCwdPickerItem(".. Parent folder", payload.parentPath, async (nextPath) => {
-          await loadCwdPicker(nextPath);
-        })
-      );
+    function setStatus(message = "") {
+      state.statusText = message;
     }
 
-    const directories = (payload.entries || []).filter((entry) => entry.type === "directory");
-    for (const entry of directories) {
-      cwdPickerListRoot.appendChild(
-        buildCwdPickerItem(entry.name, entry.path, async (nextPath) => {
-          await loadCwdPicker(nextPath);
-        })
-      );
+    function setMessages(messages) {
+      state.activeMessages = messages.filter((message) => message?.text);
+      scrollMessagesToBottom();
     }
 
-    if (!directories.length) {
-      cwdPickerListRoot.appendChild(
-        buildCwdPickerItem("Use this folder", payload.path, async () => {
-          closeCwdPicker();
-        })
-      );
-    }
-    return;
-  } catch {
-    const { path: parentPath, prefix } = splitDirectoryInput(requestedPath);
-    if (!parentPath || parentPath === requestedPath) {
-      renderCwdPickerEmpty("Directory not found.");
-      return;
+    function finalizeAssistantStream() {
+      if (!state.activeStreamBuffer) {
+        return;
+      }
+      const messages = [...state.activeMessages];
+      const last = messages[messages.length - 1];
+      if (last?.streaming) {
+        last.streaming = false;
+        last.text = normalizeLine(last.text);
+        state.activeMessages = messages;
+      }
+      state.activeStreamBuffer = "";
     }
 
-    try {
-      const payload = await requestDirectoryPayload(parentPath);
-      if (requestId !== cwdPickerRequestId) {
+    function appendAssistantChunk(chunk) {
+      const normalized = filterTerminalNoise(chunk || "");
+      if (!normalized) {
         return;
       }
 
-      const directories = (payload.entries || []).filter((entry) => {
-        return entry.type === "directory" && entry.name.toLowerCase().startsWith(prefix.toLowerCase());
+      state.activeStreamBuffer += normalized;
+      const mergedText = normalizeLine(state.activeStreamBuffer);
+      if (!mergedText) {
+        return;
+      }
+
+      const messages = [...state.activeMessages];
+      const last = messages[messages.length - 1];
+      if (last?.role === "assistant" && last.streaming) {
+        last.text = mergedText;
+        state.activeMessages = messages;
+      } else {
+        messages.push(createMessage("assistant", mergedText, new Date().toISOString(), { streaming: true, source: "live" }));
+        state.activeMessages = messages;
+      }
+      scrollMessagesToBottom();
+    }
+
+    async function hydrateSession(session, { includeMessages = false, silent = false } = {}) {
+      if (!session || session.kind !== "history" || !session.resumeSessionId) {
+        return null;
+      }
+
+      const key = cacheKey(session);
+      const cached = sessionCache[key];
+      if (cached?.hydrated && (!includeMessages || cached.messages)) {
+        return cached;
+      }
+
+      if (pendingHydrations.has(key)) {
+        if (!includeMessages) {
+          return cached || null;
+        }
+        while (pendingHydrations.has(key)) {
+          await wait(80);
+        }
+        return sessionCache[key] || null;
+      }
+
+      const task = (async () => {
+        const payload = await requestHistoryMessages(session);
+        if (!payload) {
+          const nextValue = {
+            hydrated: true,
+            title: fallbackTitleForSession(session),
+            preview: fallbackPreviewForSession(session),
+            messages: []
+          };
+          sessionCache[key] = {
+            ...(sessionCache[key] || {}),
+            ...nextValue
+          };
+          return sessionCache[key];
+        }
+
+        const messages = normalizeHistoryMessages(payload.messages || []);
+        const title = pickRealTitle(messages, payload.session?.name || session.name, session);
+        const preview = pickPreview(messages, session, title);
+        const nextValue = {
+          hydrated: true,
+          title,
+          preview,
+          messages
+        };
+        sessionCache[key] = {
+          ...(sessionCache[key] || {}),
+          ...nextValue
+        };
+        return sessionCache[key];
+      })();
+
+      pendingHydrations.set(key, task);
+      try {
+        return await task;
+      } catch (error) {
+        if (!silent) {
+          setStatus(error.message || String(error));
+        }
+        return sessionCache[key] || null;
+      } finally {
+        pendingHydrations.delete(key);
+      }
+    }
+
+    async function prefetchSessionTitles() {
+      const candidates = state.sessions
+        .filter((session) => session.kind === "history" && (isLowSignalTitle(session.name, session) || isLowSignalTitle(session.inputPreview, session)))
+        .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+        .slice(0, 18);
+
+      for (const session of candidates) {
+        await hydrateSession(session, { silent: true });
+      }
+    }
+
+    async function refreshSessions() {
+      const payload = await request("/api/sessions");
+      state.sessions = payload.sessions || [];
+      prefetchSessionTitles().catch(() => {});
+    }
+
+    async function bootstrapWorkspace() {
+      const payload = await request("/api/config");
+      await refreshSessions();
+    }
+
+    async function handleLogin() {
+      try {
+        if (!state.accessToken) {
+          throw new Error("请输入 token");
+        }
+        await request("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ token: state.accessToken })
+        });
+        state.isAuthenticated = true;
+        state.accessToken = "";
+        setStatus("");
+        await bootstrapWorkspace();
+      } catch (error) {
+        setStatus(error.message || String(error));
+      }
+    }
+
+    function attachLiveSocket(sessionId, historyMessages = []) {
+      closeSocket();
+      finalizeAssistantStream();
+      state.activeLiveSessionId = sessionId;
+      state.activeStreamBuffer = "";
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const socket = new WebSocket(`${protocol}://${window.location.host}/ws?sessionId=${encodeURIComponent(sessionId)}`);
+      state.activeSocket = socket;
+
+      socket.addEventListener("message", (event) => {
+        let payload;
+        try {
+          payload = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+
+        if (payload.type === "snapshot") {
+          if (!historyMessages.length) {
+            const snapshot = normalizeLine(payload.buffer || "");
+            if (snapshot) {
+              setMessages([createMessage("assistant", snapshot, payload.session?.updatedAt || "", { source: "snapshot" })]);
+            }
+          }
+          return;
+        }
+
+        if (payload.type === "data") {
+          appendAssistantChunk(payload.data || "");
+          return;
+        }
+
+        if (payload.type === "exit") {
+          finalizeAssistantStream();
+          const exitMessage = createMessage("assistant", `会话已退出 (${payload.exitCode ?? 0})`, new Date().toISOString(), {
+            source: "system"
+          });
+          setMessages([...state.activeMessages, exitMessage]);
+        }
       });
 
-      cwdPickerMetaRoot.textContent = payload.path || parentPath;
-      cwdPickerListRoot.innerHTML = "";
-
-      if (payload.parentPath) {
-        cwdPickerListRoot.appendChild(
-          buildCwdPickerItem(".. Parent folder", payload.parentPath, async (nextPath) => {
-            await loadCwdPicker(nextPath);
-          })
-        );
-      }
-
-      for (const entry of directories) {
-        cwdPickerListRoot.appendChild(
-          buildCwdPickerItem(entry.name, entry.path, async (nextPath) => {
-            await loadCwdPicker(nextPath);
-          })
-        );
-      }
-
-      if (!directories.length) {
-        renderCwdPickerEmpty(`No matching folders under ${payload.path || parentPath}`);
-      }
-    } catch {
-      renderCwdPickerEmpty("Directory not found.");
+      socket.addEventListener("close", () => {
+        if (state.activeSocket === socket) {
+          state.activeSocket = null;
+        }
+        finalizeAssistantStream();
+      });
     }
-  }
-}
 
-async function loadDirectory(targetPath = "") {
-  try {
-    const requestedPath =
-      String(targetPath || "").trim() ||
-      activeSession?.cwd ||
-      cwdInput.value.trim();
-    const query = requestedPath ? `?path=${encodeURIComponent(requestedPath)}` : "";
-    const payload = await request(`/api/fs${query}`);
-
-    browserState = {
-      ...browserState,
-      path: payload.path || "",
-      parentPath: payload.parentPath || "",
-      entries: payload.entries || [],
-      totalEntries: payload.totalEntries || 0,
-      truncated: Boolean(payload.truncated)
-    };
-
-    browserCurrentRoot.textContent = payload.path || "No folder loaded.";
-    renderDirectoryBrowser();
-  } catch (err) {
-    setStatus(err.message || String(err));
-  }
-}
-
-async function browseToParentDirectory() {
-  if (!browserState.parentPath) {
-    setStatus("Already at the top folder.");
-    return;
-  }
-
-  await loadDirectory(browserState.parentPath);
-}
-
-connectButton.addEventListener("click", async () => {
-  try {
-    accessToken = tokenInput.value.trim();
-    if (!accessToken) {
-      throw new Error("Enter the access token first.");
+    async function openLiveSession(session) {
+      state.pendingSessionId = session.id;
+      setStatus("");
+      const decorated = decorateSession(session);
+      state.activeSessionId = session.id;
+      state.activeSessionMeta = decorated;
+      state.view = "chat";
+      setMessages([]);
+      attachLiveSocket(session.id, []);
+      state.pendingSessionId = "";
     }
-    await loginWithToken(accessToken);
-    const payload = await request("/api/config");
-    accessToken = "";
-    tokenInput.value = "";
-    defaultCwd = payload.defaultCwd || "";
-    displayTimezone = payload.timezone || displayTimezone;
-    displayTimeFormatter = null;
-    displayCardTimeFormatter = null;
-    defaultProvider = payload.defaultProvider || defaultProvider;
-    applyProviderCatalog(payload.providers || []);
-    cwdInput.value = cwdInput.value.trim() || payload.defaultCwd || "";
-    providerSelect.value = providerCatalog.some((provider) => provider.id === defaultProvider)
-      ? defaultProvider
-      : providerCatalog[0]?.id || "codex";
-    newSessionButton.disabled = false;
-    setView("workspace");
-    setWorkspaceScreen("home");
-    setPanelOpen(false);
-    setStatus("Connected. Create or open a session.");
-    await refreshSessions();
-    await loadDirectory(cwdInput.value.trim());
-    updateInputControls();
-  } catch (err) {
-    setStatus(err.message || String(err));
-  }
-});
 
-newSessionButton.addEventListener("click", async () => {
-  try {
-    const payload = await request("/api/sessions", {
-      method: "POST",
-      body: JSON.stringify({
-        provider: providerSelect.value || defaultProvider,
-        cwd: cwdInput.value.trim(),
-        name: nameInput.value.trim()
-      })
+    async function openHistoricalSession(session) {
+      state.pendingSessionId = session.id;
+      setStatus("");
+      const decorated = decorateSession(session);
+      const hydrated = await hydrateSession(session, { includeMessages: true });
+      const historyMessages = hydrated?.messages || [];
+
+      state.activeSessionId = session.id;
+      state.activeSessionMeta = {
+        ...decorated,
+        displayTitle: hydrated?.title || decorated.displayTitle,
+        displayPreview: hydrated?.preview || decorated.displayPreview
+      };
+      state.view = "chat";
+      setMessages(historyMessages);
+      state.activeLiveSessionId = "";
+      state.pendingSessionId = "";
+    }
+
+    async function openSessionItem(session) {
+      try {
+        if (session.kind === "history") {
+          await openHistoricalSession(session);
+          return;
+        }
+        await openLiveSession(session);
+      } catch (error) {
+        state.pendingSessionId = "";
+        setStatus(error.message || String(error));
+      }
+    }
+
+    async function ensureLiveSession() {
+      if (state.activeLiveSessionId && state.activeSocket && state.activeSocket.readyState === WebSocket.OPEN) {
+        return state.activeLiveSessionId;
+      }
+
+      if (!state.activeSessionMeta) {
+        throw new Error("当前没有可继续的会话");
+      }
+
+      if (state.activeSessionMeta.kind === "live") {
+        attachLiveSocket(state.activeSessionMeta.id, []);
+        await wait(120);
+        return state.activeSessionMeta.id;
+      }
+
+      const resumed = await request("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          provider: state.activeSessionMeta.provider,
+          cwd: state.activeSessionMeta.cwd,
+          name: state.activeSessionMeta.displayTitle || state.activeSessionMeta.name,
+          resumeSessionId: state.activeSessionMeta.resumeSessionId
+        })
+      });
+
+      state.activeSessionMeta = {
+        ...state.activeSessionMeta,
+        id: resumed.session.id,
+        kind: "live",
+        status: resumed.session.status,
+        updatedAt: resumed.session.updatedAt
+      };
+      state.activeLiveSessionId = resumed.session.id;
+      await refreshSessions();
+      attachLiveSocket(resumed.session.id, state.activeMessages);
+      await wait(120);
+      return resumed.session.id;
+    }
+
+    async function submitInput() {
+      if (!canSend.value) {
+        return;
+      }
+      const text = state.draft.trim();
+      if (!text) {
+        return;
+      }
+      try {
+        await ensureLiveSession();
+        if (!state.activeSocket || state.activeSocket.readyState !== WebSocket.OPEN) {
+          throw new Error("会话连接还没准备好，请重试一次");
+        }
+        finalizeAssistantStream();
+        state.activeSocket.send(JSON.stringify({ type: "input", data: `${text}\r` }));
+        setMessages([...state.activeMessages, createMessage("user", text, new Date().toISOString(), { source: "draft" })]);
+        state.draft = "";
+        setStatus("");
+        nextTick(autoGrowComposer);
+      } catch (error) {
+        setStatus(error.message || String(error));
+      }
+    }
+
+    async function backToList() {
+      closeSocket();
+      finalizeAssistantStream();
+      state.view = "list";
+      state.activeSessionId = "";
+      state.activeLiveSessionId = "";
+      state.activeSessionMeta = null;
+      state.draft = "";
+      setMessages([]);
+      nextTick(autoGrowComposer);
+      await refreshSessions();
+    }
+
+    function defaultPreview(session) {
+      return PREVIEW_FALLBACK[session?.kind] || "继续这个会话";
+    }
+
+    watch(
+      () => state.view,
+      (view) => {
+        if (view === "list") {
+          closeSocket();
+        }
+      }
+    );
+
+    onMounted(async () => {
+      try {
+        await bootstrapWorkspace();
+        state.isAuthenticated = true;
+      } catch {
+        state.isAuthenticated = false;
+      } finally {
+        state.ready = true;
+        nextTick(autoGrowComposer);
+      }
     });
-    await refreshSessions();
-    await openSession(payload.session.id);
-    nameInput.value = "";
-  } catch (err) {
-    setStatus(err.message || String(err));
+
+    return {
+      state,
+      groupedSessions,
+      activeSessionTitle,
+      activeWorkspaceName,
+      activeAssistantName,
+      canSend,
+      messageListRef,
+      composerRef,
+      formatRelativeTime,
+      defaultPreview,
+      autoGrowComposer,
+      handleLogin,
+      openSessionItem,
+      submitInput,
+      backToList
+    };
   }
-});
-
-closeSessionButton.addEventListener("click", async () => {
-  if (!activeSessionId) {
-    return;
-  }
-  try {
-    isManualDisconnect = true;
-    await request(`/api/sessions/${activeSessionId}`, { method: "DELETE" });
-    disconnectSocket();
-    closeSessionNameEditor();
-    pendingOutput = "";
-    term.reset();
-    activeSessionId = "";
-    activeSession = null;
-    updateInputControls();
-    updateWorkspaceSummary();
-    await refreshSessions();
-    setStatus("Session closed.");
-    setWorkspaceScreen("home");
-    setPanelOpen(false);
-  } catch (err) {
-    setStatus(err.message || String(err));
-  }
-});
-
-openPanelButton.addEventListener("click", () => {
-  setPanelOpen(true);
-});
-
-closePanelButton.addEventListener("click", () => {
-  setPanelOpen(false);
-});
-
-panelBackdrop.addEventListener("click", () => {
-  setPanelOpen(false);
-});
-
-backToConnectButton.addEventListener("click", () => {
-  isManualDisconnect = true;
-  disconnectSocket();
-  closeClipboardSheet({ restoreFocus: false });
-  closeCwdPicker();
-  closeSessionNameEditor();
-  activeSessionId = "";
-  activeSession = null;
-  setPanelOpen(false);
-  setWorkspaceScreen("home");
-  setView("connect");
-  term.reset();
-  setStatus("Disconnected");
-  logoutSession();
-  updateWorkspaceSummary();
-});
-
-backToSessionsButton.addEventListener("click", async () => {
-  isManualDisconnect = true;
-  disconnectSocket();
-  closeSessionNameEditor();
-  activeSessionId = "";
-  activeSession = null;
-  setPanelOpen(false);
-  setWorkspaceScreen("home");
-  term.reset();
-  await refreshSessions();
-  setStatus("Choose another session.");
-});
-
-copyTerminalButton.addEventListener("click", () => {
-  openClipboardSheet("copy");
-});
-
-pasteTerminalButton.addEventListener("click", () => {
-  if (!hasLiveSession()) {
-    setStatus("Open a session first.");
-    return;
-  }
-  openClipboardSheet("paste");
-});
-
-clipboardPrimaryButton.addEventListener("click", async () => {
-  if (clipboardTitle.textContent === "Copy Path") {
-    clipboardBuffer.focus({ preventScroll: true });
-    clipboardBuffer.select();
-    setStatus("Path selected. Use your browser copy action.");
-    return;
-  }
-
-  await handleClipboardPrimaryAction();
-});
-
-clipboardCloseButton.addEventListener("click", () => {
-  closeClipboardSheet();
-});
-
-editSessionNameButton.addEventListener("click", () => {
-  openSessionNameEditor();
-});
-
-saveSessionNameButton.addEventListener("click", async () => {
-  await renameActiveSession();
-});
-
-cancelSessionNameButton.addEventListener("click", () => {
-  closeSessionNameEditor();
-  updateWorkspaceSummary();
-});
-
-browseUpButton.addEventListener("click", async () => {
-  await browseToParentDirectory();
-});
-
-syncBrowserPathButton.addEventListener("click", async () => {
-  const nextPath = activeSession?.cwd || cwdInput.value.trim() || browserState.path;
-  if (!nextPath) {
-    setStatus("No session folder available.");
-    return;
-  }
-  await loadDirectory(nextPath);
-});
-
-cwdInput.addEventListener("keydown", async (event) => {
-  if (event.key === "Escape") {
-    closeCwdPicker();
-    return;
-  }
-
-  if (event.key !== "Enter") {
-    return;
-  }
-
-  event.preventDefault();
-  await loadCwdPicker(cwdInput.value.trim());
-});
-
-cwdInput.addEventListener("pointerdown", async (event) => {
-  event.preventDefault();
-  await loadCwdPicker(cwdInput.value.trim());
-});
-
-sessionNameInlineInput.addEventListener("keydown", async (event) => {
-  if (event.key === "Escape") {
-    closeSessionNameEditor();
-    updateWorkspaceSummary();
-    return;
-  }
-
-  if (event.key !== "Enter") {
-    return;
-  }
-
-  event.preventDefault();
-  await renameActiveSession();
-});
-
-providerSelect.addEventListener("change", () => {
-  if (!activeSession) {
-    updateWorkspaceSummary();
-  }
-});
-
-document.addEventListener("pointerdown", (event) => {
-  if (event.target === cwdInput || cwdPickerRoot.contains(event.target)) {
-    return;
-  }
-  closeCwdPicker();
-});
-
-if (enableMobileComposer) {
-  mobileComposer.addEventListener("click", (event) => {
-    if (event.target === composerEscButton || event.target === composerSendButton) {
-      return;
-    }
-    focusImeBridge();
-  });
+  }).mount("#app");
 }
 
-if (!useImeBridge) {
-  term.onData((data) => {
-    sendToSession(data);
-  });
-}
-
-term.onResize(() => {
-  syncTerminalSize();
-});
-
-terminalRoot.addEventListener("click", () => {
-  if (useImeBridge) {
-    focusImeBridge();
-    return;
-  }
-
-  term.focus();
-});
-
-window.addEventListener("resize", () => {
-  requestViewportMetrics();
-});
-
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    blurImeBridge();
-    return;
-  }
-
-  requestViewportMetrics();
-  if (!useImeBridge) {
-    term.focus();
-  }
-  if (!hasLiveSession() && activeSessionId && isAuthenticated) {
-    isManualDisconnect = false;
-    scheduleReconnect();
+bootstrapApp().catch((error) => {
+  console.error(error);
+  const root = document.getElementById("app");
+  if (root) {
+    root.innerHTML = `
+      <section class="login-view">
+        <div class="login-card">
+          <p class="login-kicker">Codex</p>
+          <h1>页面加载失败</h1>
+          <p class="status-copy">${String(error?.message || error || "未知错误")}</p>
+        </div>
+      </section>
+    `;
   }
 });
-
-window.addEventListener("pageshow", () => {
-  requestViewportMetrics();
-  if (!useImeBridge) {
-    term.focus();
-  }
-  if (!hasLiveSession() && activeSessionId && isAuthenticated) {
-    isManualDisconnect = false;
-    scheduleReconnect();
-  }
-});
-
-window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && sessionPanel.classList.contains("open")) {
-    setPanelOpen(false);
-  }
-});
-
-window.visualViewport?.addEventListener("resize", requestViewportMetrics);
-window.visualViewport?.addEventListener("scroll", requestViewportMetrics);
-
-imeBridge.addEventListener("compositionstart", () => {
-  imeComposing = true;
-});
-
-imeBridge.addEventListener("compositionend", () => {
-  imeComposing = false;
-  flushImeBridgeValue();
-});
-
-imeBridge.addEventListener("focus", () => {
-  setComposerExpanded(true);
-  syncComposerLayout();
-});
-
-imeBridge.addEventListener("blur", () => {
-  if (!imeBridge.value && !keyboardWasOpen) {
-    setComposerExpanded(false);
-  }
-  syncComposerLayout();
-});
-
-imeBridge.addEventListener("input", () => {
-  flushImeBridgeValue();
-});
-
-imeBridge.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    submitImeBridge();
-    return;
-  }
-
-  if (event.key === "Backspace" && !imeBridge.value && !imeComposing) {
-    event.preventDefault();
-    sendToSession("\u007f");
-    return;
-  }
-
-  if (event.key === "Tab") {
-    event.preventDefault();
-    sendToSession("\t");
-    imeBridge.value += "\t";
-    mobileComposerValue = imeBridge.value;
-    syncComposerLayout();
-    return;
-  }
-
-  const arrowMap = {
-    ArrowUp: "\u001b[A",
-    ArrowDown: "\u001b[B",
-    ArrowLeft: "\u001b[D",
-    ArrowRight: "\u001b[C"
-  };
-  const controlValue = arrowMap[event.key];
-  if (controlValue) {
-    event.preventDefault();
-    sendToSession(controlValue);
-  }
-});
-
-composerEscButton.addEventListener("click", () => {
-  sendInterruptControl();
-  focusImeBridge();
-});
-
-composerSendButton.addEventListener("click", () => {
-  submitImeBridge();
-});
-
-escKeyButton.addEventListener("click", () => {
-  sendInterruptControl();
-  if (useImeBridge && keyboardWasOpen) {
-    focusImeBridge();
-    return;
-  }
-
-  term.focus();
-});
-
-applyProviderCatalog(providerCatalog);
-updateInputControls();
-updateWorkspaceSummary();
-setView("connect");
-setWorkspaceScreen("home");
-setPanelOpen(false);
-syncComposerLayout();
-requestViewportMetrics();

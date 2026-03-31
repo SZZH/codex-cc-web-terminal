@@ -1,203 +1,114 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex/CC Web Terminal</title>
-    <link rel="stylesheet" href="/vendor/xterm.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Codex Sessions</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="app">
-      <section class="view view-connect" id="view-connect">
-        <div class="connect-card">
-          <div class="brand">
-            <div class="brand-mark">C/C</div>
-            <div>
-              <p class="eyebrow">Browser terminal</p>
-              <h1>Codex/CC Web Terminal</h1>
-              <p>Authenticate once, then switch sessions and browse project paths from the side menu.</p>
-            </div>
-          </div>
+    <div id="app" class="app-shell" v-cloak>
+      <section v-if="!state.ready" class="splash-screen">
+        <div class="splash-card">正在加载会话…</div>
+      </section>
+
+      <section v-else-if="!state.isAuthenticated" class="login-view">
+        <div class="login-card">
+          <p class="login-kicker">Codex</p>
+          <h1>登录</h1>
           <label class="field">
-            <span>Access token</span>
-            <input id="token" type="password" placeholder="Enter token" />
+            <span>Access Token</span>
+            <input
+              v-model.trim="state.accessToken"
+              type="password"
+              placeholder="输入 token"
+              @keydown.enter="handleLogin"
+            />
           </label>
-          <div class="actions single">
-            <button id="connect">Connect</button>
-          </div>
-          <p class="hint">The workspace keeps sessions on the left and terminal control on the right.</p>
+          <button class="primary-button" @click="handleLogin">进入</button>
+          <p v-if="state.statusText" class="status-copy">{{ state.statusText }}</p>
         </div>
       </section>
 
-      <section class="view view-workspace hidden" id="view-workspace">
-        <div class="panel-backdrop hidden" id="panel-backdrop"></div>
-
-        <aside class="session-panel" id="session-panel" aria-hidden="true">
-          <div class="session-panel-shell">
-            <div class="session-panel-top">
-              <div>
-                <p class="section-kicker">Project files</p>
-                <h2>Current folder</h2>
-              </div>
-              <button id="close-panel" class="icon-button ghost" type="button" aria-label="Close menu">Close</button>
-            </div>
-
-            <section class="sidebar-section">
-              <div class="sidebar-section-head">
-                <div>
-                  <p class="section-kicker">Project paths</p>
-                  <h2>Browse files</h2>
-                </div>
-              </div>
-              <div class="directory-actions">
-                <button id="browse-up" class="ghost" type="button">Up</button>
-                <button id="sync-browser-path" class="ghost" type="button">Session Dir</button>
-              </div>
-              <div id="browser-current" class="browser-current">No folder loaded.</div>
-              <div id="directory-tree" class="directory-tree"></div>
-            </section>
+      <section v-else class="mobile-shell">
+        <header class="mobile-header" :class="{ compact: state.view === 'chat', list: state.view === 'list' }">
+          <button v-if="state.view === 'chat'" class="nav-button" @click="backToList">返回</button>
+          <div class="header-copy">
+            <p class="header-eyebrow">{{ state.view === 'chat' ? activeWorkspaceName : 'Codex' }}</p>
+            <h1>{{ state.view === 'chat' ? activeSessionTitle : '会话' }}</h1>
           </div>
-        </aside>
+        </header>
 
-        <main class="main">
-          <section class="workspace-screen" id="workspace-home">
-            <section class="session-rack session-rack-home">
-              <div class="session-home-grid">
-                <section class="session-launchpad">
-                  <div class="session-rack-head">
-                    <div>
-                      <p class="section-kicker">Start</p>
-                    </div>
-                    <button id="back-to-connect" class="ghost session-back-button" type="button">Back</button>
-                  </div>
-                  <p class="session-launchpad-copy">
-                    Start from a folder, give the session a short name if needed, then open it in the CLI page.
-                  </p>
-                  <div class="session-rack-form">
-                    <label class="field">
-                      <span>Provider</span>
-                      <select id="session-provider">
-                        <option value="codex">Codex</option>
-                        <option value="claude">Claude</option>
-                      </select>
-                    </label>
-                    <label class="field field-with-picker">
-                      <span>Working directory</span>
-                      <input
-                        id="cwd"
-                        type="text"
-                        placeholder="Select a folder from the list below"
-                        readonly
-                        inputmode="none"
-                      />
-                      <div id="cwd-picker" class="cwd-picker hidden" aria-hidden="true">
-                        <div id="cwd-picker-meta" class="cwd-picker-meta">No folder loaded.</div>
-                        <div id="cwd-picker-list" class="cwd-picker-list"></div>
-                      </div>
-                    </label>
-                    <label class="field">
-                      <span>Session name</span>
-                      <input id="session-name" type="text" placeholder="Optional label" />
-                    </label>
-                    <div class="actions">
-                      <button id="new-session" disabled>New Session</button>
-                    </div>
-                  </div>
-                </section>
+        <main v-if="state.view === 'list'" class="session-screen">
+          <section v-if="groupedSessions.length" class="session-groups">
+            <section v-for="group in groupedSessions" :key="group.name" class="session-group">
+              <header class="session-group-head">
+                <span class="folder-icon" aria-hidden="true"></span>
+                <h2>{{ group.name }}</h2>
+              </header>
 
-                <section class="session-library">
-                  <div id="session-history-toolbar" class="session-history-toolbar hidden"></div>
-                  <div id="sessions" class="sessions session-rack-list"></div>
-                </section>
-              </div>
+              <button
+                v-for="session in group.sessions"
+                :key="session.id"
+                class="session-row"
+                :class="{
+                  active: session.id === state.activeSessionId,
+                  pending: session.id === state.pendingSessionId
+                }"
+                @click="openSessionItem(session)"
+              >
+                <div class="session-row-body">
+                  <div class="session-row-line">
+                    <p class="session-row-title">{{ session.displayTitle }}</p>
+                    <time class="session-row-time">{{ formatRelativeTime(session.updatedAt) }}</time>
+                  </div>
+                  <div class="session-row-meta">
+                    <p class="session-row-preview">{{ session.displayPreview || defaultPreview(session) }}</p>
+                  </div>
+                </div>
+              </button>
             </section>
           </section>
 
-          <section class="workspace-screen hidden" id="workspace-terminal">
-            <div class="workspace-topbar terminal-topbar">
-              <div class="terminal-topbar-main">
-                <div class="toolbar-left">
-                  <button id="back-to-sessions" class="ghost" type="button">Sessions</button>
-                  <button id="open-panel" class="icon-button ghost" type="button" aria-label="Open menu">
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                  </button>
-                </div>
-                <div class="toolbar-title">
-                  <p id="active-session-provider" class="section-kicker">CLI</p>
-                  <div class="session-title-row">
-                    <h2 id="active-session-name">No active session</h2>
-                    <button id="edit-session-name" class="ghost session-title-edit" type="button" disabled>Edit</button>
-                  </div>
-                  <div id="session-name-editor" class="session-name-editor hidden">
-                    <input id="session-name-inline" type="text" maxlength="120" placeholder="Rename session" />
-                    <button id="save-session-name" class="ghost" type="button">Save</button>
-                    <button id="cancel-session-name" class="ghost" type="button">Cancel</button>
-                  </div>
-                  <p id="active-session-meta" class="toolbar-meta">Open a session to start.</p>
-                </div>
-              </div>
-              <div class="toolbar-actions terminal-actions">
-                <button id="copy-terminal" class="ghost" disabled>Copy</button>
-                <button id="paste-terminal" class="ghost" disabled>Paste</button>
-                <button id="close-session" disabled>Close Session</button>
-              </div>
-            </div>
-
-            <div class="terminal-shell terminal-shell-page">
-              <div id="terminal" class="terminal"></div>
-              <button id="esc-key" type="button" aria-label="Send Escape">Esc</button>
-            </div>
-            <div class="mobile-composer" id="mobile-composer">
-              <button id="composer-esc" class="composer-side ghost" type="button" aria-label="Send Escape">Esc</button>
-              <div class="composer-input-shell">
-                <textarea
-                  id="ime-bridge"
-                  class="ime-bridge"
-                  autocapitalize="off"
-                  autocomplete="off"
-                  autocorrect="off"
-                  spellcheck="false"
-                  enterkeyhint="send"
-                  rows="1"
-                  placeholder="Type into session"
-                  aria-label="Terminal input"
-                ></textarea>
-              </div>
-              <button id="composer-send" class="composer-send" type="button" aria-label="Send command">Enter</button>
-            </div>
-          </section>
+          <div v-else class="empty-state">还没有可展示的会话。</div>
         </main>
+
+        <main v-else class="chat-screen">
+          <section class="message-stream" ref="messageListRef">
+            <article
+              v-for="message in state.activeMessages"
+              :key="message.id"
+              class="message-item"
+              :class="message.role"
+            >
+              <p class="message-author">{{ message.role === 'user' ? '你' : activeAssistantName }}</p>
+              <div class="message-bubble">
+                <pre class="message-text">{{ message.text }}</pre>
+              </div>
+            </article>
+
+            <div v-if="!state.activeMessages.length" class="empty-state chat-empty">
+              暂时还没有可展示的消息。
+            </div>
+          </section>
+
+          <form class="composer" @submit.prevent="submitInput">
+            <textarea
+              v-model="state.draft"
+              class="composer-input"
+              rows="1"
+              placeholder="继续输入给 Codex"
+              @input="autoGrowComposer"
+              ref="composerRef"
+            ></textarea>
+            <button class="primary-button composer-send" type="submit" :disabled="!canSend">发送</button>
+          </form>
+        </main>
+
+        <div v-if="state.statusText && state.view === 'list'" class="notice-strip">{{ state.statusText }}</div>
       </section>
     </div>
 
-    <div class="clipboard-sheet hidden" id="clipboard-sheet" aria-hidden="true">
-      <div class="clipboard-card">
-        <div class="clipboard-card-header">
-          <div>
-            <h3 id="clipboard-title">Copy Terminal Text</h3>
-            <p id="clipboard-hint">Long-press below to select and copy.</p>
-          </div>
-          <button id="clipboard-close" class="ghost" type="button">Close</button>
-        </div>
-        <textarea
-          id="clipboard-buffer"
-          class="clipboard-buffer"
-          autocapitalize="off"
-          autocomplete="off"
-          autocorrect="off"
-          spellcheck="false"
-        ></textarea>
-        <div class="clipboard-actions">
-          <button id="clipboard-primary" type="button">Copy All</button>
-        </div>
-      </div>
-    </div>
-
-    <script src="/vendor/xterm.js"></script>
-    <script src="/vendor/xterm-addon-fit.js"></script>
-    <script type="module" src="/app.js"></script>
+    <script src="/app.js"></script>
   </body>
 </html>

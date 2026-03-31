@@ -66,21 +66,199 @@ function normalizeName(value, fallback) {
 }
 
 function sanitizeTitleFragment(value) {
-  return String(value || "")
+  return stripControlChars(applyBackspaces(String(value || "")))
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\u001b[@-_]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function stripTerminalControlSequences(value) {
+function applyBackspaces(value) {
+  const result = [];
+  for (const char of String(value || "")) {
+    if (char === "\b" || char === "\u007f") {
+      result.pop();
+      continue;
+    }
+    result.push(char);
+  }
+  return result.join("");
+}
+
+function stripControlChars(value) {
+  return String(value || "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, " ");
+}
+
+function stripAnsiEscapeSequences(value) {
   return String(value || "")
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u009b[0-?]*[ -/]*[@-~]?/g, "")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]?/g, "")
+    .replace(/\u001b[@-_]/g, "");
+}
+
+function stripTerminalControlSequences(value) {
+  return stripControlChars(applyBackspaces(String(value || "")))
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
     .replace(/\u001b[@-_]/g, " ")
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizeLiveOutputLine(value) {
+  return stripControlChars(applyBackspaces(stripAnsiEscapeSequences(String(value || ""))))
+    .replace(/[ \t]+$/g, "");
+}
+
+function simplifyLiveOutputLine(value) {
+  return normalizeLiveOutputLine(value).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function collapseDoubledAsciiNoise(value) {
+  const text = String(value || "");
+  if (!text) {
+    return text;
+  }
+
+  const pairMatches = text.match(/([A-Za-z0-9])\1/g) || [];
+  if (pairMatches.length < 6) {
+    return text;
+  }
+
+  const ratio = pairMatches.length / Math.max(1, text.length);
+  if (ratio < 0.12) {
+    return text;
+  }
+
+  return text.replace(/([A-Za-z0-9])\1/g, "$1");
+}
+
+function isLikelyResumeEchoLine(value, pendingInput) {
+  const expected = simplifyLiveOutputLine(pendingInput);
+  const candidate = simplifyLiveOutputLine(value);
+  if (!expected || !candidate) {
+    return false;
+  }
+
+  if (candidate === expected) {
+    return true;
+  }
+
+  const delta = candidate.length - expected.length;
+  if (delta >= 0 && delta <= 80 && candidate.endsWith(expected)) {
+    return true;
+  }
+
+  if (delta >= 0 && delta <= 80 && candidate.startsWith(expected)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isTerminalStatusLine(value) {
+  const text = sanitizeTitleFragment(value);
+  if (!text) {
+    return true;
+  }
+
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("esc to interrupt") ||
+    /^working\(/i.test(text) ||
+    /^press esc to interrupt/i.test(text)
+  );
+}
+
+function filterLiveOutputChunk(session, chunk) {
+  const text = String(chunk || "");
+  if (!text) {
+    return "";
+  }
+
+  if (session?.resumeSessionId && !session.resumeBootstrapComplete && !session.pendingResumeInput) {
+    return "";
+  }
+
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const visibleLines = [];
+  let sawNonEmptyLine = false;
+
+  for (const line of lines) {
+    const currentLine = line.includes("\r") ? line.slice(line.lastIndexOf("\r") + 1) : line;
+    const cleaned = normalizeLiveOutputLine(currentLine);
+    const normalized = collapseDoubledAsciiNoise(cleaned);
+    const simplified = sanitizeTitleFragment(normalized);
+
+    if (!normalized) {
+      if (currentLine === "" || /^[ \t]+$/.test(currentLine)) {
+        visibleLines.push("");
+      }
+      continue;
+    }
+
+    if (isTerminalStatusLine(simplified)) {
+      continue;
+    }
+
+    if (
+      /^[\p{P}\p{S}\s]+$/u.test(simplified) &&
+      simplified.length <= 4 &&
+      !/\w/.test(simplified)
+    ) {
+      continue;
+    }
+
+    if (
+      session?.resumeSessionId &&
+      !session.resumeBootstrapComplete &&
+      session.pendingResumeInput &&
+      isLikelyResumeEchoLine(normalized, session.pendingResumeInput)
+    ) {
+      continue;
+    }
+
+    visibleLines.push(normalized);
+    if (simplified) {
+      sawNonEmptyLine = true;
+    }
+  }
+
+  if (!visibleLines.length) {
+    return "";
+  }
+
+  if (session?.resumeSessionId && !session.resumeBootstrapComplete && sawNonEmptyLine) {
+    session.resumeBootstrapComplete = true;
+    session.pendingResumeInput = "";
+  }
+
+  return visibleLines.join(newline);
+}
+
+function extractImagePartsFromMarkdown(text) {
+  const source = String(text || "");
+  if (!source) {
+    return { text: "", images: [] };
+  }
+
+  const images = [];
+  const cleaned = source.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/gi, (_, alt, url) => {
+    images.push({
+      type: "image",
+      alt: String(alt || "").trim(),
+      url: String(url || "").trim()
+    });
+    return "";
+  });
+
+  return {
+    text: cleaned,
+    images
+  };
 }
 
 function extractEmbeddedUserRequest(value) {
@@ -135,13 +313,161 @@ function deriveSessionTitle(value, fallback) {
   return `${clean.slice(0, 49).trimEnd()}...`;
 }
 
+const HISTORICAL_META_LINE_PATTERNS = [
+  /^[-*•]\s+/,
+  /^\d+[.)、]\s+/,
+  /^#+\s+/,
+  /^```/,
+  /^accessibility override/i,
+  /^auth-required override/i,
+  /^automatic routing rule/i,
+  /^how to infer auth-sensitive tasks/i,
+  /^public-web routing rule/i,
+  /^ambiguous-case policy/i,
+  /^failure-upgrade rule/i,
+  /^stability rules/i,
+  /^execution style/i,
+  /^important integration note/i,
+  /^natural-language triggers/i,
+  /^recall triggers/i,
+  /^default objective/i,
+  /^structure:?$/i,
+  /^style rules:?$/i,
+  /^content rules:?$/i,
+  /^forbidden in final article output:?$/i,
+  /^image rules:?$/i,
+  /^html article rules:?$/i,
+  /^execution rule:?$/i,
+  /^this rule applies/i,
+  /^当满足任一条件时，视为 `?code_task/i,
+  /^若均不满足/i,
+  /^当 `?code_task=true`? 时/i,
+  /^创建文件时[:：]?/i,
+  /^(完成后请返回|请返回|修改文件列表|优化摘要|风险说明|风险\/后续建议|风险\/后续建议（若有）|兼容性注意事项|视觉优化要点|关键 tokens 清单|自检点|潜在冲突点|可能冲突点|你做了哪些视觉提升|必须遵守|严格写入边界)[:：]?/i
+];
+
+function isHistoricalMetaLine(value) {
+  const line = sanitizeTitleFragment(value);
+  if (!line) {
+    return true;
+  }
+  return HISTORICAL_META_LINE_PATTERNS.some((pattern) => pattern.test(line));
+}
+
+function historicalMeaningfulLines(value) {
+  return normalizeHistoricalText(value)
+    .split("\n")
+    .map((line) => sanitizeTitleFragment(line))
+    .filter(Boolean)
+    .filter((line) => !isBoilerplateUserText(line))
+    .filter((line) => !isHistoricalMetaLine(line))
+    .filter((line) => !line.startsWith("<") && !line.startsWith("["));
+}
+
+function truncateHistoricalTitle(value, fallback = "") {
+  const clean = sanitizeTitleFragment(value || fallback);
+  if (!clean) {
+    return sanitizeTitleFragment(fallback);
+  }
+  return clean.length <= 52 ? clean : `${clean.slice(0, 49).trimEnd()}...`;
+}
+
+function extractHistoricalTitleCandidate(value) {
+  const lines = historicalMeaningfulLines(value);
+  const preferred = lines.find((line) => !isHistoricalMetaLine(line));
+  return preferred || lines[0] || "";
+}
+
+function scoreHistoricalSummarySnippet(text, role, title) {
+  const clean = sanitizeTitleFragment(text);
+  if (!clean) {
+    return -1;
+  }
+
+  let score = role === "assistant" ? 120 : 80;
+  if (clean === sanitizeTitleFragment(title)) {
+    score -= 60;
+  }
+  if (isHistoricalMetaLine(clean)) {
+    score -= 80;
+  }
+  if (clean.length >= 18 && clean.length <= 140) {
+    score += 24;
+  } else if (clean.length > 140) {
+    score += 12;
+  } else {
+    score -= 12;
+  }
+  if (/[？?。.!！]/.test(clean)) {
+    score += 8;
+  }
+  return score;
+}
+
+function extractHistoricalSummaryCandidate(messages, title, fallback = "") {
+  const candidates = [];
+
+  for (const message of messages || []) {
+    const snippets = historicalMeaningfulLines(message.text).filter((line) => {
+      if (!line) {
+        return false;
+      }
+      if (sanitizeTitleFragment(line) === sanitizeTitleFragment(title)) {
+        return false;
+      }
+      return !isHistoricalMetaLine(line);
+    });
+
+    for (const snippet of snippets.slice(0, 3)) {
+      candidates.push({
+        text: snippet,
+        score: scoreHistoricalSummarySnippet(snippet, message.role, title)
+      });
+    }
+  }
+
+  candidates.sort((left, right) => right.score - left.score);
+  return sanitizeTitleFragment(candidates[0]?.text || fallback);
+}
+
+function cleanHistoricalMessageText(value) {
+  const normalized = normalizeHistoricalText(value);
+  if (!normalized) {
+    return "";
+  }
+
+  const lines = normalized
+    .split("\n")
+    .map((line) => sanitizeTitleFragment(line))
+    .filter(Boolean)
+    .filter((line) => !isBoilerplateUserText(line))
+    .filter((line) => !isHistoricalMetaLine(line))
+    .filter((line) => !/^<.*>$/.test(line))
+    .filter((line) => !/^\[.*\]$/.test(line));
+
+  if (!lines.length) {
+    return "";
+  }
+
+  return lines.join("\n");
+}
+
 function isLowSignalTitle(value) {
-  const lower = String(value || "").trim().toLowerCase();
+  const clean = sanitizeTitleFragment(value);
+  const lower = clean.toLowerCase();
   if (!lower) {
     return true;
   }
 
   return (
+    lower === "codex" ||
+    lower === "claude" ||
+    lower === "session" ||
+    lower === "会话" ||
+    lower === "历史会话" ||
+    lower === "untitled workspace" ||
+    lower.startsWith("saved ") ||
+    /^-\s/.test(clean) ||
     lower.startsWith("conversation info") ||
     lower.includes("safety and fallback") ||
     lower.includes("available skills") ||
@@ -168,8 +494,19 @@ function isBoilerplateUserText(value) {
     originalLower.startsWith("# agents.md instructions") ||
     originalLower.includes("### available skills") ||
     originalLower.includes("a skill is a set of local instructions") ||
+    originalLower.includes("global instructions for browser automation") ||
+    originalLower.includes("global instructions for memory recall") ||
+    originalLower.includes("current user accessibility context") ||
+    originalLower.includes("auth-required override") ||
+    originalLower.includes("default browser workflow") ||
+    originalLower.includes("default memory workflow") ||
+    originalLower.includes("code task execution flow") ||
+    originalLower.includes("filesystem sandboxing defines") ||
+    originalLower.includes("approval policy is currently never") ||
     originalLower.includes("<environment_context>") ||
     originalLower.includes("</environment_context>") ||
+    originalLower.includes("<app-context>") ||
+    originalLower.includes("</app-context>") ||
     originalLower.includes("<local-command-caveat>") ||
     originalLower.includes("<command-name>") ||
     originalLower.includes("<command-message>") ||
@@ -181,6 +518,8 @@ function isBoilerplateUserText(value) {
     lower.startsWith("# agents.md instructions") ||
     lower.startsWith("<environment_context>") ||
     lower.startsWith("</environment_context>") ||
+    lower.startsWith("<app-context>") ||
+    lower.startsWith("</app-context>") ||
     lower.startsWith("you are running inside a local discord-controlled agent bridge") ||
     lower.includes("a skill is a set of local instructions") ||
     lower.includes("### available skills") ||
@@ -194,6 +533,214 @@ function isBoilerplateUserText(value) {
     lower.includes("the user doesn't want to proceed with this tool use") ||
     lower.includes("[request interrupted by user for tool use]")
   );
+}
+
+function normalizeHistoricalText(value) {
+  return stripControlChars(applyBackspaces(String(value || "")))
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
+    .replace(/\u001b[@-_]/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
+function extractTextFromNode(value) {
+  if (value == null) {
+    return [];
+  }
+
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return [String(value)];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => extractTextFromNode(item));
+  }
+
+  if (typeof value !== "object") {
+    return [];
+  }
+
+  const pieces = [];
+  for (const key of ["text", "message", "summary", "value", "content"]) {
+    if (!(key in value)) {
+      continue;
+    }
+    const child = value[key];
+    if (child == null) {
+      continue;
+    }
+    if (key === "content" && typeof child === "object" && !Array.isArray(child)) {
+      pieces.push(...extractTextFromNode(child));
+      continue;
+    }
+    if (key === "summary" && Array.isArray(child)) {
+      pieces.push(...extractTextFromNode(child));
+      continue;
+    }
+    if (typeof child === "string" || typeof child === "number" || typeof child === "boolean") {
+      pieces.push(String(child));
+      continue;
+    }
+    if (Array.isArray(child)) {
+      pieces.push(...extractTextFromNode(child));
+    }
+  }
+
+  return pieces;
+}
+
+function extractTextContentFromPayload(payload) {
+  const pieces = [];
+  if (!payload || typeof payload !== "object") {
+    return pieces;
+  }
+
+  if (Array.isArray(payload.content)) {
+    pieces.push(...extractTextFromNode(payload.content));
+  } else if (payload.content != null) {
+    pieces.push(...extractTextFromNode(payload.content));
+  }
+
+  if (typeof payload.message === "string") {
+    pieces.push(payload.message);
+  } else if (payload.message && typeof payload.message === "object") {
+    pieces.push(...extractTextFromNode(payload.message));
+  }
+
+  if (typeof payload.summary === "string") {
+    pieces.push(payload.summary);
+  } else if (Array.isArray(payload.summary)) {
+    pieces.push(...extractTextFromNode(payload.summary));
+  }
+
+  if (typeof payload.text === "string") {
+    pieces.push(payload.text);
+  }
+
+  return pieces;
+}
+
+function resolveRecordTimestamp(record, fallbackTimestamp = nowIso()) {
+  const rawTimestamp =
+    record?.timestamp ||
+    record?.payload?.timestamp ||
+    fallbackTimestamp;
+  const parsed = Date.parse(String(rawTimestamp || ""));
+  if (Number.isNaN(parsed)) {
+    const fallbackParsed = Date.parse(String(fallbackTimestamp || ""));
+    if (!Number.isNaN(fallbackParsed)) {
+      return new Date(fallbackParsed).toISOString();
+    }
+    return nowIso();
+  }
+  return new Date(parsed).toISOString();
+}
+
+function normalizeHistoricalRole(record) {
+  if (!record || typeof record !== "object") {
+    return "";
+  }
+
+  if (record.type === "response_item") {
+    const role = String(record.payload?.role || "").trim().toLowerCase();
+    if (role === "user" || role === "assistant") {
+      return role;
+    }
+    return "";
+  }
+
+  if (record.type === "event_msg") {
+    const type = String(record.payload?.type || "").trim().toLowerCase();
+    if (type === "user_message") {
+      return "user";
+    }
+    if (type === "agent_message") {
+      return "assistant";
+    }
+  }
+
+  return "";
+}
+
+function extractHistoricalMessagesFromRecord(record, fallbackTimestamp) {
+  const role = normalizeHistoricalRole(record);
+  if (!role) {
+    return [];
+  }
+
+  const payload = record?.payload || {};
+  const timestamp = resolveRecordTimestamp(record, fallbackTimestamp);
+  const text = cleanHistoricalMessageText(
+    record.type === "response_item"
+      ? extractTextContentFromPayload(payload).join("\n")
+      : typeof payload.message === "string"
+        ? payload.message
+        : extractTextContentFromPayload(payload).join("\n")
+  );
+  if (!text) {
+    return [];
+  }
+
+  return [{ role, text, timestamp }];
+}
+
+function appendHistoricalMessage(messages, candidate) {
+  if (!candidate || !candidate.role || !candidate.text) {
+    return;
+  }
+
+  const last = messages[messages.length - 1];
+  if (last && last.role === candidate.role) {
+    const lastTimestamp = Date.parse(last.timestamp);
+    const candidateTimestamp = Date.parse(candidate.timestamp);
+    const gap = Math.abs(lastTimestamp - candidateTimestamp);
+    const lastText = sanitizeTitleFragment(last.text);
+    const candidateText = sanitizeTitleFragment(candidate.text);
+    const lastLooksLikeFragment =
+      lastText.length <= 80 && !/[。！？.!?]$/.test(lastText) && !/\n/.test(lastText);
+    const candidateLooksLikeFragment =
+      candidateText.length <= 80 && !/^[,，、:：]/.test(candidateText) && !/\n/.test(candidateText);
+    const shouldMerge =
+      lastText &&
+      candidateText &&
+      Number.isFinite(gap) &&
+      gap <= 15_000 &&
+      lastText !== candidateText &&
+      lastText.length + candidateText.length <= 320 &&
+      (lastLooksLikeFragment || candidateLooksLikeFragment || !/[。！？.!?]$/.test(lastText));
+
+    if (shouldMerge) {
+      last.text = `${last.text}\n${candidate.text}`.trim();
+      last.timestamp = lastTimestamp <= candidateTimestamp ? last.timestamp : candidate.timestamp;
+      return;
+    }
+
+    if (last.text === candidate.text && Number.isFinite(gap) && gap <= 2_000) {
+      return;
+    }
+  }
+
+  messages.push({
+    role: candidate.role,
+    text: candidate.text,
+    timestamp: candidate.timestamp
+  });
+}
+
+function findFirstRealUserMessage(messages) {
+  for (const message of messages) {
+    if (message.role !== "user") {
+      continue;
+    }
+    if (isBoilerplateUserText(message.text)) {
+      continue;
+    }
+    return message.text;
+  }
+  return "";
 }
 
 function walkJsonlFiles(rootDir) {
@@ -289,6 +836,11 @@ function contentTextItems(content) {
       continue;
     }
 
+    if (item?.type === "output_text" && item.text) {
+      items.push(String(item.text));
+      continue;
+    }
+
     if (item?.type === "tool_result" && item.content) {
       items.push(...contentTextItems(item.content));
     }
@@ -321,9 +873,165 @@ function userTextsFromPayload(payload) {
   return [];
 }
 
+function assistantTextsFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  if (payload.role === "assistant") {
+    return contentTextItems(payload.content);
+  }
+
+  if (payload.type === "agent_message" && payload.message) {
+    return [String(payload.message)];
+  }
+
+  if (payload.message?.role === "assistant") {
+    return contentTextItems(payload.message.content);
+  }
+
+  return [];
+}
+
+function compactTranscriptText(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => sanitizeTitleFragment(line))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function parseHistoricalFile(filePath) {
+  const preview = readSessionPreview(filePath);
+  let id = "";
+  let cwd = "";
+  let title = "";
+  let firstInput = "";
+  let fallbackInput = "";
+  const messages = [];
+  let sessionTimestamp = "";
+
+  for (const line of preview.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    if (record.type === "session_meta") {
+      id = String(record.payload?.id || id);
+      cwd = String(record.payload?.cwd || cwd);
+      title = sanitizeTitleFragment(record.payload?.thread_name || title);
+      sessionTimestamp = resolveRecordTimestamp(record, sessionTimestamp);
+    }
+
+    id = String(record.sessionId || id || "");
+    cwd = String(record.cwd || cwd || "");
+    title = sanitizeTitleFragment(record.slug || title);
+
+    const candidates = extractHistoricalMessagesFromRecord(record, sessionTimestamp);
+    for (const candidate of candidates) {
+      if (!fallbackInput) {
+        fallbackInput = candidate.text;
+      }
+      if (candidate.role === "user" && isBoilerplateUserText(candidate.text)) {
+        continue;
+      }
+      if (candidate.role === "user" && !firstInput) {
+        firstInput = candidate.text;
+      }
+      appendHistoricalMessage(messages, candidate);
+    }
+  }
+
+  return {
+    resumeSessionId: id || basenameWithoutExtension(filePath),
+    cwd,
+    title,
+    titleSource: firstInput || extractHistoricalTitleCandidate(title),
+    firstInput,
+    fallbackInput,
+    messages
+  };
+}
+
+function uniqueTrimmedStrings(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values || []) {
+    const text = String(value || "").trim();
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    result.push(text);
+  }
+  return result;
+}
+
+function selectModel(preferred, fallback) {
+  const preferredText = String(preferred || "").trim();
+  if (preferredText) {
+    return preferredText;
+  }
+  return String(fallback || "").trim();
+}
+
 function buildProviders(config) {
   const codexBootstrapNames = uniqueStrings(["codex", commandBaseName(config.codexBin)]);
   const ccBootstrapNames = uniqueStrings(["cc", "claude", commandBaseName(config.ccBin)]);
+  const codexModelOptions = uniqueTrimmedStrings([config.codexModel, ...(config.codexModels || [])]);
+  const ccModelOptions = uniqueTrimmedStrings([config.ccModel, ...(config.ccModels || [])]);
+  const codexArgs = ({ resumeSessionId, model }) => {
+    const args = [];
+    const selectedModel = selectModel(model, config.codexModel);
+    if (resumeSessionId) {
+      args.push("resume", "--all", resumeSessionId);
+    }
+    if (selectedModel) {
+      args.push("--model", selectedModel);
+    }
+    if (config.codexProfile) {
+      args.push("--profile", config.codexProfile);
+    }
+    if (config.codexNoAltScreen) {
+      args.push("--no-alt-screen");
+    }
+    if (config.codexFullAccess) {
+      args.push("--dangerously-bypass-approvals-and-sandbox");
+    }
+    if (config.codexExtraArgs.length > 0) {
+      args.push(...config.codexExtraArgs);
+    }
+    return args;
+  };
+  const ccArgs = ({ resumeSessionId, name, model }) => {
+    const args = [];
+    const selectedModel = selectModel(model, config.ccModel);
+    if (resumeSessionId) {
+      args.push("--resume", resumeSessionId);
+    } else if (String(name || "").trim()) {
+      args.push("--name", String(name).trim());
+    }
+    if (selectedModel) {
+      args.push("--model", selectedModel);
+    }
+    if (config.ccFullAccess) {
+      args.push("--dangerously-skip-permissions");
+    }
+    if (config.ccExtraArgs.length > 0) {
+      args.push(...config.ccExtraArgs);
+    }
+    return args;
+  };
 
   return [
     {
@@ -335,26 +1043,16 @@ function buildProviders(config) {
       fallbackPrefix: "codex",
       sessionsDir: config.codexSessionsDir,
       bootstrapNames: codexBootstrapNames,
-      buildCommand({ resumeSessionId }) {
-        const parts = [config.codexBin];
-        if (resumeSessionId) {
-          parts.push("resume", "--all", resumeSessionId);
-        }
-        if (config.codexModel) {
-          parts.push("--model", config.codexModel);
-        }
-        if (config.codexProfile) {
-          parts.push("--profile", config.codexProfile);
-        }
-        if (config.codexNoAltScreen) {
-          parts.push("--no-alt-screen");
-        }
-        if (config.codexFullAccess) {
-          parts.push("--dangerously-bypass-approvals-and-sandbox");
-        }
-        if (config.codexExtraArgs.length > 0) {
-          parts.push(...config.codexExtraArgs);
-        }
+      defaultModel: config.codexModel,
+      models: codexModelOptions,
+      buildSpawnSpec({ resumeSessionId, model }) {
+        return {
+          file: config.codexBin,
+          args: codexArgs({ resumeSessionId, model })
+        };
+      },
+      buildCommand({ resumeSessionId, model }) {
+        const parts = [config.codexBin, ...codexArgs({ resumeSessionId, model })];
         return buildShellCommand(parts, config.shellQuoteStyle);
       }
     },
@@ -367,22 +1065,16 @@ function buildProviders(config) {
       fallbackPrefix: "cc",
       sessionsDir: config.ccSessionsDir,
       bootstrapNames: ccBootstrapNames,
-      buildCommand({ resumeSessionId, name }) {
-        const parts = [config.ccBin];
-        if (resumeSessionId) {
-          parts.push("--resume", resumeSessionId);
-        } else if (String(name || "").trim()) {
-          parts.push("--name", String(name).trim());
-        }
-        if (config.ccModel) {
-          parts.push("--model", config.ccModel);
-        }
-        if (config.ccFullAccess) {
-          parts.push("--dangerously-skip-permissions");
-        }
-        if (config.ccExtraArgs.length > 0) {
-          parts.push(...config.ccExtraArgs);
-        }
+      defaultModel: config.ccModel,
+      models: ccModelOptions,
+      buildSpawnSpec({ resumeSessionId, name, model }) {
+        return {
+          file: config.ccBin,
+          args: ccArgs({ resumeSessionId, name, model })
+        };
+      },
+      buildCommand({ resumeSessionId, name, model }) {
+        const parts = [config.ccBin, ...ccArgs({ resumeSessionId, name, model })];
         return buildShellCommand(parts, config.shellQuoteStyle);
       }
     }
@@ -414,7 +1106,9 @@ export class SessionManager {
       id: provider.id,
       label: provider.label,
       cliLabel: provider.cliLabel,
-      historyLabel: provider.historyLabel
+      historyLabel: provider.historyLabel,
+      defaultModel: provider.defaultModel || "",
+      models: provider.models || []
     }));
   }
 
@@ -483,13 +1177,18 @@ export class SessionManager {
     };
   }
 
-  create({ cwd = "", name = "", resumeSessionId = "", provider = "codex" } = {}) {
+  create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "" } = {}) {
     const resolvedProvider = this.getProvider(provider);
     const id = crypto.randomUUID();
     const resolvedCwd = this.resolveCwd(cwd);
     const fallbackName = `${resolvedProvider.fallbackPrefix}-${this.sessions.size + 1}`;
     const sessionName = normalizeName(name, fallbackName);
-    const shell = pty.spawn(this.config.shellBin, this.config.shellArgs, {
+    const spawnSpec = resolvedProvider.buildSpawnSpec({
+      resumeSessionId: String(resumeSessionId || "").trim() || null,
+      name: sessionName,
+      model: String(model || "").trim()
+    });
+    const shell = pty.spawn(spawnSpec.file, spawnSpec.args, {
       name: "xterm-color",
       cols: 120,
       rows: 30,
@@ -520,19 +1219,51 @@ export class SessionManager {
       sawBootstrapCommand: false,
       bootstrapNames: resolvedProvider.bootstrapNames,
       claudeStartupStage: 0,
-      resumeSessionId: String(resumeSessionId || "").trim() || null
+      resumeSessionId: String(resumeSessionId || "").trim() || null,
+      resumeBootstrapComplete: !String(resumeSessionId || "").trim(),
+      pendingResumeInput: "",
+      model: String(model || "").trim() || resolvedProvider.defaultModel || ""
     };
 
     shell.onData((chunk) => {
-      session.buffer += chunk;
-      if (session.buffer.length > this.config.sessionBufferLimit) {
-        session.buffer = session.buffer.slice(-this.config.sessionBufferLimit);
-      }
       session.status = "running";
       session.updatedAt = nowIso();
       this.maybeAutoAdvanceClaudeStartup(session);
+
+      const visibleChunk = filterLiveOutputChunk(session, chunk);
+      if (!visibleChunk) {
+        return;
+      }
+
+      const { text: textChunk, images } = extractImagePartsFromMarkdown(visibleChunk);
+      if (!textChunk && images.length === 0) {
+        return;
+      }
+
+      if (textChunk) {
+        session.buffer += textChunk;
+      }
+      for (const image of images) {
+        session.buffer += `\n![${image.alt || "image"}](${image.url})\n`;
+      }
+      if (session.buffer.length > this.config.sessionBufferLimit) {
+        session.buffer = session.buffer.slice(-this.config.sessionBufferLimit);
+      }
+
       for (const client of session.clients) {
-        client.send(JSON.stringify({ type: "data", data: chunk }));
+        if (textChunk) {
+          client.send(JSON.stringify({ type: "data", data: textChunk }));
+        }
+        for (const image of images) {
+          client.send(
+            JSON.stringify({
+              type: "message_part",
+              role: "assistant",
+              part: image,
+              timestamp: nowIso()
+            })
+          );
+        }
       }
     });
 
@@ -549,7 +1280,6 @@ export class SessionManager {
     });
 
     this.sessions.set(id, session);
-    shell.write(`${this.buildProviderCommand(session)}\r`);
     return this.serialize(session);
   }
 
@@ -581,6 +1311,10 @@ export class SessionManager {
 
     const text = String(data || "");
     this.maybeAutoRename(session, text);
+    if (session.resumeSessionId && !session.resumeBootstrapComplete) {
+      session.pendingResumeInput = `${session.pendingResumeInput || ""}${text}`.slice(-4096);
+      session.updatedAt = nowIso();
+    }
     session.shell.write(text);
     session.updatedAt = nowIso();
   }
@@ -666,7 +1400,8 @@ export class SessionManager {
       exitCode: session.exitCode,
       autoNamed: session.autoNamed,
       inputPreview: session.inputPreview,
-      resumeSessionId: session.resumeSessionId
+      resumeSessionId: session.resumeSessionId,
+      model: session.model || ""
     };
   }
 
@@ -702,61 +1437,8 @@ export class SessionManager {
     for (const filePath of files) {
       try {
         const stat = fs.statSync(filePath);
-        const preview = readSessionPreview(filePath);
-        let id = "";
-        let cwd = this.config.defaultCwd;
-        let title = "";
-        let firstInput = "";
-        let fallbackInput = "";
-
-        for (const line of preview.split(/\r?\n/)) {
-          if (!line.trim()) {
-            continue;
-          }
-
-          let record;
-          try {
-            record = JSON.parse(line);
-          } catch {
-            continue;
-          }
-
-          if (record.type === "session_meta") {
-            id = String(record.payload?.id || id);
-            cwd = String(record.payload?.cwd || cwd);
-            title = sanitizeTitleFragment(record.payload?.thread_name || title);
-          }
-
-          id = String(record.sessionId || id || "");
-          cwd = String(record.cwd || cwd || this.config.defaultCwd);
-          title = sanitizeTitleFragment(record.slug || title);
-
-          const eventCandidates = record.type === "event_msg" ? userTextsFromPayload(record.payload) : [];
-          const fallbackCandidates =
-            record.type === "response_item"
-              ? userTextsFromPayload(record.payload)
-              : userTextsFromPayload(record);
-          const candidates = eventCandidates.length > 0 ? eventCandidates : fallbackCandidates;
-          for (const rawCandidate of candidates) {
-            const candidate = sanitizeTitleFragment(extractEmbeddedUserRequest(rawCandidate));
-            if (!candidate) {
-              continue;
-            }
-            if (!fallbackInput) {
-              fallbackInput = candidate;
-            }
-            if (!isBoilerplateUserText(candidate)) {
-              firstInput = candidate;
-              break;
-            }
-          }
-
-          if (id && firstInput) {
-            break;
-          }
-        }
-
-        id = id || basenameWithoutExtension(filePath);
+        const parsed = parseHistoricalFile(filePath);
+        const id = parsed.resumeSessionId || basenameWithoutExtension(filePath);
         if (!id) {
           continue;
         }
@@ -765,10 +1447,12 @@ export class SessionManager {
           filePath,
           stat,
           resumeSessionId: id,
-          cwd,
-          title,
-          firstInput,
-          fallbackInput
+          cwd: parsed.cwd || this.config.defaultCwd,
+          title: parsed.title,
+          firstInput: parsed.firstInput,
+          fallbackInput: parsed.fallbackInput,
+          titleSource: parsed.titleSource,
+          messages: parsed.messages
         });
       } catch {
         // Ignore malformed or unreadable session files.
@@ -779,23 +1463,34 @@ export class SessionManager {
   }
 
   buildHistoricalSession(provider, entry, kind = "history") {
-    const effectivePreview = entry.firstInput || entry.fallbackInput || entry.title;
-    const derivedName = deriveSessionTitle(
-      effectivePreview || entry.title,
-      `${provider.fallbackPrefix}-${entry.resumeSessionId.slice(0, 8)}`
-    );
     const fallbackSavedName = `Saved ${path.basename(entry.cwd || this.config.defaultCwd)} ${formatShortTimestamp(
       entry.stat.mtime,
       this.config.timezone
     )}`;
-    const finalName = isLowSignalTitle(derivedName) ? fallbackSavedName : derivedName;
-    const customName = this.getCustomName(provider.id, entry.resumeSessionId);
+    const titleSource =
+      extractHistoricalTitleCandidate(entry.firstInput) ||
+      extractHistoricalTitleCandidate(entry.title) ||
+      extractHistoricalTitleCandidate(entry.fallbackInput);
+    const derivedName = truncateHistoricalTitle(titleSource, fallbackSavedName);
+    const canonicalTitle = truncateHistoricalTitle(entry.title);
+    const summarySource = extractHistoricalSummaryCandidate(
+      entry.messages || [],
+      derivedName,
+      entry.firstInput || entry.fallbackInput || ""
+    );
+    const finalName =
+      this.getCustomName(provider.id, entry.resumeSessionId) ||
+      (!isLowSignalTitle(derivedName)
+        ? derivedName
+        : canonicalTitle && !isLowSignalTitle(canonicalTitle)
+          ? canonicalTitle
+          : fallbackSavedName);
     return {
       id: `history:${provider.id}:${entry.resumeSessionId}`,
       provider: provider.id,
       providerLabel: provider.label,
       cliLabel: provider.cliLabel,
-      name: customName || finalName,
+      name: finalName,
       cwd: entry.cwd,
       kind,
       status: kind === "archived" ? "archived" : "saved",
@@ -803,9 +1498,24 @@ export class SessionManager {
       updatedAt: entry.stat.mtime.toISOString(),
       exitCode: null,
       autoNamed: false,
-      inputPreview: isLowSignalTitle(derivedName) ? "" : effectivePreview,
+      inputPreview: summarySource || titleSource || entry.firstInput || entry.fallbackInput || "",
       resumeSessionId: entry.resumeSessionId,
       archivedAt: this.getArchivedAt(provider.id, entry.resumeSessionId)
+    };
+  }
+
+  getHistoricalMessages(providerId, resumeSessionId) {
+    const provider = this.getProvider(providerId);
+    const targetId = String(resumeSessionId || "").trim();
+    const entries = this.scanHistoricalSessionsForProvider(provider).filter((item) => item.resumeSessionId === targetId);
+    if (!entries.length) {
+      throw new Error(`Historical session not found: ${providerId}/${resumeSessionId}`);
+    }
+
+    const entry = entries.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0];
+    return {
+      session: this.buildHistoricalSession(provider, entry, this.isArchived(provider.id, entry.resumeSessionId) ? "archived" : "history"),
+      messages: entry.messages || []
     };
   }
 

@@ -12,6 +12,7 @@ import { SessionManager } from "./sessionManager.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "..", "public");
+const webDistDir = path.join(__dirname, "..", "web", "dist");
 
 const sessionManager = new SessionManager(config);
 const authSessions = new Map();
@@ -158,6 +159,11 @@ function ipv4ToInt(address) {
   return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
 }
 
+function isTailscaleIpv6(address) {
+  const normalized = normalizeIp(address).toLowerCase();
+  return normalized.startsWith("fd7a:115c:a1e0:");
+}
+
 function cidrContains(cidr, address) {
   const [baseAddress, prefixText] = String(cidr || "").split("/");
   const prefix = Number.parseInt(prefixText, 10);
@@ -184,6 +190,9 @@ function isAllowedClient(req) {
     return true;
   }
   const clientIp = getClientAddress(req);
+  if (config.tailscaleOnly && isTailscaleIpv6(clientIp)) {
+    return true;
+  }
   return cidrs.some((cidr) => cidrContains(cidr, clientIp));
 }
 
@@ -195,7 +204,20 @@ function isTrustedOrigin(req) {
   try {
     const originUrl = new URL(origin);
     const hostHeader = String(req.headers.host || "").trim();
-    return originUrl.host === hostHeader;
+    if (originUrl.host === hostHeader) {
+      return true;
+    }
+
+    // Dev-mode compatibility: allow loopback cross-port requests,
+    // e.g. Vite dev server (127.0.0.1:5173) -> API server (127.0.0.1:3210).
+    const hostName = hostHeader.split(":")[0].toLowerCase();
+    const originHostName = originUrl.hostname.toLowerCase();
+    const loopbacks = new Set(["127.0.0.1", "localhost", "::1"]);
+    if (loopbacks.has(hostName) && loopbacks.has(originHostName)) {
+      return true;
+    }
+
+    return false;
   } catch {
     return false;
   }
@@ -348,6 +370,71 @@ function serveFile(res, filePath, contentType) {
   fs.createReadStream(filePath).pipe(res);
 }
 
+function frontendRootDir() {
+  return webDistDir;
+}
+
+function resolveFrontendAsset(pathname) {
+  const rootDir = frontendRootDir();
+  const normalizedPath = pathname === "/" ? "/index.html" : pathname;
+  const safePath = path.normalize(normalizedPath).replace(/^(\.\.[/\\])+/, "");
+  const resolvedPath = path.join(rootDir, safePath);
+  if (!resolvedPath.startsWith(rootDir)) {
+    return null;
+  }
+  if (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isFile()) {
+    return null;
+  }
+  return resolvedPath;
+}
+
+function contentTypeForFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+      return "application/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".woff":
+      return "font/woff";
+    case ".woff2":
+      return "font/woff2";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function tryServeFrontendAsset(res, pathname) {
+  const filePath = resolveFrontendAsset(pathname);
+  if (!filePath) {
+    return false;
+  }
+  serveFile(res, filePath, contentTypeForFile(filePath));
+  return true;
+}
+
+function serveFrontendIndex(res) {
+  const filePath = path.join(frontendRootDir(), "index.html");
+  if (!fs.existsSync(filePath)) {
+    json(res, 503, { error: "Frontend assets are missing. Run `npm run web:build` first." });
+    return;
+  }
+  serveFile(res, filePath, "text/html; charset=utf-8");
+}
+
 function parseJson(body) {
   if (!body) {
     return {};
@@ -444,6 +531,13 @@ function routeVendor(res, pathname) {
       "addon-fit",
       "lib",
       "addon-fit.js"
+    ),
+    "/vendor/vue.js": path.join(
+      process.cwd(),
+      "node_modules",
+      "vue",
+      "dist",
+      "vue.global.prod.js"
     )
   };
 
@@ -469,7 +563,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (!isAllowedClient(req)) {
-    json(res, 403, { error: "Client address is not allowed" });
+    const clientIp = normalizeIp(getClientAddress(req));
+    console.warn(`[access] denied client=${clientIp || "unknown"} url=${req.url || ""}`);
+    json(res, 403, { error: "Client address is not allowed", clientIp });
     return;
   }
 
@@ -481,14 +577,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/styles.css") {
-    const fileMap = {
-      "/": ["index.html", "text/html; charset=utf-8"],
-      "/app.js": ["app.js", "application/javascript; charset=utf-8"],
-      "/styles.css": ["styles.css", "text/css; charset=utf-8"]
-    };
-    const [name, contentType] = fileMap[url.pathname] || fileMap["/"];
-    serveFile(res, path.join(publicDir, name), contentType);
+  if (req.method === "GET" && !url.pathname.startsWith("/api/")) {
+    if (tryServeFrontendAsset(res, url.pathname)) {
+      return;
+    }
+    if (!path.extname(url.pathname)) {
+      serveFrontendIndex(res);
+      return;
+    }
+  }
+
+  if (url.pathname === "/") {
+    serveFrontendIndex(res);
     return;
   }
 
@@ -583,6 +683,46 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/api/history-messages" && req.method === "GET") {
+    if (!isAuthorized(req)) {
+      clearAuthCookie(res);
+      unauthorized(res);
+      return;
+    }
+
+    try {
+      const provider = String(url.searchParams.get("provider") || "codex");
+      const resumeSessionId = String(url.searchParams.get("resumeSessionId") || "");
+      json(res, 200, sessionManager.getHistoricalMessages(provider, resumeSessionId));
+    } catch (err) {
+      json(res, 400, { error: err?.message || String(err) });
+    }
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/history-sessions/") && url.pathname.endsWith("/messages") && req.method === "GET") {
+    if (!isAuthorized(req)) {
+      clearAuthCookie(res);
+      unauthorized(res);
+      return;
+    }
+
+    const parts = url.pathname.split("/");
+    if (parts.length !== 6) {
+      json(res, 404, { error: "Not Found" });
+      return;
+    }
+
+    const provider = String(parts[3] || "codex").trim();
+    const resumeSessionId = String(parts[4] || "").trim();
+    try {
+      json(res, 200, sessionManager.getHistoricalMessages(provider, resumeSessionId));
+    } catch (err) {
+      json(res, 400, { error: err?.message || String(err) });
+    }
+    return;
+  }
+
   if (url.pathname === "/api/fs" && req.method === "GET") {
     if (!isAuthorized(req)) {
       clearAuthCookie(res);
@@ -611,8 +751,12 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = parseJson(await readBody(req));
       const session = sessionManager.create(body);
+      console.log(
+        `[session] created id=${session.id} provider=${session.provider} model=${session.model || ""} cwd=${session.cwd || ""} resume=${session.resumeSessionId || ""}`
+      );
       json(res, 201, { session });
     } catch (err) {
+      console.warn(`[session] create failed error=${err?.message || String(err)}`);
       json(res, 400, { error: err?.message || String(err) });
     }
     return;
@@ -797,18 +941,23 @@ server.on("upgrade", (req, socket, head) => {
   }
 
   if (!isAllowedClient(req)) {
+    console.warn(`[ws] denied client=${normalizeIp(getClientAddress(req)) || "unknown"} reason=client-not-allowed`);
     socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
     socket.destroy();
     return;
   }
 
   if (!isTrustedOrigin(req)) {
+    console.warn(
+      `[ws] denied client=${normalizeIp(getClientAddress(req)) || "unknown"} reason=origin origin=${String(req.headers.origin || "")}`
+    );
     socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
     socket.destroy();
     return;
   }
 
   if (!isAuthorized(req)) {
+    console.warn(`[ws] denied client=${normalizeIp(getClientAddress(req)) || "unknown"} reason=unauthorized`);
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
@@ -816,12 +965,14 @@ server.on("upgrade", (req, socket, head) => {
 
   const sessionId = url.searchParams.get("sessionId") || "";
   if (!sessionId || !sessionManager.get(sessionId)) {
+    console.warn(`[ws] denied client=${normalizeIp(getClientAddress(req)) || "unknown"} reason=session-not-found sessionId=${sessionId}`);
     socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
     socket.destroy();
     return;
   }
 
   wss.handleUpgrade(req, socket, head, (ws) => {
+    console.log(`[ws] connected client=${normalizeIp(getClientAddress(req)) || "unknown"} sessionId=${sessionId}`);
     wss.emit("connection", ws, req, sessionId);
   });
 });

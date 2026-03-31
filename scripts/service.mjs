@@ -9,6 +9,7 @@ const root = path.join(__dirname, "..");
 const logsDir = path.join(root, "logs");
 const pm2Script = path.join(root, "node_modules", "pm2", "bin", "pm2");
 const ecosystemFile = path.join(root, "ecosystem.config.cjs");
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const appNames = {
   prod: "codex-cc-web-terminal",
   dev: "codex-cc-web-terminal-dev"
@@ -117,6 +118,22 @@ function getAppName(mode) {
   return appNames[mode] || appNames.prod;
 }
 
+function buildFrontend() {
+  const result = spawnSync(npmCommand, ["run", "web:build"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: "inherit"
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    fail("Frontend build failed.");
+  }
+}
+
 async function waitForHealth(port, timeoutSeconds) {
   const url = `http://127.0.0.1:${port}/api/health`;
   const deadline = Date.now() + timeoutSeconds * 1000;
@@ -168,6 +185,7 @@ function getManagedApps() {
 
 async function handleStartLike(action, options) {
   ensureLogsDir();
+  buildFrontend();
   const appName = getAppName(options.mode);
   runPm2(["startOrReload", ecosystemFile, "--only", appName, "--update-env"]);
   const health = await waitForHealth(options.healthPort, options.healthTimeoutSeconds);
@@ -198,6 +216,7 @@ function handleLogs(options) {
 
 function handleResurrect(options) {
   ensureLogsDir();
+  buildFrontend();
   runPm2(["ping"], { allowFailure: true });
   runPm2(["resurrect"], { allowFailure: true });
 

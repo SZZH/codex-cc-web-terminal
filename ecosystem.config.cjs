@@ -33,7 +33,7 @@ module.exports = {
     {
       ...shared,
       name: "codex-cc-web-terminal-dev",
-      watch: [path.join(root, "src"), path.join(root, "public"), path.join(root, ".env")],
+      watch: [path.join(root, "src"), path.join(root, "web"), path.join(root, ".env")],
       ignore_watch: [
         path.join(root, "data"),
         path.join(root, "logs"),

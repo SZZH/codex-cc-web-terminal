@@ -6,7 +6,13 @@
   "description": "Browser-based multi-session Codex/CC terminal for Windows and macOS.",
   "scripts": {
     "start": "node ./src/server.js",
-    "check": "node --check ./src/server.js && node --check ./src/config.js && node --check ./src/sessionManager.js && node --check ./public/app.js && node --check ./scripts/service.mjs && node --check ./scripts/launchd/manage.mjs",
+    "build": "npm run web:build",
+    "web:build": "vite build --config ./web/vite.config.js",
+    "web:dev": "vite --config ./web/vite.config.js",
+    "dev:up": "bash ./scripts/dev-up.sh",
+    "server:dev": "node --watch ./src/server.js",
+    "dev:hot": "concurrently -k -n server,web \"npm:server:dev\" \"npm:web:dev\"",
+    "check": "node --check ./src/server.js && node --check ./src/config.js && node --check ./src/sessionManager.js && node --check ./scripts/service.mjs && node --check ./scripts/launchd/manage.mjs && npm run web:build",
     "pm2:dev": "pm2 startOrReload ecosystem.config.cjs --only codex-cc-web-terminal-dev --update-env",
     "pm2:prod": "pm2 startOrReload ecosystem.config.cjs --only codex-cc-web-terminal --update-env",
     "pm2:stop": "pm2 delete codex-cc-web-terminal codex-cc-web-terminal-dev",
@@ -27,7 +33,7 @@
     "launchd:install": "node ./scripts/launchd/manage.mjs install",
     "launchd:uninstall": "node ./scripts/launchd/manage.mjs uninstall",
     "launchd:list": "node ./scripts/launchd/manage.mjs list",
-    "dev": "npm run service:start:dev",
+    "dev": "npm run dev:hot",
     "prod": "npm run service:start"
   },
   "engines": {
@@ -35,12 +41,21 @@
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
+    "dompurify": "^3.3.3",
     "dotenv": "^17.2.3",
-    "node-pty": "^1.0.0",
+    "markdown-it": "^14.1.1",
+    "node-pty": "^1.2.0-beta.12",
+    "vue": "^3.5.31",
+    "vue-router": "^4.6.3",
+    "vue-router": "^4.6.4",
     "ws": "^8.18.3",
     "xterm": "^5.3.0"
   },
   "devDependencies": {
-    "pm2": "^6.0.8"
+    "@vitejs/plugin-vue": "^6.0.5",
+    "concurrently": "^9.2.1",
+    "concurrently": "^9.2.1",
+    "pm2": "^6.0.8",
+    "vite": "^8.0.3"
   }
 }
