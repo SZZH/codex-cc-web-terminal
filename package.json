@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Browser-based multi-session Codex/CC terminal for Windows and macOS.",
+  "description": "Browser-based multi-session Codex terminal for Windows and macOS.",
   "scripts": {
     "start": "node ./src/server.js",
     "build": "npm run web:build",
@@ -46,14 +46,12 @@
     "markdown-it": "^14.1.1",
     "node-pty": "^1.2.0-beta.12",
     "vue": "^3.5.31",
-    "vue-router": "^4.6.3",
     "vue-router": "^4.6.4",
     "ws": "^8.18.3",
     "xterm": "^5.3.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.5",
-    "concurrently": "^9.2.1",
     "concurrently": "^9.2.1",
     "pm2": "^6.0.8",
     "vite": "^8.0.3"
