@@ -1,6 +1,6 @@
-# Codex/CC Web Terminal
+# Codex Web Terminal
 
-Browser-based multi-session terminal for running native `codex` and `cc`/`claude` on your Windows or macOS machine.
+Browser-based multi-session terminal for running native `codex` on your Windows or macOS machine.
 
 ## License
 
@@ -9,13 +9,12 @@ MIT. See [LICENSE](./LICENSE).
 ## What It Does
 
 - Opens real PTY shell sessions on the host machine
-- Auto-starts native `codex` or `cc` in each new or resumed session
-- Starts both CLIs in full-access mode by default
+- Auto-starts native `codex` in each new or resumed session
+- Starts Codex CLI in full-access mode by default
 - Streams terminal output live to a browser
 - Supports multiple concurrent sessions
 - Lists saved native Codex sessions from `~/.codex/sessions`
-- Lists saved native CC sessions from `~/.claude/projects`
-- Lets you reopen saved Codex or CC sessions from the browser
+- Lets you reopen saved Codex sessions from the browser
 - Lets you pick the working directory from an in-page path dropdown
 - Lets you rename the active live session directly from the CLI page
 - Uses a short-lived HttpOnly session cookie after token login
@@ -29,7 +28,7 @@ MIT. See [LICENSE](./LICENSE).
 
 ## Prerequisites
 
-- Install native `codex` and/or `cc` (`claude`) on the host machine.
+- Install native `codex` on the host machine.
 - Install Node.js 22 or newer.
 - If you want phone access over Tailscale, install Tailscale first and sign in on both the host and the phone.
 - Platform shell defaults:
@@ -145,12 +144,10 @@ npm run service:resurrect
 
 ## Session Behavior
 
-- New browser sessions start a real PTY and launch the selected provider.
+- New browser sessions start a real PTY and launch Codex.
 - The New Session page exposes a path dropdown under `Working directory` so you can pick folders without typing the full path.
-- The New Session page also lets you choose between `codex` and `cc`.
-- Saved native Codex sessions from `~/.codex/sessions` and CC sessions from `~/.claude/projects` are listed in the Sessions panel.
-- Live sessions stay visible in the browser list, while saved history is switched by provider so long Claude history lists stay manageable.
-- Reopening a saved session starts a new live PTY that resumes that provider session.
+- Saved native Codex sessions from `~/.codex/sessions` are listed in the Sessions panel.
+- Reopening a saved session starts a new live PTY that resumes that Codex session.
 - Browser session names are auto-titled from the first meaningful input when possible.
 - Live session titles can also be edited manually from the CLI header.
 - Historical session timestamps are displayed in `DISPLAY_TIMEZONE`.
@@ -166,20 +163,21 @@ npm run service:resurrect
 ## Notes
 
 - Sessions are in-memory in this first version.
-- Each new session launches the configured shell and immediately runs the selected provider CLI.
+- Each new session launches the configured shell and immediately runs Codex CLI.
 - Resumed Codex sessions launch `codex resume --all <session-id>`.
-- Resumed CC sessions launch `claude --resume <session-id>` by default. Set `CC_BIN=cc` if you prefer that command name.
-- Claude sessions auto-advance the initial workspace trust and bypass-permissions confirmations so the browser session lands in the Claude UI instead of hanging on startup prompts.
-- Claude mobile paste uses bracketed paste handling, and the terminal interrupt button switches to `Ctrl+C` while a Claude session is active.
 - Default launch flags are controlled by `.env`:
   - `SHELL_BIN` and `SHELL_ARGS` let you override the host shell
   - `CODEX_FULL_ACCESS=true`
   - `CODEX_NO_ALT_SCREEN=true`
-  - `CC_FULL_ACCESS=true`
   - `DISPLAY_TIMEZONE=Australia/Melbourne`
   - leave `DEFAULT_CWD` empty to use your own home directory
-  - optional `CODEX_MODEL`, `CODEX_PROFILE`, `CODEX_EXTRA_ARGS`, `CC_MODEL`, `CC_EXTRA_ARGS`, and `CC_SESSIONS_DIR`
+  - optional `CODEX_MODEL`, `CODEX_PROFILE`, and `CODEX_EXTRA_ARGS`
 - `/api/health` returns basic uptime, session, auth, and WebSocket counters for monitoring.
+
+## Scope
+
+Current open-source release targets Codex only.
+Some legacy multi-provider settings may still exist internally for compatibility, but they are not part of the supported public feature set.
 
 ## Open Source Docs
 
