@@ -1,186 +1,192 @@
 # Codex Web Terminal
 
-Browser-based multi-session terminal for running native `codex` on your Windows or macOS machine.
+在你的 Windows/macOS 机器上运行 `codex`，并通过浏览器（电脑/手机）访问多会话界面。
 
-## License
+当前开源版本仅支持 **Codex**。
 
-MIT. See [LICENSE](./LICENSE).
+## 1. 你会得到什么
 
-## What It Does
+- 浏览器里管理 Codex 会话（列表、历史、恢复、发送、中断）
+- 手机可访问（局域网或 Tailscale）
+- 开发模式支持热更新（前端 HMR + 后端 watch）
 
-- Opens real PTY shell sessions on the host machine
-- Auto-starts native `codex` in each new or resumed session
-- Starts Codex CLI in full-access mode by default
-- Streams terminal output live to a browser
-- Supports multiple concurrent sessions
-- Lists saved native Codex sessions from `~/.codex/sessions`
-- Lets you reopen saved Codex sessions from the browser
-- Lets you pick the working directory from an in-page path dropdown
-- Lets you rename the active live session directly from the CLI page
-- Uses a short-lived HttpOnly session cookie after token login
-- Supports optional login rate limiting and network allowlists
-- Supports managed restarts with `pm2`
-- Supports optional auto-restore after login
-- Works from:
-  - your PC at `http://localhost:3210`
-  - your phone on the same LAN
-  - your phone over Tailscale
+## 2. 环境要求
 
-## Prerequisites
+- Node.js >= 22
+- 本机已安装并可执行 `codex`
+- （可选）需要手机外网访问时安装 Tailscale
 
-- Install native `codex` on the host machine.
-- Install Node.js 22 or newer.
-- If you want phone access over Tailscale, install Tailscale first and sign in on both the host and the phone.
-- Platform shell defaults:
-  - Windows: Windows PowerShell is used by default.
-  - macOS: your login shell from `$SHELL` is used by default, usually `/bin/zsh`.
-- Decide whether you want:
-  - local + LAN access
-  - local + Tailscale-only access with `TAILSCALE_ONLY=true`
-
-## Setup
-
-1. Copy `.env.example` to `.env`
-2. Set a strong `ACCESS_TOKEN`
-3. Optional: set `SHELL_BIN` / `SHELL_ARGS` if you want a non-default shell.
-4. If you want Tailscale phone access, make sure Tailscale is already installed, connected, and has assigned an IP on the host.
-5. Optional: tighten access with `TAILSCALE_ONLY=true` or `TRUSTED_CIDRS`
-6. Optional: tune session TTL / rate limits / heartbeat timings
-7. Install dependencies:
+检查命令：
 
 ```bash
+node -v
+codex --version
+```
+
+## 3. 最快启动（本地）
+
+### 3.1 初始化
+
+```bash
+cd /Users/jiaojian/Desktop/self/codex-cc-web-terminal
+cp .env.example .env
 npm install
 ```
 
-8. Start the server directly:
+编辑 `.env`，至少改这两项：
 
-```bash
-npm start
+```env
+PORT=3210
+ACCESS_TOKEN=改成你自己的强密码token
 ```
 
-For development (backend watch + web HMR):
+### 3.2 启动（开发模式，推荐）
 
 ```bash
 npm run dev:up
 ```
 
-9. Or run it under `pm2` with the shared service entrypoint:
+启动后：
+
+- API 服务：`http://127.0.0.1:3210`
+- 前端 HMR：`http://127.0.0.1:5173/#/sessions`
+
+查看日志：
 
 ```bash
-npm run service:start
+tail -f /tmp/codex-server-dev.log /tmp/codex-web-dev.log
 ```
 
-## Access
+## 4. 手机访问（局域网）
 
-- Local PC: `http://localhost:3210`
-- Same Wi-Fi phone: `http://<your-pc-lan-ip>:3210`
-- Tailscale phone: `http://<your-tailscale-ip>:3210`
-- Dev web (HMR): `http://127.0.0.1:5173/#/sessions`
+1. 确保手机和电脑在同一 Wi-Fi。
+2. 电脑上查看局域网 IP（例如 `192.168.1.23`）。
+3. 手机访问：`http://<电脑IP>:3210`
+4. 输入 `.env` 的 `ACCESS_TOKEN` 登录。
 
-Before the UI will work, open the correct address for your network path, enter the `ACCESS_TOKEN` from `.env`, then create a new session.
-If `TAILSCALE_ONLY=true`, the same-Wi-Fi LAN address is blocked; use `http://localhost:3210` on the PC or `http://<your-tailscale-ip>:3210` from your phone.
-The token is exchanged for an HttpOnly session cookie; subsequent API and WebSocket requests use that cookie instead of sending the token again.
+如果打不开：
 
-## PM2 Management
+- 检查防火墙是否放行 `3210`
+- 确保 `.env` 里 `HOST=0.0.0.0`
 
-- Unified service entrypoint:
+## 5. 手机访问（Tailscale，推荐外网）
+
+## 5.1 安装
+
+- 电脑端：安装并登录 Tailscale（[官方下载](https://tailscale.com/download)）
+- 手机端：安装 Tailscale App（iOS/Android）并登录同一账号
+
+## 5.2 连接
+
+电脑端确认在线：
+
+```bash
+tailscale status
+tailscale ip -4
+```
+
+拿到电脑 Tailscale IP（如 `100.x.x.x`）后，手机访问：
+
+`http://<tailscale-ip>:3210`
+
+建议 `.env` 开启仅 Tailscale 访问：
+
+```env
+TAILSCALE_ONLY=true
+```
+
+## 6. 生产部署（PM2）
+
+安装依赖后，直接用内置脚本：
 
 ```bash
 npm run service:start
+npm run service:status
+```
+
+常用命令：
+
+```bash
 npm run service:restart
 npm run service:stop
-npm run service:status
-npm run service:list
 npm run service:logs
+npm run service:list
 ```
 
-- Development watch mode:
+## 7. 自启动
+
+### macOS（launchd）
 
 ```bash
-npm run service:start:dev
+npm run launchd:install
+npm run launchd:list
 ```
 
-- `stop` only stops the service. It does not restart it.
-- `restart` waits for `/api/health` before returning.
-- `list` shows the managed `codex-cc-web-terminal` PM2 apps without the extra health output from `status`.
-- `scripts/service.mjs` is the shared implementation used by both Windows and macOS.
-- On Windows, `service.ps1`, `start.ps1`, `stop.ps1`, `restart.ps1`, `status.ps1`, and `logs.ps1` still exist as thin wrappers if you prefer PowerShell.
-
-- Windows PowerShell wrappers:
-
-```powershell
-.\scripts\service.ps1 -Action status
-.\scripts\service.ps1 -Action start -Mode prod
-.\scripts\service.ps1 -Action restart -Mode prod
-.\scripts\service.ps1 -Action stop
-.\\scripts\\service.ps1 -Action list
-.\scripts\service.ps1 -Action logs
-```
-
-```powershell
-.\scripts\start.ps1 -Mode dev
-```
-
-## Auto Start
-
-- The production process is managed by `pm2`.
-- PM2 state is persisted with `pm2 save`.
-- Shared restore command:
+卸载：
 
 ```bash
-npm run service:resurrect
+npm run launchd:uninstall
 ```
 
-- Windows:
-  - keep using Task Scheduler if you want login-time recovery
-  - the scheduled task can run `.\scripts\pm2-resurrect.ps1`
-- macOS:
-  - use `launchd`
-  - inspect the rendered plist with `npm run launchd:render`
-  - install the agent with `npm run launchd:install`
-  - verify it with `npm run launchd:list`
-  - remove it with `npm run launchd:uninstall`
-  - the installer renders `scripts/launchd/com.codex-cc-web-terminal.plist.template` into `~/Library/LaunchAgents/com.codex-cc-web-terminal.plist` using the current Node executable and repo path
+### Windows
 
-## Session Behavior
+可用任务计划程序在登录后执行 PM2 恢复。
 
-- New browser sessions start a real PTY and launch Codex.
-- The New Session page exposes a path dropdown under `Working directory` so you can pick folders without typing the full path.
-- Saved native Codex sessions from `~/.codex/sessions` are listed in the Sessions panel.
-- Reopening a saved session starts a new live PTY that resumes that Codex session.
-- Browser session names are auto-titled from the first meaningful input when possible.
-- Live session titles can also be edited manually from the CLI header.
-- Historical session timestamps are displayed in `DISPLAY_TIMEZONE`.
+## 8. 常用配置（.env）
 
-## Network Notes
+最常用：
 
-- If you want phone access on the same Wi-Fi or over Tailscale, keep `HOST=0.0.0.0`.
-- If Windows Firewall prompts for Node.js access, allow it on the network type you plan to use.
-- Tailscale access usually looks like `http://<tailscale-ip>:3210`.
-- If you only want local + Tailscale access, set `TAILSCALE_ONLY=true`.
-- If you want a custom allowlist, set `TRUSTED_CIDRS` to a comma-separated list like `127.0.0.0/8,100.64.0.0/10`.
+```env
+HOST=0.0.0.0
+PORT=3210
+ACCESS_TOKEN=your-strong-token
+TAILSCALE_ONLY=false
+TRUSTED_CIDRS=
+CODEX_BIN=codex
+CODEX_MODEL=
+CODEX_PROFILE=
+CODEX_FULL_ACCESS=true
+CODEX_NO_ALT_SCREEN=true
+CODEX_EXTRA_ARGS=
+DISPLAY_TIMEZONE=Asia/Shanghai
+```
 
-## Notes
+说明：
 
-- Sessions are in-memory in this first version.
-- Each new session launches the configured shell and immediately runs Codex CLI.
-- Resumed Codex sessions launch `codex resume --all <session-id>`.
-- Default launch flags are controlled by `.env`:
-  - `SHELL_BIN` and `SHELL_ARGS` let you override the host shell
-  - `CODEX_FULL_ACCESS=true`
-  - `CODEX_NO_ALT_SCREEN=true`
-  - `DISPLAY_TIMEZONE=Australia/Melbourne`
-  - leave `DEFAULT_CWD` empty to use your own home directory
-  - optional `CODEX_MODEL`, `CODEX_PROFILE`, and `CODEX_EXTRA_ARGS`
-- `/api/health` returns basic uptime, session, auth, and WebSocket counters for monitoring.
+- `TAILSCALE_ONLY=true`：只允许本机 + Tailscale 网段访问
+- `TRUSTED_CIDRS`：自定义白名单网段（逗号分隔）
+- `CODEX_MODEL`：默认模型
 
-## Scope
+## 9. 常见问题
 
-Current open-source release targets Codex only.
-Some legacy multi-provider settings may still exist internally for compatibility, but they are not part of the supported public feature set.
+### Q1: 登录提示 `Cross-origin request rejected`
 
-## Open Source Docs
+使用 `npm run dev:up` 启动，前后端配套开发模式已处理本机跨端口校验。
 
-- Contribution guide: [CONTRIBUTING.md](./CONTRIBUTING.md)
-- Security policy: [SECURITY.md](./SECURITY.md)
-- Code of conduct: [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)
+### Q2: 5173 打不开
+
+先重启开发服务：
+
+```bash
+npm run dev:up
+```
+
+再检查端口：
+
+```bash
+lsof -iTCP:5173 -sTCP:LISTEN -n -P
+lsof -iTCP:3210 -sTCP:LISTEN -n -P
+```
+
+### Q3: 手机能打开但提示“电脑未连接”
+
+- 确认电脑端服务在线（`service:status`）
+- 确认手机和电脑在同一网络路径（同 Wi-Fi 或同 Tailnet）
+
+## 10. 开源协作
+
+- License: [MIT](./LICENSE)
+- 贡献指南: [CONTRIBUTING.md](./CONTRIBUTING.md)
+- 安全策略: [SECURITY.md](./SECURITY.md)
+- 行为准则: [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)
+
