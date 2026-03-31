@@ -2,6 +2,10 @@
 
 Browser-based multi-session terminal for running native `codex` and `cc`/`claude` on your Windows or macOS machine.
 
+## License
+
+MIT. See [LICENSE](./LICENSE).
+
 ## What It Does
 
 - Opens real PTY shell sessions on the host machine
@@ -55,6 +59,12 @@ npm install
 npm start
 ```
 
+For development (backend watch + web HMR):
+
+```bash
+npm run dev:up
+```
+
 9. Or run it under `pm2` with the shared service entrypoint:
 
 ```bash
@@ -66,6 +76,7 @@ npm run service:start
 - Local PC: `http://localhost:3210`
 - Same Wi-Fi phone: `http://<your-pc-lan-ip>:3210`
 - Tailscale phone: `http://<your-tailscale-ip>:3210`
+- Dev web (HMR): `http://127.0.0.1:5173/#/sessions`
 
 Before the UI will work, open the correct address for your network path, enter the `ACCESS_TOKEN` from `.env`, then create a new session.
 If `TAILSCALE_ONLY=true`, the same-Wi-Fi LAN address is blocked; use `http://localhost:3210` on the PC or `http://<your-tailscale-ip>:3210` from your phone.
@@ -169,3 +180,9 @@ npm run service:resurrect
   - leave `DEFAULT_CWD` empty to use your own home directory
   - optional `CODEX_MODEL`, `CODEX_PROFILE`, `CODEX_EXTRA_ARGS`, `CC_MODEL`, `CC_EXTRA_ARGS`, and `CC_SESSIONS_DIR`
 - `/api/health` returns basic uptime, session, auth, and WebSocket counters for monitoring.
+
+## Open Source Docs
+
+- Contribution guide: [CONTRIBUTING.md](./CONTRIBUTING.md)
+- Security policy: [SECURITY.md](./SECURITY.md)
+- Code of conduct: [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)
