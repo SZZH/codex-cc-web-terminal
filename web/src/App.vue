@@ -136,6 +136,29 @@ const activeSessionTitle = computed(() => {
 
 const activeWorkspaceName = computed(() => workspaceName(state.activeSessionMeta?.cwd || ""));
 const activeAssistantName = computed(() => state.activeSessionMeta?.providerLabel || "Codex");
+const routeHistoryTarget = computed(() => {
+  if (route.name !== "chat") {
+    return null;
+  }
+  return parseHistoryRouteSessionId(route.params.sessionId);
+});
+const expectedThreadId = computed(() => {
+  const target = routeHistoryTarget.value;
+  if (!target || target.provider !== "codex") {
+    return "";
+  }
+  return target.resumeSessionId;
+});
+const activeThreadId = computed(() => String(state.activeSessionMeta?.resumeSessionId || "").trim());
+const threadMismatch = computed(() => {
+  if (!expectedThreadId.value) {
+    return false;
+  }
+  if (!activeThreadId.value) {
+    return false;
+  }
+  return expectedThreadId.value !== activeThreadId.value;
+});
 const canSend = computed(() => Boolean(composerDraft.value.trim()));
 const canInterrupt = computed(() => {
   const socketReady =
@@ -704,6 +727,21 @@ function attachLiveSocket(sessionId, historyMessages = []) {
       return;
     }
 
+    if (payload.type === "session_updated" && payload.session) {
+      const updated = decorateSession(payload.session);
+      state.activeSessionMeta = updated;
+      if (state.activeSessionId === updated.id) {
+        state.activeLiveSessionId = updated.id;
+      }
+      const index = state.sessions.findIndex((item) => item.id === updated.id);
+      if (index >= 0) {
+        const next = [...state.sessions];
+        next[index] = updated;
+        state.sessions = next;
+      }
+      return;
+    }
+
     if (payload.type === "data") {
       if (payload.data && String(payload.data).trim()) {
         clearPendingReplyStatus();
@@ -930,9 +968,19 @@ async function submitInput() {
   try {
     state.loading = true;
     setStatus("正在发送…");
+    if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
+      throw new Error(
+        `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。请返回列表后重新打开该会话。`
+      );
+    }
     await ensureLiveSession();
     if (!state.activeSocket || state.activeSocket.readyState !== WebSocket.OPEN) {
       throw new Error("会话连接还没准备好，请重试一次");
+    }
+    if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
+      throw new Error(
+        `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。已取消发送，避免写入错误会话。`
+      );
     }
     finalizeAssistantStream();
     state.activeSocket.send(JSON.stringify({ type: "input", data: `${text}\n` }));
@@ -1164,6 +1212,9 @@ if (typeof window !== 'undefined') {
         :session-key="state.activeSessionMeta?.resumeSessionId || state.activeSessionMeta?.id || ''"
         :open-token="state.activeSessionOpenToken"
         :title="activeSessionTitle"
+        :thread-id="activeThreadId"
+        :expected-thread-id="expectedThreadId"
+        :thread-mismatch="threadMismatch"
         :workspace-name="activeWorkspaceName"
         :assistant-name="activeAssistantName"
         :messages="state.activeMessages"
