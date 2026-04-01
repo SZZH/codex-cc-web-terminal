@@ -62,11 +62,7 @@ const PROCESS_PATTERNS = [
   /codex resume/i,
   /'codex'.*'resume'/i,
   /current changes/i,
-  /\bworkdir\b/i,
-  /^I'm\b/i,
-  /^I’m\b/i,
-  /^我正在\b/,
-  /^我先\b/
+  /\bworkdir\b/i
 ];
 
 function isProcessLine(line) {
@@ -88,49 +84,10 @@ function splitMessageParts(message) {
     .map((line) => line.trimEnd())
     .filter((line) => String(line || "").trim().length > 0);
 
-  const processFlags = lines.map((line) => isProcessLine(line));
-  const processCount = processFlags.filter(Boolean).length;
-  const shouldCollapse = Boolean(message?.streaming || message?.source === "live" || processCount > 0);
-
-  if (!shouldCollapse) {
-    return {
-      primary: lines.join("\n").trim(),
-      process: ""
-    };
-  }
-
-  const primaryIndexes = [];
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (processFlags[index]) {
-      continue;
-    }
-    primaryIndexes.unshift(index);
-    if (primaryIndexes.length >= 2) {
-      break;
-    }
-  }
-
-  if (!primaryIndexes.length) {
-    return {
-      primary: "",
-      process: lines.join("\n").trim()
-    };
-  }
-
-  const primarySet = new Set(primaryIndexes);
-  const primaryLines = [];
-  const processLines = [];
-
-  lines.forEach((line, index) => {
-    if (primarySet.has(index)) {
-      primaryLines.push(line);
-      return;
-    }
-    processLines.push(line);
-  });
-
+  const processLines = lines.filter((line) => isProcessLine(line));
   return {
-    primary: primaryLines.join("\n").trim(),
+    // Keep full assistant text visible by default to avoid hiding real content.
+    primary: lines.join("\n").trim(),
     process: processLines.join("\n").trim()
   };
 }

@@ -5,7 +5,7 @@ import { useRoute, useRouter } from "vue-router";
 import ChatView from "./components/ChatView.vue";
 import LoginView from "./components/LoginView.vue";
 import SessionListView from "./components/SessionListView.vue";
-import { request, requestHistoryMessages } from "./lib/api.js";
+import { request, requestHistoryMessages, requestSessionById } from "./lib/api.js";
 import { normalizeServerPayload } from "./lib/normalize-events.js";
 import {
   PREVIEW_FALLBACK,
@@ -34,6 +34,7 @@ const pendingHydrations = new Map();
 const TOKEN_STORAGE_KEY = "codex-web-terminal.saved-token";
 let autoLoginTried = false;
 let replaySuppressionLines = new Set();
+let submitFallbackTimer = null;
 
 const LIVE_BOOTSTRAP_LINE_PATTERNS = [
   /^[╭╰│─]+$/,
@@ -70,7 +71,9 @@ const state = reactive({
   activeSessionOpenToken: 0,
   replayGuardActive: false,
   replayGuardPrompt: "",
-  replayGuardUntil: 0
+  replayGuardUntil: 0,
+  lastSubmitText: "",
+  lastSubmitAt: 0
 });
 let syncingRouteOpen = false;
 
@@ -78,6 +81,20 @@ function cacheKey(session) {
   return session?.kind === "history"
     ? `history:${session.provider}:${session.resumeSessionId}`
     : `live:${session?.id || "unknown"}`;
+}
+
+function parseHistoryRouteSessionId(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^history:([^:]+):(.+)$/i);
+  if (!match) {
+    return null;
+  }
+  const provider = String(match[1] || "").trim().toLowerCase();
+  const resumeSessionId = String(match[2] || "").trim();
+  if (!provider || !resumeSessionId) {
+    return null;
+  }
+  return { provider, resumeSessionId };
 }
 
 function decorateSession(session) {
@@ -120,15 +137,36 @@ const activeSessionTitle = computed(() => {
 const activeWorkspaceName = computed(() => workspaceName(state.activeSessionMeta?.cwd || ""));
 const activeAssistantName = computed(() => state.activeSessionMeta?.providerLabel || "Codex");
 const canSend = computed(() => Boolean(composerDraft.value.trim()));
-const canInterrupt = computed(
-  () =>
+const canInterrupt = computed(() => {
+  const socketReady =
     Boolean(state.activeLiveSessionId) &&
     Boolean(state.activeSocket) &&
-    state.activeSocket.readyState === WebSocket.OPEN
-);
+    state.activeSocket.readyState === WebSocket.OPEN;
+  if (!socketReady) {
+    return false;
+  }
+  if (state.loading) {
+    return true;
+  }
+  if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
+    return true;
+  }
+  if (String(state.activeStreamBuffer || "").trim()) {
+    return true;
+  }
+  const lastMessage = state.activeMessages[state.activeMessages.length - 1];
+  return Boolean(lastMessage?.role === "assistant" && lastMessage?.streaming);
+});
 
 function setStatus(message = "") {
   state.statusText = message;
+}
+
+function clearSubmitFallbackTimer() {
+  if (submitFallbackTimer) {
+    window.clearTimeout(submitFallbackTimer);
+    submitFallbackTimer = null;
+  }
 }
 
 function toFriendlyLoginError(error) {
@@ -243,6 +281,33 @@ function pruneLiveBootstrapNoise(value) {
   return filtered.join("\n").trim();
 }
 
+function pruneMessagePartNoise(value) {
+  const lines = String(value || "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+
+  const filtered = lines.filter((line) => {
+    const compact = compactLine(line);
+    if (!compact) {
+      return false;
+    }
+    if (/^[\u2500-\u257f\s]+$/.test(compact)) {
+      return false;
+    }
+    if (
+      /openai codex|^model:|^directory:|new try the codex app|\/feedback|conversation interrupted|esc to interrupt/i.test(
+        compact
+      )
+    ) {
+      return false;
+    }
+    return true;
+  });
+
+  return filtered.join("\n").trim();
+}
+
 function finalizeAssistantStream() {
   if (!state.activeStreamBuffer) {
     return;
@@ -270,7 +335,8 @@ function discardPendingAssistantStream() {
   }
 }
 
-function appendAssistantChunk(chunk) {
+function appendAssistantChunk(chunk, { source = "normalized" } = {}) {
+  clearSubmitFallbackTimer();
   const now = Date.now();
   if (state.replayGuardActive && now >= state.replayGuardUntil) {
     state.replayGuardActive = false;
@@ -278,7 +344,13 @@ function appendAssistantChunk(chunk) {
     state.replayGuardUntil = 0;
   }
 
-  let normalized = pruneLiveBootstrapNoise(filterTerminalNoise(chunk || ""));
+  let normalized = "";
+  if (source === "message_part") {
+    normalized = pruneMessagePartNoise(normalizeLine(chunk || ""));
+  } else {
+    // 旧 `data` 通道保留原有清洗，兼容历史行为。
+    normalized = pruneLiveBootstrapNoise(filterTerminalNoise(chunk || ""));
+  }
   if (!normalized) {
     return;
   }
@@ -332,21 +404,15 @@ function appendAssistantChunk(chunk) {
   state.activeMessages = messages;
 }
 
-function stringifyPartPayload(payload) {
-  try {
-    return `\`\`\`json\n${JSON.stringify(payload || {}, null, 2)}\n\`\`\``;
-  } catch {
-    return String(payload || "");
-  }
-}
-
 function appendNormalizedParts(parts = []) {
+  clearSubmitFallbackTimer();
   if (!Array.isArray(parts) || parts.length === 0) {
     return;
   }
 
   let messages = [...state.activeMessages];
   let touched = false;
+  let hasStreamingUpdate = false;
 
   for (const part of parts) {
     const partType = String(part?.partType || "").trim();
@@ -361,9 +427,22 @@ function appendNormalizedParts(parts = []) {
         continue;
       }
       if (role === "assistant" && phase === "streaming") {
-        appendAssistantChunk(text);
+        appendAssistantChunk(text, { source: part?.source || "normalized" });
         touched = true;
+        hasStreamingUpdate = true;
         continue;
+      }
+      if (role === "assistant") {
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage?.role === "assistant" && lastMessage?.streaming) {
+          lastMessage.text = text;
+          lastMessage.streaming = false;
+          touched = true;
+          continue;
+        }
+        if (lastMessage?.role === "assistant" && normalizeLine(String(lastMessage.text || "")) === text) {
+          continue;
+        }
       }
       messages.push(
         createMessage(role, text, ts, {
@@ -396,19 +475,31 @@ function appendNormalizedParts(parts = []) {
       continue;
     }
 
-    const fallbackText = stringifyPartPayload(payload);
-    messages.push(
-      createMessage(role, fallbackText, ts, {
-        source: part?.source || "normalized",
-        partType: partType || "unknown",
-        payload,
-        rawType: part?.rawType || ""
-      })
-    );
-    touched = true;
+    if (partType === "error") {
+      const errorText = sanitizeAssistantText(
+        normalizeLine(String(payload.message || payload.text || "系统事件，请稍后重试。"))
+      );
+      if (!errorText) {
+        continue;
+      }
+      messages.push(
+        createMessage("system", errorText, ts, {
+          source: part?.source || "normalized",
+          partType,
+          payload,
+          rawType: part?.rawType || ""
+        })
+      );
+      touched = true;
+    }
   }
 
   if (touched) {
+    // Streaming chunks mutate `state.activeMessages` in appendAssistantChunk.
+    // If we always overwrite with the stale local `messages`, live text disappears until refresh.
+    if (hasStreamingUpdate) {
+      messages = [...state.activeMessages];
+    }
     state.activeMessages = messages;
   }
 }
@@ -447,7 +538,8 @@ async function hydrateSession(session, { includeMessages = false, silent = false
         hydrated: true,
         title: fallbackTitleForSession(session),
         preview: fallbackPreviewForSession(session),
-        messages: []
+        messages: [],
+        session: null
       };
       sessionCache[key] = { ...(sessionCache[key] || {}), ...nextValue };
       return sessionCache[key];
@@ -456,7 +548,7 @@ async function hydrateSession(session, { includeMessages = false, silent = false
     const messages = normalizeHistoryMessages(payload.messages || []);
     const title = pickRealTitle(messages, payload.session?.name || session.name, session);
     const preview = pickPreview(messages, session, title);
-    const nextValue = { hydrated: true, title, preview, messages };
+    const nextValue = { hydrated: true, title, preview, messages, session: payload.session || null };
     sessionCache[key] = { ...(sessionCache[key] || {}), ...nextValue };
     return sessionCache[key];
   })();
@@ -492,12 +584,13 @@ async function prefetchSessionTitles() {
 async function refreshSessions() {
   const payload = await request("/api/sessions");
   state.sessions = payload.sessions || [];
-  prefetchSessionTitles().catch(() => {});
 }
 
-async function bootstrapWorkspace() {
+async function bootstrapWorkspace({ includeSessions = true } = {}) {
   await request("/api/config");
-  await refreshSessions();
+  if (includeSessions) {
+    await refreshSessions();
+  }
 }
 
 async function handleLogin({ silent = false, auto = false } = {}) {
@@ -517,8 +610,13 @@ async function handleLogin({ silent = false, auto = false } = {}) {
     state.accessToken = "";
     setStatus("");
     await bootstrapWorkspace();
-    if (route.name !== "sessions") {
-      await router.replace({ name: "sessions" });
+    if (route.name === "login") {
+      const redirectPath = String(route.query.redirect || "").trim();
+      if (redirectPath) {
+        await router.replace(redirectPath);
+      } else {
+        await router.replace({ name: "sessions" });
+      }
     }
   } catch (error) {
     if (auto) {
@@ -539,6 +637,7 @@ async function handleLogin({ silent = false, auto = false } = {}) {
 }
 
 function closeSocket() {
+  clearSubmitFallbackTimer();
   if (state.activeSocket) {
     state.activeSocket.close();
     state.activeSocket = null;
@@ -602,23 +701,6 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "snapshot") {
-      if (!historyMessages.length) {
-        const snapshot = filterTerminalNoise(payload.buffer || "");
-        if (snapshot) {
-          const systemFailure = detectSystemFailureText(snapshot);
-          if (systemFailure) {
-            discardPendingAssistantStream();
-            setStatus(systemFailure);
-            return;
-          }
-          clearPendingReplyStatus();
-          setMessages([
-            createMessage("assistant", snapshot, payload.session?.updatedAt || "", {
-              source: "snapshot"
-            })
-          ]);
-        }
-      }
       return;
     }
 
@@ -631,11 +713,14 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "message_part") {
+      if (payload?.part?.type === "text" && String(payload?.part?.text || "").trim()) {
+        clearPendingReplyStatus();
+      }
       appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
       return;
     }
 
-    if (payload.type === "event_msg" || payload.type === "response_item") {
+    if (payload.type === "event_msg") {
       appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
       return;
     }
@@ -700,6 +785,8 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
 }
 
 async function openHistoricalSession(session, { skipRoute = false } = {}) {
+  closeSocket();
+  finalizeAssistantStream();
   state.pendingSessionId = session.id;
   setStatus("正在加载会话…");
   const decorated = decorateSession(session);
@@ -709,6 +796,7 @@ async function openHistoricalSession(session, { skipRoute = false } = {}) {
   state.activeSessionId = session.id;
   state.activeSessionMeta = {
     ...decorated,
+    cwd: hydrated?.session?.cwd || decorated.cwd || "",
     displayTitle: hydrated?.title || decorated.displayTitle,
     displayPreview: hydrated?.preview || decorated.displayPreview
   };
@@ -728,8 +816,17 @@ async function openHistoricalSession(session, { skipRoute = false } = {}) {
 
 async function openSessionItem(session, { skipRoute = false } = {}) {
   try {
-    if (session.kind === "history") {
-      await openHistoricalSession(session, { skipRoute });
+    if (session.kind === "history" || session.resumeSessionId) {
+      const historySession =
+        session.kind === "history"
+          ? session
+          : {
+              ...session,
+              id: `history:${session.provider}:${session.resumeSessionId}`,
+              kind: "history",
+              status: "saved"
+            };
+      await openHistoricalSession(historySession, { skipRoute });
       return;
     }
     await openLiveSession(session, { skipRoute });
@@ -766,6 +863,26 @@ async function ensureLiveSession() {
     return state.activeSessionMeta.id;
   }
 
+  const resumeSessionId = String(state.activeSessionMeta.resumeSessionId || "").trim();
+  const provider = String(state.activeSessionMeta.provider || "").trim().toLowerCase();
+  if (resumeSessionId && provider) {
+    const reusable = state.sessions
+      .filter(
+        (session) =>
+          session.kind === "live" &&
+          session.status !== "exited" &&
+          String(session.provider || "").trim().toLowerCase() === provider &&
+          String(session.resumeSessionId || "").trim() === resumeSessionId
+      )
+      .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
+    if (reusable) {
+      state.activeSessionMeta = decorateSession(reusable);
+      state.activeLiveSessionId = reusable.id;
+      await attachLiveSocket(reusable.id, state.activeMessages);
+      return reusable.id;
+    }
+  }
+
   const resumed = await request("/api/sessions", {
     method: "POST",
     body: JSON.stringify({
@@ -796,13 +913,19 @@ async function ensureLiveSession() {
 }
 
 async function submitInput() {
-  if (!canSend.value) {
+  if (!canSend.value || state.loading) {
     return;
   }
   const text = composerDraft.value.trim();
   if (!text) {
     return;
   }
+  const now = Date.now();
+  if (text === state.lastSubmitText && now - Number(state.lastSubmitAt || 0) < 2500) {
+    return;
+  }
+  state.lastSubmitText = text;
+  state.lastSubmitAt = now;
 
   try {
     state.loading = true;
@@ -812,7 +935,8 @@ async function submitInput() {
       throw new Error("会话连接还没准备好，请重试一次");
     }
     finalizeAssistantStream();
-    state.activeSocket.send(JSON.stringify({ type: "input", data: `${text}\r` }));
+    state.activeSocket.send(JSON.stringify({ type: "input", data: `${text}\n` }));
+    clearSubmitFallbackTimer();
     if (state.replayGuardActive) {
       state.replayGuardPrompt = text;
     }
@@ -831,6 +955,7 @@ async function submitInput() {
 }
 
 function interruptActiveSession() {
+  clearSubmitFallbackTimer();
   if (!state.activeSocket || state.activeSocket.readyState !== WebSocket.OPEN) {
     setStatus("当前没有可中断的运行流程。");
     return;
@@ -845,6 +970,7 @@ function interruptActiveSession() {
 }
 
 async function backToList() {
+  clearSubmitFallbackTimer();
   closeSocket();
   finalizeAssistantStream();
   state.replayGuardActive = false;
@@ -884,13 +1010,19 @@ watch(
 
     if (!isAuthenticated) {
       if (routeName !== "login") {
-        await router.replace({ name: "login" });
+        const redirect = route.fullPath || "/sessions";
+        await router.replace({ name: "login", query: { redirect } });
       }
       return;
     }
 
     if (routeName === "login") {
-      await router.replace({ name: "sessions" });
+      const redirectPath = String(route.query.redirect || "").trim();
+      if (redirectPath) {
+        await router.replace(redirectPath);
+      } else {
+        await router.replace({ name: "sessions" });
+      }
       return;
     }
 
@@ -898,31 +1030,55 @@ watch(
       return;
     }
 
-    const targetSessionId = String(routeSessionId || "").trim();
-    if (!targetSessionId) {
-      await router.replace({ name: "sessions" });
-      return;
-    }
+  const targetSessionId = String(routeSessionId || "").trim();
+  if (!targetSessionId) {
+    await router.replace({ name: "sessions" });
+    return;
+  }
 
-    if (syncingRouteOpen || state.activeSessionId === targetSessionId) {
-      return;
+  if (syncingRouteOpen || state.activeSessionId === targetSessionId) {
+    return;
+  }
+
+  const historyTarget = parseHistoryRouteSessionId(targetSessionId);
+  if (historyTarget) {
+    syncingRouteOpen = true;
+    try {
+      await openHistoricalSession(
+        {
+          id: targetSessionId,
+          kind: "history",
+          status: "saved",
+          provider: historyTarget.provider,
+          resumeSessionId: historyTarget.resumeSessionId,
+          name: "历史会话",
+          cwd: state.activeSessionMeta?.cwd || ""
+        },
+        { skipRoute: true }
+      );
+    } finally {
+      syncingRouteOpen = false;
     }
+    return;
+  }
 
     let session = state.sessions.find((item) => item.id === targetSessionId);
     if (!session) {
       try {
-        await refreshSessions();
+        const single = await requestSessionById(targetSessionId);
+        if (single) {
+          session = single;
+        }
       } catch {
-        // Keep existing state when refresh fails.
+        // Keep existing state when single-session lookup fails.
       }
-      session = state.sessions.find((item) => item.id === targetSessionId);
     }
 
-    if (!session) {
-      setStatus("会话不存在或已失效。");
-      await router.replace({ name: "sessions" });
-      return;
-    }
+  if (!session) {
+    setStatus("会话 ID 已失效，无法定位历史记录。请使用 history:provider:resumeSessionId 形式的链接。");
+    await router.replace({ name: "sessions" });
+    return;
+  }
 
     syncingRouteOpen = true;
     try {
@@ -941,7 +1097,7 @@ onMounted(async () => {
       state.accessToken = savedToken;
       state.rememberToken = true;
     }
-    await bootstrapWorkspace();
+    await bootstrapWorkspace({ includeSessions: route.name !== "chat" });
     state.isAuthenticated = true;
   } catch {
     state.isAuthenticated = false;
