@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Browser-based multi-session Codex terminal for Windows and macOS.",
   "scripts": {
+    "setup": "node ./scripts/setup.mjs",
     "start": "node ./src/server.js",
     "build": "npm run web:build",
     "web:build": "vite build --config ./web/vite.config.js",
@@ -43,6 +44,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "dompurify": "^3.3.3",
     "dotenv": "^17.2.3",
+    "koa": "^2.16.4",
     "markdown-it": "^14.1.1",
     "node-pty": "^1.2.0-beta.12",
     "vue": "^3.5.31",

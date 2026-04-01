@@ -57,6 +57,23 @@ export function normalizeMessagePartEvent(payload, sessionId = "") {
   const partType = asText(part.type);
   const ts = asText(payload?.timestamp) || new Date().toISOString();
 
+  if ((partType === "text" || partType === "markdown") && asText(part.text)) {
+    return [
+      createUiPart({
+        sessionId,
+        role,
+        partType: "markdown",
+        payload: {
+          text: asText(part.text)
+        },
+        ts,
+        phase: asText(payload?.phase) || "streaming",
+        source: "message_part",
+        rawType: "message_part"
+      })
+    ];
+  }
+
   if (partType === "image" && asText(part.url)) {
     return [
       createUiPart({
@@ -92,69 +109,38 @@ export function normalizeMessagePartEvent(payload, sessionId = "") {
 function normalizeEventMsgPayload(eventMsg, sessionId = "") {
   const msg = safeObject(eventMsg);
   const rawType = asText(msg.type) || "event_msg";
-  const delta = asText(msg.delta);
   const text = asText(msg.message || msg.text);
 
   switch (rawType) {
-    case "agent_message":
+    case "user_message":
+      if (!text) {
+        return [];
+      }
       return [
         createUiPart({
           sessionId,
-          role: "assistant",
-          partType: "markdown",
-          payload: { text: text || JSON.stringify(msg) },
+          role: "user",
+          partType: "text",
+          payload: { text },
           phase: "final",
           source: "event_msg",
           rawType
         })
       ];
-    case "agent_message_delta":
+    case "agent_message":
+      if (asText(msg.phase) && asText(msg.phase).toLowerCase() !== "final_answer") {
+        return [];
+      }
+      if (!text) {
+        return [];
+      }
       return [
         createUiPart({
           sessionId,
           role: "assistant",
           partType: "markdown",
-          payload: { text: delta || text },
-          phase: "streaming",
-          source: "event_msg",
-          rawType
-        })
-      ];
-    case "token_count":
-      return [
-        createUiPart({
-          sessionId,
-          role: "system",
-          partType: "token_count",
-          payload: msg,
-          source: "event_msg",
-          rawType
-        })
-      ];
-    case "agent_reasoning":
-    case "agent_reasoning_delta":
-    case "agent_reasoning_raw_content":
-    case "agent_reasoning_raw_content_delta":
-      return [
-        createUiPart({
-          sessionId,
-          role: "assistant",
-          partType: "reasoning",
-          payload: msg,
-          phase: rawType.endsWith("_delta") ? "streaming" : "final",
-          source: "event_msg",
-          rawType
-        })
-      ];
-    case "exec_command_output_delta":
-    case "exec_command_begin":
-    case "exec_command_end":
-      return [
-        createUiPart({
-          sessionId,
-          role: "system",
-          partType: "exec_output",
-          payload: msg,
+          payload: { text },
+          phase: "final",
           source: "event_msg",
           rawType
         })
@@ -172,113 +158,12 @@ function normalizeEventMsgPayload(eventMsg, sessionId = "") {
         })
       ];
     default:
-      return [
-        createUiPart({
-          sessionId,
-          role: rawType === "user_message" ? "user" : "system",
-          partType: "unknown",
-          payload: msg,
-          source: "event_msg",
-          rawType
-        })
-      ];
+      return [];
   }
 }
 
 function normalizeResponseItemPayload(payload, sessionId = "") {
-  const item = safeObject(payload?.item || payload);
-  const rawType = asText(item.type);
-  if (!rawType) {
-    return [];
-  }
-
-  if (rawType === "message") {
-    const role = asText(item.role) || "assistant";
-    const textParts = Array.isArray(item.content)
-      ? item.content
-          .filter((contentItem) => asText(contentItem?.type) === "output_text")
-          .map((contentItem) => asText(contentItem?.text))
-          .filter(Boolean)
-      : [];
-    if (textParts.length > 0) {
-      return [
-        createUiPart({
-          sessionId,
-          role,
-          partType: "markdown",
-          payload: { text: textParts.join("\n") },
-          source: "response_item",
-          rawType
-        })
-      ];
-    }
-  }
-
-  if (rawType === "image_generation_call") {
-    const url = asText(item.result);
-    if (url) {
-      return [
-        createUiPart({
-          sessionId,
-          role: "assistant",
-          partType: "image",
-          payload: { url, alt: asText(item.revised_prompt) || "generated image" },
-          source: "response_item",
-          rawType
-        })
-      ];
-    }
-  }
-
-  if (rawType === "function_call" || rawType === "custom_tool_call") {
-    return [
-      createUiPart({
-        sessionId,
-        role: "system",
-        partType: "tool_call",
-        payload: item,
-        source: "response_item",
-        rawType
-      })
-    ];
-  }
-
-  if (rawType === "function_call_output" || rawType === "custom_tool_call_output") {
-    return [
-      createUiPart({
-        sessionId,
-        role: "system",
-        partType: "tool_result",
-        payload: item,
-        source: "response_item",
-        rawType
-      })
-    ];
-  }
-
-  if (rawType === "reasoning") {
-    return [
-      createUiPart({
-        sessionId,
-        role: "assistant",
-        partType: "reasoning",
-        payload: item,
-        source: "response_item",
-        rawType
-      })
-    ];
-  }
-
-  return [
-    createUiPart({
-      sessionId,
-      role: "system",
-      partType: "unknown",
-      payload: item,
-      source: "response_item",
-      rawType
-    })
-  ];
+  return [];
 }
 
 export function normalizeServerPayload(payload, sessionId = "") {
@@ -300,4 +185,3 @@ export function normalizeServerPayload(payload, sessionId = "") {
   }
   return [];
 }
-

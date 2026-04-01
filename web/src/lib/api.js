@@ -1,4 +1,4 @@
-export async function request(url, options = {}) {
+export async function request(url, options = {}, attempt = 0) {
   const response = await fetch(url, {
     ...options,
     credentials: "same-origin",
@@ -7,6 +7,13 @@ export async function request(url, options = {}) {
       ...(options.headers || {})
     }
   });
+
+  if (response.status === 401 && attempt === 0) {
+    const relogged = await retryLoginFromSavedToken();
+    if (relogged) {
+      return request(url, options, attempt + 1);
+    }
+  }
 
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
@@ -78,4 +85,13 @@ export async function requestHistoryMessages(session, historyApiAvailable, attem
 
   historyApiAvailable.value = true;
   return response.json();
+}
+
+export async function requestSessionById(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id) {
+    throw new Error("Session id is required");
+  }
+  const payload = await request(`/api/sessions/${encodeURIComponent(id)}`);
+  return payload?.session || null;
 }

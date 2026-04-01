@@ -183,18 +183,53 @@ export function sanitizeAssistantText(value) {
     return "";
   }
 
-  const lines = raw
+  const rawLines = raw
     .split("\n")
     .map((line) => collapseDoubledAscii(line))
     .map((line) => line.trimEnd())
-    .filter(Boolean)
-    .filter((line) => !isProcessNoiseLine(line));
+    .filter(Boolean);
 
-  if (!lines.length) {
-    return "";
+  const lines = rawLines.filter((line) => !isProcessNoiseLine(line));
+
+  if (lines.length) {
+    return lines.join("\n").trim();
   }
 
-  return lines.join("\n").trim();
+  // Fallback: if aggressive noise filtering removed everything,
+  // keep lines that still contain meaningful words so replies are not fully hidden.
+  const fallback = rawLines.filter((line) => {
+    const key = compactNoiseKey(line);
+    if (!key) {
+      return false;
+    }
+    if (/^working\(/.test(key) || /esc to interrupt/.test(key) || /\b\d{1,3}% left\b/.test(key)) {
+      return false;
+    }
+    if (/^[=~`._-]{1,12}$/.test(key)) {
+      return false;
+    }
+    return /[a-z\u4e00-\u9fff]/i.test(key);
+  });
+
+  // Some Codex TUI streams interleave progress chunks and final short replies
+  // as bullet fragments like "• R" / "• 收到". Extract the latest signal.
+  const bulletSignals = [...String(raw || "").matchAll(/•\s*([^\n\r]+)/g)]
+    .map((match) => compactLine(match?.[1] || ""))
+    .map((line) => line.replace(/\bworking.*$/i, "").trim())
+    .filter(Boolean)
+    .filter((line) => /[a-z\u4e00-\u9fff]/i.test(line))
+    .filter((line) => !/^w(or|ork|orki|orkin|orking)?$/i.test(line));
+
+  if (bulletSignals.length > 0) {
+    return bulletSignals[bulletSignals.length - 1];
+  }
+
+  const fallbackText = fallback.join("\n").trim();
+  if (fallbackText) {
+    return fallbackText;
+  }
+
+  return "";
 }
 
 export function compactLine(value) {
@@ -369,17 +404,11 @@ export function normalizeHistoryMessages(messages) {
   const normalized = [];
   for (const item of messages || []) {
     const role = item?.role === "user" ? "user" : "assistant";
-    const text = cleanHistoricalMessageText(item?.text || "");
+    const text = normalizeLine(item?.text || "");
     if (!text) {
       continue;
     }
-    const next = createMessage(role, text, item?.timestamp || "", { source: "history" });
-    const last = normalized[normalized.length - 1];
-    if (last && shouldMergeHistoricalMessages(last, next)) {
-      normalized[normalized.length - 1] = mergeHistoricalMessages(last, next);
-      continue;
-    }
-    normalized.push(next);
+    normalized.push(createMessage(role, text, item?.timestamp || "", { source: "history" }));
   }
   return normalized;
 }

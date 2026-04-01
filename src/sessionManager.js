@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -651,20 +652,16 @@ function normalizeHistoricalRole(record) {
     return "";
   }
 
-  if (record.type === "response_item") {
-    const role = String(record.payload?.role || "").trim().toLowerCase();
-    if (role === "user" || role === "assistant") {
-      return role;
-    }
-    return "";
-  }
-
   if (record.type === "event_msg") {
     const type = String(record.payload?.type || "").trim().toLowerCase();
     if (type === "user_message") {
       return "user";
     }
     if (type === "agent_message") {
+      const phase = String(record.payload?.phase || "").trim().toLowerCase();
+      if (phase && phase !== "final_answer") {
+        return "";
+      }
       return "assistant";
     }
   }
@@ -680,13 +677,12 @@ function extractHistoricalMessagesFromRecord(record, fallbackTimestamp) {
 
   const payload = record?.payload || {};
   const timestamp = resolveRecordTimestamp(record, fallbackTimestamp);
-  const text = cleanHistoricalMessageText(
-    record.type === "response_item"
-      ? extractTextContentFromPayload(payload).join("\n")
-      : typeof payload.message === "string"
-        ? payload.message
-        : extractTextContentFromPayload(payload).join("\n")
-  );
+  const rawText =
+    typeof payload.message === "string" ? payload.message : extractTextContentFromPayload(payload).join("\n");
+  if (role === "user" && isBoilerplateUserText(rawText)) {
+    return [];
+  }
+  const text = cleanHistoricalMessageText(rawText);
   if (!text) {
     return [];
   }
@@ -1184,6 +1180,23 @@ export class SessionManager {
     };
   }
 
+  findRunningLiveSessionByResume(providerId, resumeSessionId) {
+    const provider = this.getProvider(providerId);
+    const targetResumeId = String(resumeSessionId || "").trim();
+    if (!targetResumeId) {
+      return null;
+    }
+    const candidates = [...this.sessions.values()]
+      .filter(
+        (session) =>
+          session.provider === provider.id &&
+          session.status !== "exited" &&
+          String(session.resumeSessionId || "").trim() === targetResumeId
+      )
+      .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")));
+    return candidates.length ? this.serialize(candidates[0]) : null;
+  }
+
   create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "" } = {}) {
     const resolvedProvider = this.getProvider(provider);
     const id = crypto.randomUUID();
@@ -1195,6 +1208,40 @@ export class SessionManager {
       name: sessionName,
       model: String(model || "").trim()
     });
+
+    if (resolvedProvider.id === "codex") {
+      const session = {
+        id,
+        provider: resolvedProvider.id,
+        providerLabel: resolvedProvider.label,
+        cliLabel: resolvedProvider.cliLabel,
+        name: sessionName,
+        cwd: resolvedCwd,
+        shell: null,
+        buffer: "",
+        status: "running",
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        exitCode: null,
+        clients: new Set(),
+        autoNamed: !String(name || "").trim(),
+        fallbackName,
+        inputPreview: "",
+        sawBootstrapCommand: true,
+        bootstrapNames: resolvedProvider.bootstrapNames,
+        claudeStartupStage: 2,
+        resumeSessionId: String(resumeSessionId || "").trim() || null,
+        resumeBootstrapComplete: true,
+        pendingResumeInput: "",
+        model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+        runnerMode: "json_exec",
+        runningProcess: null,
+        queuedInputs: []
+      };
+      this.sessions.set(id, session);
+      return this.serialize(session);
+    }
+
     const shell = pty.spawn(spawnSpec.file, spawnSpec.args, {
       name: "xterm-color",
       cols: 120,
@@ -1259,7 +1306,19 @@ export class SessionManager {
 
       for (const client of session.clients) {
         if (textChunk) {
-          client.send(JSON.stringify({ type: "data", data: textChunk }));
+          client.send(
+            JSON.stringify({
+              type: "message_part",
+              role: "assistant",
+              part: {
+                type: "text",
+                text: textChunk,
+                format: "terminal_raw"
+              },
+              phase: "streaming",
+              timestamp: nowIso()
+            })
+          );
         }
         for (const image of images) {
           client.send(
@@ -1290,6 +1349,27 @@ export class SessionManager {
     return this.serialize(session);
   }
 
+  pushSessionBuffer(session, text = "") {
+    const value = String(text || "");
+    if (!value) {
+      return;
+    }
+    session.buffer += value;
+    if (session.buffer.length > this.config.sessionBufferLimit) {
+      session.buffer = session.buffer.slice(-this.config.sessionBufferLimit);
+    }
+  }
+
+  broadcast(session, payload) {
+    for (const client of session.clients) {
+      try {
+        client.send(JSON.stringify(payload));
+      } catch {
+        // Ignore transient ws send failures.
+      }
+    }
+  }
+
   attachClient(id, ws) {
     const session = this.get(id);
     if (!session) {
@@ -1310,6 +1390,172 @@ export class SessionManager {
     });
   }
 
+  enqueueJsonExecInput(session, data) {
+    const text = String(data || "");
+    if (!text) {
+      return;
+    }
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const lines = normalized
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!lines.length) {
+      return;
+    }
+
+    for (const line of lines) {
+      session.queuedInputs.push(line);
+    }
+    session.updatedAt = nowIso();
+    this.maybeStartJsonExecRun(session);
+  }
+
+  maybeStartJsonExecRun(session) {
+    if (!session || session.runnerMode !== "json_exec") {
+      return;
+    }
+    if (session.runningProcess) {
+      return;
+    }
+
+    const prompt = session.queuedInputs.shift();
+    if (!prompt) {
+      return;
+    }
+
+    const args = this.buildCodexJsonExecArgs(session, prompt);
+    const child = spawn(this.config.codexBin, args, {
+      cwd: session.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    session.runningProcess = child;
+    session.updatedAt = nowIso();
+
+    let stdoutBuffer = "";
+    let stderrBuffer = "";
+    let emittedAssistant = false;
+    const parseLine = (line) => {
+      const trimmed = String(line || "").trim();
+      if (!trimmed) {
+        return;
+      }
+      try {
+        const event = JSON.parse(trimmed);
+        if (this.handleCodexJsonEvent(session, event)) {
+          emittedAssistant = true;
+        }
+      } catch {
+        // Ignore non-json diagnostic lines.
+      }
+    };
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBuffer += String(chunk || "");
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || "";
+      for (const line of lines) {
+        parseLine(line);
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderrBuffer += String(chunk || "");
+      if (stderrBuffer.length > 10000) {
+        stderrBuffer = stderrBuffer.slice(-10000);
+      }
+    });
+
+    child.on("close", (code) => {
+      if (stdoutBuffer.trim()) {
+        parseLine(stdoutBuffer.trim());
+      }
+      session.runningProcess = null;
+      session.updatedAt = nowIso();
+      if (code && code !== 0) {
+        const concise = String(stderrBuffer || "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 220);
+        this.broadcast(session, {
+          type: "message_part",
+          role: "system",
+          part: { type: "text", text: concise ? `Codex 执行失败（exit=${code}）：${concise}` : `Codex 执行失败（exit=${code}）` },
+          phase: "final",
+          timestamp: nowIso()
+        });
+      } else if (!emittedAssistant) {
+        const concise = String(stderrBuffer || "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 220);
+        this.broadcast(session, {
+          type: "message_part",
+          role: "system",
+          part: { type: "text", text: concise ? `本轮无可展示回复：${concise}` : "本轮未返回可展示文本。" },
+          phase: "final",
+          timestamp: nowIso()
+        });
+      }
+      this.maybeStartJsonExecRun(session);
+    });
+  }
+
+  buildCodexJsonExecArgs(session, prompt) {
+    const args = ["exec"];
+    if (session.resumeSessionId) {
+      args.push("resume", "--all", session.resumeSessionId);
+    }
+    args.push("--json", "--skip-git-repo-check");
+    const model = String(session.model || "").trim();
+    if (model) {
+      args.push("--model", model);
+    }
+    if (this.config.codexProfile) {
+      args.push("--profile", this.config.codexProfile);
+    }
+    if (this.config.codexFullAccess) {
+      args.push("--dangerously-bypass-approvals-and-sandbox");
+    }
+    if (Array.isArray(this.config.codexExtraArgs) && this.config.codexExtraArgs.length > 0) {
+      args.push(...this.config.codexExtraArgs);
+    }
+    args.push(prompt);
+    return args;
+  }
+
+  handleCodexJsonEvent(session, event) {
+    if (!event || typeof event !== "object") {
+      return false;
+    }
+    if (event.type === "thread.started" && event.thread_id && !session.resumeSessionId) {
+      session.resumeSessionId = String(event.thread_id || "").trim() || session.resumeSessionId;
+    }
+    if (event.type === "item.completed") {
+      const item = event.item || {};
+      if (String(item.type || "").trim() !== "agent_message") {
+        return false;
+      }
+      const text = String(item.text || "").trim();
+      if (!text) {
+        return false;
+      }
+      this.pushSessionBuffer(session, `${text}\n`);
+      this.broadcast(session, {
+        type: "message_part",
+        role: "assistant",
+        part: { type: "text", text, format: "markdown" },
+        phase: "final",
+        timestamp: nowIso()
+      });
+      return true;
+    }
+    return false;
+  }
+
   write(id, data) {
     const session = this.get(id);
     if (!session) {
@@ -1317,11 +1563,20 @@ export class SessionManager {
     }
 
     const text = String(data || "");
+    if (!text) {
+      return;
+    }
+
     this.maybeAutoRename(session, text);
     if (session.resumeSessionId && !session.resumeBootstrapComplete) {
       session.pendingResumeInput = `${session.pendingResumeInput || ""}${text}`.slice(-4096);
       session.updatedAt = nowIso();
     }
+    if (session.runnerMode === "json_exec") {
+      this.enqueueJsonExecInput(session, text);
+      return;
+    }
+
     session.shell.write(text);
     session.updatedAt = nowIso();
   }
@@ -1330,6 +1585,10 @@ export class SessionManager {
     const session = this.get(id);
     if (!session) {
       throw new Error(`Session not found: ${id}`);
+    }
+
+    if (session.runnerMode === "json_exec") {
+      return;
     }
 
     session.shell.resize(Math.max(20, cols || 120), Math.max(10, rows || 30));
@@ -1358,9 +1617,13 @@ export class SessionManager {
     session.status = "closing";
     session.updatedAt = nowIso();
     try {
-      session.shell.kill();
+      if (session.runnerMode === "json_exec") {
+        session.runningProcess?.kill("SIGTERM");
+      } else {
+        session.shell.kill();
+      }
     } catch {
-      // Ignore PTY kill failures.
+      // Ignore kill failures.
     }
     this.sessions.delete(id);
     return true;
@@ -1369,9 +1632,13 @@ export class SessionManager {
   shutdown() {
     for (const session of [...this.sessions.values()]) {
       try {
-        session.shell.kill();
+        if (session.runnerMode === "json_exec") {
+          session.runningProcess?.kill("SIGTERM");
+        } else {
+          session.shell.kill();
+        }
       } catch {
-        // Ignore PTY kill failures during shutdown.
+        // Ignore kill failures during shutdown.
       }
       session.clients.clear();
     }
