@@ -1533,6 +1533,11 @@ export class SessionManager {
     }
     if (event.type === "thread.started" && event.thread_id && !session.resumeSessionId) {
       session.resumeSessionId = String(event.thread_id || "").trim() || session.resumeSessionId;
+      session.updatedAt = nowIso();
+      this.broadcast(session, {
+        type: "session_updated",
+        session: this.serialize(session)
+      });
     }
     if (event.type === "item.completed") {
       const item = event.item || {};

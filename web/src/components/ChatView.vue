@@ -10,6 +10,9 @@ const props = defineProps({
   sessionKey: { type: String, default: "" },
   openToken: { type: [String, Number], default: 0 },
   title: { type: String, default: "会话" },
+  threadId: { type: String, default: "" },
+  expectedThreadId: { type: String, default: "" },
+  threadMismatch: { type: Boolean, default: false },
   workspaceName: { type: String, default: "" },
   assistantName: { type: String, default: "Codex" },
   messages: { type: Array, default: () => [] },
@@ -189,6 +192,16 @@ const renderedMessages = computed(() =>
 );
 
 const hasAnyProcessDetails = computed(() => renderedMessages.value.some((message) => message.hasProcessDetails));
+const visibleThreadId = computed(() => String(props.threadId || props.expectedThreadId || "").trim());
+const threadHint = computed(() => {
+  if (!visibleThreadId.value) {
+    return "thread_id: 暂未获取";
+  }
+  if (props.threadMismatch) {
+    return `thread_id 不一致：当前 ${props.threadId} / 目标 ${props.expectedThreadId}`;
+  }
+  return `thread_id: ${visibleThreadId.value}`;
+});
 
 function isNearBottom(element, threshold = BOTTOM_THRESHOLD) {
   if (!element) {
@@ -362,6 +375,7 @@ onBeforeUnmount(() => {
       </button>
       <div class="header-copy">
         <h1>{{ title }}</h1>
+        <p class="thread-id" :class="{ warn: threadMismatch }">{{ threadHint }}</p>
       </div>
       <span class="header-spacer" aria-hidden="true"></span>
     </header>
@@ -463,6 +477,21 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.thread-id {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.2;
+  color: #7a6d62;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.thread-id.warn {
+  color: #b5483d;
+  font-weight: 600;
 }
 
 .nav-button {
