@@ -1078,8 +1078,9 @@ function buildProviders(config) {
 }
 
 export class SessionManager {
-  constructor(config) {
+  constructor(config, { appServerBridge = null } = {}) {
     this.config = config;
+    this.appServerBridge = appServerBridge;
     this.sessions = new Map();
     this.providers = new Map(buildProviders(config).map((provider) => [provider.id, provider]));
     this.customNamesPath = path.join(this.config.dataDir, "session-names.json");
@@ -1095,6 +1096,15 @@ export class SessionManager {
         .filter((entry) => entry[0] && entry[1])
     );
     fs.mkdirSync(this.config.dataDir, { recursive: true });
+    if (this.appServerBridge) {
+      this.appServerBridge.on("notification", (msg) => this.handleAppServerNotification(msg));
+      this.appServerBridge.on("log", (line) => {
+        const text = String(line || "").trim();
+        if (text) {
+          console.warn(`[app-server] ${text}`);
+        }
+      });
+    }
   }
 
   providerCatalog() {
@@ -1227,7 +1237,8 @@ export class SessionManager {
         resumeBootstrapComplete: true,
         pendingResumeInput: "",
         model: String(model || "").trim() || resolvedProvider.defaultModel || "",
-        runnerMode: "json_exec",
+        runnerMode: this.appServerBridge ? "app_server" : "json_exec",
+        turnRunning: false,
         runningProcess: null,
         queuedInputs: []
       };
@@ -1401,7 +1412,69 @@ export class SessionManager {
       session.queuedInputs.push(line);
     }
     session.updatedAt = nowIso();
+    if (session.runnerMode === "app_server") {
+      this.maybeStartAppServerTurn(session);
+      return;
+    }
     this.maybeStartJsonExecRun(session);
+  }
+
+  async maybeStartAppServerTurn(session) {
+    if (!session || session.runnerMode !== "app_server") {
+      return;
+    }
+    if (session.turnRunning) {
+      return;
+    }
+    const prompt = session.queuedInputs.shift();
+    if (!prompt) {
+      return;
+    }
+    session.turnRunning = true;
+    session.updatedAt = nowIso();
+    try {
+      const result = await this.appServerBridge.startTurn(session, prompt);
+      this.handleAppServerTurnResult(session, result);
+      session.turnRunning = false;
+      session.updatedAt = nowIso();
+      this.broadcast(session, { type: "session_updated", session: this.serialize(session) });
+      this.maybeStartAppServerTurn(session);
+    } catch (error) {
+      session.turnRunning = false;
+      session.updatedAt = nowIso();
+      this.broadcast(session, {
+        type: "message_part",
+        role: "system",
+        part: { type: "text", text: `Codex app-server 执行失败：${error?.message || String(error)}` },
+        phase: "final",
+        timestamp: nowIso()
+      });
+      this.maybeStartAppServerTurn(session);
+    }
+  }
+
+  handleAppServerTurnResult(session, result) {
+    const items = Array.isArray(result?.turn?.items) ? result.turn.items : [];
+    if (!items.length) {
+      return;
+    }
+    for (const item of items) {
+      if (String(item?.type || "").trim() !== "agentMessage") {
+        continue;
+      }
+      const text = String(item?.text || "").trim();
+      if (!text) {
+        continue;
+      }
+      this.pushSessionBuffer(session, `${text}\n`);
+      this.broadcast(session, {
+        type: "message_part",
+        role: "assistant",
+        part: { type: "text", text, format: "markdown" },
+        phase: "final",
+        timestamp: nowIso()
+      });
+    }
   }
 
   maybeStartJsonExecRun(session) {
@@ -1554,6 +1627,67 @@ export class SessionManager {
     return false;
   }
 
+  handleAppServerNotification(msg) {
+    const method = String(msg?.method || "");
+    const params = msg?.params || {};
+    const threadId = String(params?.threadId || "").trim();
+    if (!threadId) {
+      return;
+    }
+    const targets = [...this.sessions.values()].filter(
+      (session) => session.provider === "codex" && String(session.resumeSessionId || "").trim() === threadId
+    );
+    if (!targets.length) {
+      return;
+    }
+
+    for (const session of targets) {
+      session.updatedAt = nowIso();
+      if (method === "item/agentMessage/delta") {
+        const delta = String(params?.delta || "");
+        if (!delta.trim()) {
+          continue;
+        }
+        this.pushSessionBuffer(session, delta);
+        this.broadcast(session, {
+          type: "message_part",
+          role: "assistant",
+          part: { type: "text", text: delta, format: "markdown" },
+          phase: "streaming",
+          timestamp: nowIso()
+        });
+        continue;
+      }
+      if (method === "item/completed") {
+        const item = params?.item || {};
+        if (item?.type !== "agentMessage") {
+          continue;
+        }
+        const text = String(item?.text || "").trim();
+        if (!text) {
+          continue;
+        }
+        this.pushSessionBuffer(session, `${text}\n`);
+        this.broadcast(session, {
+          type: "message_part",
+          role: "assistant",
+          part: { type: "text", text, format: "markdown" },
+          phase: "final",
+          timestamp: nowIso()
+        });
+        continue;
+      }
+      if (method === "turn/completed") {
+        session.turnRunning = false;
+        this.maybeStartAppServerTurn(session);
+        continue;
+      }
+      if (method === "thread/status/changed") {
+        this.broadcast(session, { type: "session_updated", session: this.serialize(session) });
+      }
+    }
+  }
+
   write(id, data) {
     const session = this.get(id);
     if (!session) {
@@ -1570,7 +1704,7 @@ export class SessionManager {
       session.pendingResumeInput = `${session.pendingResumeInput || ""}${text}`.slice(-4096);
       session.updatedAt = nowIso();
     }
-    if (session.runnerMode === "json_exec") {
+    if (session.runnerMode === "json_exec" || session.runnerMode === "app_server") {
       this.enqueueJsonExecInput(session, text);
       return;
     }
@@ -1585,7 +1719,7 @@ export class SessionManager {
       throw new Error(`Session not found: ${id}`);
     }
 
-    if (session.runnerMode === "json_exec") {
+    if (session.runnerMode === "json_exec" || session.runnerMode === "app_server") {
       return;
     }
 
@@ -1615,8 +1749,8 @@ export class SessionManager {
     session.status = "closing";
     session.updatedAt = nowIso();
     try {
-      if (session.runnerMode === "json_exec") {
-        session.runningProcess?.kill("SIGTERM");
+      if (session.runnerMode === "json_exec" || session.runnerMode === "app_server") {
+        session.turnRunning = false;
       } else {
         session.shell.kill();
       }
@@ -1630,8 +1764,8 @@ export class SessionManager {
   shutdown() {
     for (const session of [...this.sessions.values()]) {
       try {
-        if (session.runnerMode === "json_exec") {
-          session.runningProcess?.kill("SIGTERM");
+        if (session.runnerMode === "json_exec" || session.runnerMode === "app_server") {
+          session.turnRunning = false;
         } else {
           session.shell.kill();
         }

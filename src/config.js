@@ -98,6 +98,8 @@ export const config = {
   codexFullAccess: boolEnv("CODEX_FULL_ACCESS", true),
   codexNoAltScreen: boolEnv("CODEX_NO_ALT_SCREEN", true),
   codexExtraArgs: listEnv("CODEX_EXTRA_ARGS"),
+  codexAppServerEnabled: boolEnv("CODEX_APP_SERVER_ENABLED", true),
+  codexAppServerListenUrl: env("CODEX_APP_SERVER_LISTEN_URL", "ws://127.0.0.1:8777"),
   ccBin: env("CC_BIN", "claude"),
   ccModel: env("CC_MODEL", ""),
   ccModels: listEnv("CC_MODELS"),

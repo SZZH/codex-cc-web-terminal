@@ -1,11 +1,13 @@
 import http from "node:http";
 
 import { config } from "./config.js";
+import { AppServerBridge } from "./appServerBridge.js";
 import { createKoaApp } from "./koa-app.js";
 import { SessionManager } from "./sessionManager.js";
 import { installWebSocketServer } from "./routes/ws.js";
 
-const sessionManager = new SessionManager(config);
+const appServerBridge = new AppServerBridge(config);
+const sessionManager = new SessionManager(config, { appServerBridge });
 const { app, runtime } = createKoaApp({ config, sessionManager });
 const server = http.createServer(app.callback());
 const wsRuntime = installWebSocketServer(server, runtime);
@@ -23,12 +25,14 @@ async function shutdown(signal = "unknown") {
 
     server.close(() => {
       wsRuntime.stop();
+      appServerBridge.shutdown();
       sessionManager.shutdown();
       resolve();
     });
 
     setTimeout(() => {
       wsRuntime.stop();
+      appServerBridge.shutdown();
       sessionManager.shutdown();
       resolve();
     }, 3000).unref();
