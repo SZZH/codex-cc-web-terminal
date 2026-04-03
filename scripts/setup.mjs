@@ -10,6 +10,7 @@ const rl = createInterface({ input, output });
 const projectRoot = process.cwd();
 const envExamplePath = path.join(projectRoot, '.env.example');
 const envPath = path.join(projectRoot, '.env');
+const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 function logStep(title) {
   output.write(`\n=== ${title} ===\n`);
@@ -152,7 +153,7 @@ async function main() {
   const installDeps = await askYesNo('现在安装依赖（npm install）？', true);
   if (installDeps) {
     logStep('安装依赖');
-    const ret = spawnSync('npm', ['install'], { stdio: 'inherit' });
+    const ret = spawnSync(npmCommand, ['install'], { stdio: 'inherit' });
     if (ret.status !== 0) {
       output.write('npm install 失败，请修复后重试。\n');
       await rl.close();
@@ -163,7 +164,8 @@ async function main() {
   const startNow = await askYesNo('现在启动开发服务（npm run dev:up）？', true);
   if (startNow) {
     logStep('启动服务');
-    const ret = spawnSync('npm', ['run', 'dev:up'], { stdio: 'inherit' });
+    const startScript = process.platform === 'win32' ? 'dev' : 'dev:up';
+    const ret = spawnSync(npmCommand, ['run', startScript], { stdio: 'inherit' });
     if (ret.status !== 0) {
       output.write('启动失败，请查看日志排查。\n');
       await rl.close();

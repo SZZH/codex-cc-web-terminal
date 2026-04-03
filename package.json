@@ -11,6 +11,7 @@
     "web:build": "vite build --config ./web/vite.config.js",
     "web:dev": "vite --config ./web/vite.config.js",
     "dev:up": "bash ./scripts/dev-up.sh",
+    "dev:down": "bash ./scripts/dev-down.sh",
     "server:dev": "node --watch ./src/server.js",
     "dev:hot": "concurrently -k -n server,web \"npm:server:dev\" \"npm:web:dev\"",
     "check": "node --check ./src/server.js && node --check ./src/config.js && node --check ./src/sessionManager.js && node --check ./scripts/service.mjs && node --check ./scripts/launchd/manage.mjs && npm run web:build",
