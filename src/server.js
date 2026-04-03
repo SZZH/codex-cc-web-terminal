@@ -6,7 +6,7 @@ import { createKoaApp } from "./koa-app.js";
 import { SessionManager } from "./sessionManager.js";
 import { installWebSocketServer } from "./routes/ws.js";
 
-const appServerBridge = new AppServerBridge(config);
+const appServerBridge = config.codexAppServerEnabled ? new AppServerBridge(config) : null;
 const sessionManager = new SessionManager(config, { appServerBridge });
 const { app, runtime } = createKoaApp({ config, sessionManager });
 const server = http.createServer(app.callback());
@@ -25,14 +25,14 @@ async function shutdown(signal = "unknown") {
 
     server.close(() => {
       wsRuntime.stop();
-      appServerBridge.shutdown();
+      appServerBridge?.shutdown();
       sessionManager.shutdown();
       resolve();
     });
 
     setTimeout(() => {
       wsRuntime.stop();
-      appServerBridge.shutdown();
+      appServerBridge?.shutdown();
       sessionManager.shutdown();
       resolve();
     }, 3000).unref();

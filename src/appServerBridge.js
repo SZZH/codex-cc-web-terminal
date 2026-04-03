@@ -83,8 +83,9 @@ export class AppServerBridge extends EventEmitter {
   async openWebSocket() {
     const url = this.listenUrl;
     this.ws = new WebSocket(url);
+    const connectTimeoutMs = Math.max(1_000, Number(this.config.codexAppServerConnectTimeoutMs) || 5_000);
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("app-server websocket connect timeout")), 5000);
+      const timer = setTimeout(() => reject(new Error("app-server websocket connect timeout")), connectTimeoutMs);
       this.ws.once("open", () => {
         clearTimeout(timer);
         resolve();
@@ -197,6 +198,7 @@ export class AppServerBridge extends EventEmitter {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("app-server websocket not connected"));
     }
+    const requestTimeoutMs = Math.max(1_000, Number(this.config.codexAppServerRequestTimeoutMs) || 20_000);
     const id = this.nextId++;
     const payload = { jsonrpc: "2.0", id, method, params };
     this.ws.send(JSON.stringify(payload));
@@ -204,7 +206,7 @@ export class AppServerBridge extends EventEmitter {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`app-server request timeout: ${method}`));
-      }, 20000);
+      }, requestTimeoutMs);
       this.pending.set(id, {
         resolve: (result) => {
           clearTimeout(timer);

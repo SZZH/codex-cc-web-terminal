@@ -262,6 +262,43 @@ function extractImagePartsFromMarkdown(text) {
   };
 }
 
+function normalizeSymbolToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function isAgentMessageType(value) {
+  return normalizeSymbolToken(value) === "agentmessage";
+}
+
+function extractTurnItems(result) {
+  const direct = Array.isArray(result?.turn?.items) ? result.turn.items : null;
+  if (direct) {
+    return direct;
+  }
+  const fallback = Array.isArray(result?.items) ? result.items : null;
+  if (fallback) {
+    return fallback;
+  }
+  return [];
+}
+
+function emitNoReplyFallback(manager, session) {
+  if (!session || session.turnNoReplyNotified) {
+    return;
+  }
+  session.turnNoReplyNotified = true;
+  manager.broadcast(session, {
+    type: "message_part",
+    role: "system",
+    part: { type: "text", text: "本轮未返回可展示文本。" },
+    phase: "final",
+    timestamp: nowIso()
+  });
+}
+
 function extractEmbeddedUserRequest(value) {
   const text = String(value || "");
   const userRequestMarker = "User request:";
@@ -1213,6 +1250,7 @@ export class SessionManager {
     });
 
     if (resolvedProvider.id === "codex") {
+      const preferAppServer = Boolean(this.config.codexAppServerEnabled && this.appServerBridge);
       const session = {
         id,
         provider: resolvedProvider.id,
@@ -1237,8 +1275,10 @@ export class SessionManager {
         resumeBootstrapComplete: true,
         pendingResumeInput: "",
         model: String(model || "").trim() || resolvedProvider.defaultModel || "",
-        runnerMode: this.appServerBridge ? "app_server" : "json_exec",
+        runnerMode: preferAppServer ? "app_server" : "json_exec",
         turnRunning: false,
+        turnHadVisibleOutput: false,
+        turnNoReplyNotified: false,
         runningProcess: null,
         queuedInputs: []
       };
@@ -1408,6 +1448,11 @@ export class SessionManager {
       return;
     }
 
+    const queueLimit = Math.max(1, Number(this.config.maxQueuedInputs) || 200);
+    if (session.queuedInputs.length + lines.length > queueLimit) {
+      throw new Error(`当前会话待处理消息过多（上限 ${queueLimit}），请稍后重试。`);
+    }
+
     for (const line of lines) {
       session.queuedInputs.push(line);
     }
@@ -1431,10 +1476,15 @@ export class SessionManager {
       return;
     }
     session.turnRunning = true;
+    session.turnHadVisibleOutput = false;
+    session.turnNoReplyNotified = false;
     session.updatedAt = nowIso();
     try {
       const result = await this.appServerBridge.startTurn(session, prompt);
-      this.handleAppServerTurnResult(session, result);
+      const hadOutput = this.handleAppServerTurnResult(session, result);
+      if (!hadOutput && !session.turnHadVisibleOutput) {
+        emitNoReplyFallback(this, session);
+      }
       session.turnRunning = false;
       session.updatedAt = nowIso();
       this.broadcast(session, { type: "session_updated", session: this.serialize(session) });
@@ -1454,18 +1504,21 @@ export class SessionManager {
   }
 
   handleAppServerTurnResult(session, result) {
-    const items = Array.isArray(result?.turn?.items) ? result.turn.items : [];
+    const items = extractTurnItems(result);
     if (!items.length) {
-      return;
+      return false;
     }
+    let hadOutput = false;
     for (const item of items) {
-      if (String(item?.type || "").trim() !== "agentMessage") {
+      if (!isAgentMessageType(item?.type)) {
         continue;
       }
       const text = String(item?.text || "").trim();
       if (!text) {
         continue;
       }
+      hadOutput = true;
+      session.turnHadVisibleOutput = true;
       this.pushSessionBuffer(session, `${text}\n`);
       this.broadcast(session, {
         type: "message_part",
@@ -1475,6 +1528,7 @@ export class SessionManager {
         timestamp: nowIso()
       });
     }
+    return hadOutput;
   }
 
   maybeStartJsonExecRun(session) {
@@ -1629,8 +1683,9 @@ export class SessionManager {
 
   handleAppServerNotification(msg) {
     const method = String(msg?.method || "");
+    const normalizedMethod = normalizeSymbolToken(method);
     const params = msg?.params || {};
-    const threadId = String(params?.threadId || "").trim();
+    const threadId = String(params?.threadId || params?.thread_id || "").trim();
     if (!threadId) {
       return;
     }
@@ -1643,11 +1698,12 @@ export class SessionManager {
 
     for (const session of targets) {
       session.updatedAt = nowIso();
-      if (method === "item/agentMessage/delta") {
+      if (method === "item/agentMessage/delta" || normalizedMethod === "itemagentmessagedelta") {
         const delta = String(params?.delta || "");
         if (!delta.trim()) {
           continue;
         }
+        session.turnHadVisibleOutput = true;
         this.pushSessionBuffer(session, delta);
         this.broadcast(session, {
           type: "message_part",
@@ -1658,15 +1714,16 @@ export class SessionManager {
         });
         continue;
       }
-      if (method === "item/completed") {
+      if (method === "item/completed" || normalizedMethod === "itemcompleted") {
         const item = params?.item || {};
-        if (item?.type !== "agentMessage") {
+        if (!isAgentMessageType(item?.type)) {
           continue;
         }
         const text = String(item?.text || "").trim();
         if (!text) {
           continue;
         }
+        session.turnHadVisibleOutput = true;
         this.pushSessionBuffer(session, `${text}\n`);
         this.broadcast(session, {
           type: "message_part",
@@ -1677,12 +1734,13 @@ export class SessionManager {
         });
         continue;
       }
-      if (method === "turn/completed") {
-        session.turnRunning = false;
-        this.maybeStartAppServerTurn(session);
+      if (method === "turn/completed" || normalizedMethod === "turncompleted") {
+        if (!session.turnHadVisibleOutput) {
+          emitNoReplyFallback(this, session);
+        }
         continue;
       }
-      if (method === "thread/status/changed") {
+      if (method === "thread/status/changed" || normalizedMethod === "threadstatuschanged") {
         this.broadcast(session, { type: "session_updated", session: this.serialize(session) });
       }
     }

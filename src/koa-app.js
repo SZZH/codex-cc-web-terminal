@@ -69,7 +69,11 @@ export function createKoaApp({ config, sessionManager }) {
       }
       const name = pair.slice(0, index).trim();
       const value = pair.slice(index + 1).trim();
-      cookies[name] = decodeURIComponent(value);
+      try {
+        cookies[name] = decodeURIComponent(value);
+      } catch {
+        // Ignore malformed cookie values rather than failing the whole request.
+      }
     }
     return cookies;
   };

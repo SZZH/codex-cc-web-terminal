@@ -766,6 +766,23 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "snapshot") {
+      const snapshotBuffer = String(payload?.buffer || "");
+      const normalizedSnapshot = sanitizeAssistantText(
+        normalizeLine(snapshotBuffer.length > 12000 ? snapshotBuffer.slice(-12000) : snapshotBuffer)
+      );
+      if (normalizedSnapshot) {
+        const lastAssistant = [...state.activeMessages]
+          .reverse()
+          .find((message) => message.role === "assistant");
+        if (normalizeLine(String(lastAssistant?.text || "")) !== normalizedSnapshot) {
+          setMessages([
+            ...state.activeMessages,
+            createMessage("assistant", normalizedSnapshot, new Date().toISOString(), {
+              source: "snapshot"
+            })
+          ]);
+        }
+      }
       return;
     }
 
@@ -802,6 +819,24 @@ function attachLiveSocket(sessionId, historyMessages = []) {
 
     if (payload.type === "event_msg") {
       appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
+      return;
+    }
+
+    if (payload.type === "error") {
+      const errorText = String(payload.error || "会话发生未知错误。").trim();
+      clearPendingReplyStatus();
+      appendNormalizedParts([
+        {
+          role: "system",
+          partType: "text",
+          payload: { text: errorText },
+          ts: new Date().toISOString(),
+          phase: "final",
+          source: "ws_error",
+          rawType: "error"
+        }
+      ]);
+      setStatus(errorText);
       return;
     }
 

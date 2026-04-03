@@ -163,7 +163,52 @@ function normalizeEventMsgPayload(eventMsg, sessionId = "") {
 }
 
 function normalizeResponseItemPayload(payload, sessionId = "") {
-  return [];
+  const item = safeObject(payload?.item || payload);
+  const ts = asText(item?.timestamp || payload?.timestamp) || new Date().toISOString();
+  const role = asText(item?.role || payload?.role) || "assistant";
+
+  const collectText = (node) => {
+    if (node == null) {
+      return [];
+    }
+    if (typeof node === "string" || typeof node === "number" || typeof node === "boolean") {
+      return [String(node)];
+    }
+    if (Array.isArray(node)) {
+      return node.flatMap((child) => collectText(child));
+    }
+    if (typeof node !== "object") {
+      return [];
+    }
+
+    const directText = asText(node.text || node.message || node.value);
+    const nested = [
+      ...collectText(node.content),
+      ...collectText(node.output),
+      ...collectText(node.result),
+      ...collectText(node.parts)
+    ];
+    return [directText, ...nested].filter(Boolean);
+  };
+
+  const rawType = asText(item?.type || payload?.type || "response_item");
+  const text = collectText(item).join("\n").trim();
+  if (!text) {
+    return [];
+  }
+
+  return [
+    createUiPart({
+      sessionId,
+      role: role === "user" ? "user" : role === "system" ? "system" : "assistant",
+      partType: "markdown",
+      payload: { text },
+      ts,
+      phase: asText(item?.phase || payload?.phase) || "final",
+      source: "response_item",
+      rawType
+    })
+  ];
 }
 
 export function normalizeServerPayload(payload, sessionId = "") {
