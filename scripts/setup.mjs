@@ -161,10 +161,10 @@ async function main() {
     }
   }
 
-  const startNow = await askYesNo('现在启动开发服务（npm run dev:up）？', true);
+  const startScript = process.platform === 'win32' ? 'dev' : 'dev:up';
+  const startNow = await askYesNo(`现在启动开发服务（npm run ${startScript}）？`, true);
   if (startNow) {
     logStep('启动服务');
-    const startScript = process.platform === 'win32' ? 'dev' : 'dev:up';
     const ret = spawnSync(npmCommand, ['run', startScript], { stdio: 'inherit' });
     if (ret.status !== 0) {
       output.write('启动失败，请查看日志排查。\n');
@@ -177,7 +177,11 @@ async function main() {
   output.write('配置完成。\n');
   output.write(`前端: http://127.0.0.1:5173/#/sessions\n`);
   output.write(`后端: http://127.0.0.1:${port}\n`);
-  output.write('如需查看日志: tail -f /tmp/codex-server-dev.log /tmp/codex-web-dev.log\n');
+  if (process.platform === 'win32') {
+    output.write('Windows 建议使用 npm run dev 前台运行并直接查看终端输出日志。\n');
+  } else {
+    output.write('如需查看日志: tail -f /tmp/codex-server-dev.log /tmp/codex-web-dev.log\n');
+  }
 
   await rl.close();
 }

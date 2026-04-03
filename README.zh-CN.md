@@ -14,14 +14,14 @@
 ## 1 分钟本地跑起来
 
 ```bash
-git clone https://github.com/ttm43/codex-cc-web-terminal.git
+git clone https://github.com/SZZH/codex-cc-web-terminal.git
 cd codex-cc-web-terminal
 npm run setup
 ```
 
 `npm run setup` 会交互式引导你完成：`.env` 配置、可选 Tailscale、安装依赖、启动服务。
 
-或手动执行：
+或手动执行（macOS / Linux）：
 
 ```bash
 cd codex-cc-web-terminal
@@ -31,7 +31,7 @@ npm install
 npm run dev:up
 ```
 
-Windows 用户请改用：
+Windows（PowerShell / CMD）请改用：
 
 ```bash
 npm install
@@ -41,7 +41,7 @@ npm run dev
 打开：
 
 - 前端（推荐）：`http://127.0.0.1:5173/#/sessions`
-- 后端直连：`http://127.0.0.1:3210`
+- 后端直连：`http://127.0.0.1:3210`（如果你改了 `PORT`，这里用对应端口）
 
 ## 手机访问（两种）
 
@@ -81,25 +81,31 @@ npm run service:logs
 ## 最常用命令
 
 ```bash
-npm run dev:up         # 开发模式（前端热更新）
-npm run dev:down       # 停止开发服务
+npm run dev            # 跨平台开发模式（前后端前台运行）
+npm run dev:up         # 仅 macOS/Linux：后台启动开发服务
+npm run dev:down       # 仅 macOS/Linux：停止后台开发进程
 npm run check          # 快速自检
 ```
 
 ## 三个高频问题
 
 1. `Cross-origin request rejected`
-- 用 `npm run dev:up` 启动，不要手动拆开前后端起。
+- 优先用 `npm run dev`（macOS/Linux 也可用 `npm run dev:up`）启动，不要手动拆开前后端起。
 
 2. `5173` 打不开
-- 先执行 `npm run dev:up`，再看端口：
+- 先执行 `npm run dev`，再看端口：
 ```bash
+# macOS/Linux
 lsof -iTCP:5173 -sTCP:LISTEN -n -P
+
+# Windows
+netstat -ano | findstr :5173
 ```
 
 3. 手机提示“电脑未连接”
 - 先确认电脑服务在线：`npm run service:status`
 - 再确认网络路径正确：同 Wi-Fi 或同 Tailnet
+- 如果你改过 `PORT`，手机访问地址也要用同一个端口。
 
 ## 开源说明
 

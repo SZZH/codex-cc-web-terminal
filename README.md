@@ -14,7 +14,7 @@ Currently supports **Codex** only.
 ## Quick Start (1 minute)
 
 ```bash
-git clone https://github.com/ttm43/codex-cc-web-terminal.git
+git clone https://github.com/SZZH/codex-cc-web-terminal.git
 cd codex-cc-web-terminal
 npm run setup
 ```
@@ -22,7 +22,7 @@ npm run setup
 `npm run setup` guides you through `.env` setup, optional Tailscale setup,
 dependency installation, and service startup.
 
-Or run manually:
+Or run manually (macOS / Linux):
 
 ```bash
 cd codex-cc-web-terminal
@@ -32,7 +32,7 @@ npm install
 npm run dev:up
 ```
 
-On Windows, use:
+On Windows (PowerShell or CMD), use:
 
 ```bash
 npm install
@@ -42,7 +42,7 @@ npm run dev
 Open:
 
 - Frontend (recommended): `http://127.0.0.1:5173/#/sessions`
-- Backend direct: `http://127.0.0.1:3210`
+- Backend direct: `http://127.0.0.1:3210` (or your custom `PORT`)
 
 ## Mobile Access (2 ways)
 
@@ -82,25 +82,31 @@ npm run service:logs
 ## Common Commands
 
 ```bash
-npm run dev:up         # Start development mode (web HMR)
-npm run dev:down       # Stop development processes
+npm run dev            # Cross-platform dev mode (server + web, foreground)
+npm run dev:up         # macOS/Linux: start dev in background
+npm run dev:down       # macOS/Linux: stop background dev processes
 npm run check          # Quick checks
 ```
 
 ## Common Issues
 
 1. `Cross-origin request rejected`
-- Start with `npm run dev:up`. Do not manually split startup commands.
+- Start with `npm run dev` (or `npm run dev:up` on macOS/Linux). Do not manually split startup commands.
 
 2. `5173` is not reachable
-- Run `npm run dev:up` first, then check port:
+- Run `npm run dev` first, then check port:
 ```bash
+# macOS/Linux
 lsof -iTCP:5173 -sTCP:LISTEN -n -P
+
+# Windows
+netstat -ano | findstr :5173
 ```
 
 3. Phone says desktop is offline
 - Check service status first: `npm run service:status`
 - Then verify network path: same Wi-Fi or same Tailnet
+- If you changed `PORT`, use the same port in your phone URL.
 
 ## Open Source
 
