@@ -10,6 +10,7 @@
 
 - Node.js 22+
 - 已安装 `codex` 命令并可在终端直接运行
+- 如果要外网访问：电脑和手机都要安装 Tailscale，并登录同一账号
 
 ## 1 分钟本地跑起来
 
@@ -52,6 +53,8 @@ npm run dev
 3. 用 `ACCESS_TOKEN` 登录
 
 ### B. Tailscale（外网推荐）
+
+这条路径的前提：电脑和手机都安装 Tailscale，并登录同一账号。
 
 1. 电脑安装并登录 [Tailscale](https://tailscale.com/download)
 2. 安卓/iOS 安装 Tailscale App，并登录同一账号

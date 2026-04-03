@@ -10,6 +10,7 @@ Currently supports **Codex** only.
 
 - Node.js 22+
 - `codex` CLI installed and available in `PATH`
+- For remote/external access: Tailscale installed on both desktop and phone, logged into the same account
 
 ## Quick Start (1 minute)
 
@@ -53,6 +54,8 @@ Open:
 3. Sign in with `ACCESS_TOKEN`.
 
 ### B. Tailscale (recommended for remote network)
+
+Required for this path: Tailscale on both desktop and mobile, signed into the same account.
 
 1. Install and sign in on desktop: [Tailscale](https://tailscale.com/download)
 2. Install Tailscale on Android/iOS and sign in to the same account
