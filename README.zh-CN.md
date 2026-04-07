@@ -6,6 +6,13 @@
 
 当前仅支持 **Codex**。
 
+## 示例截图
+
+<p align="center">
+  <img src="./docs/images/codex-web-terminal.jpg" alt="Codex Web Terminal 手机界面截图 1" width="280" />
+  <img src="./docs/images/codex-web-terminal2.jpg" alt="Codex Web Terminal 手机界面截图 2" width="280" />
+</p>
+
 ## 前置依赖
 
 - Node.js 22+

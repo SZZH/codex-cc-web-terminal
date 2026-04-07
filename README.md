@@ -6,6 +6,13 @@ One thing only: use local `codex` sessions in your browser (including mobile).
 
 Currently supports **Codex** only.
 
+## Screenshots
+
+<p align="center">
+  <img src="./docs/images/codex-web-terminal.jpg" alt="Codex Web Terminal mobile screenshot 1" width="280" />
+  <img src="./docs/images/codex-web-terminal2.jpg" alt="Codex Web Terminal mobile screenshot 2" width="280" />
+</p>
+
 ## Prerequisites
 
 - Node.js 22+
