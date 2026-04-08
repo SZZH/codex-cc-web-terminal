@@ -584,6 +584,18 @@ function normalizeHistoricalText(value) {
     .trim();
 }
 
+function isSystemTemporaryCwd(value) {
+  const cwd = String(value || "").trim();
+  if (!cwd) {
+    return false;
+  }
+  return (
+    cwd.startsWith("/tmp") ||
+    cwd.startsWith("/var/folders") ||
+    cwd.startsWith("/private/var/folders")
+  );
+}
+
 function extractTextFromNode(value) {
   if (value == null) {
     return [];
@@ -943,9 +955,16 @@ function parseHistoricalFile(filePath) {
   let cwd = "";
   let title = "";
   let firstInput = "";
+  let firstUserMessage = "";
   let fallbackInput = "";
   const messages = [];
   let sessionTimestamp = "";
+  let sessionType = "main";
+  let parentThreadId = "";
+  let agentRole = "";
+  let agentNickname = "";
+  let originator = "";
+  let sourceType = "";
 
   for (const line of preview.split(/\r?\n/)) {
     if (!line.trim()) {
@@ -963,12 +982,33 @@ function parseHistoricalFile(filePath) {
       id = String(record.payload?.id || id);
       cwd = String(record.payload?.cwd || cwd);
       title = sanitizeTitleFragment(record.payload?.thread_name || title);
+      originator = String(record.payload?.originator || originator || "").trim();
+      sourceType =
+        typeof record.payload?.source === "string"
+          ? String(record.payload.source || sourceType || "").trim()
+          : sourceType;
       sessionTimestamp = resolveRecordTimestamp(record, sessionTimestamp);
+      const spawn = record?.payload?.source?.subagent?.thread_spawn || null;
+      if (spawn && typeof spawn === "object") {
+        sessionType = "subagent";
+        parentThreadId = String(spawn.parent_thread_id || parentThreadId || "").trim();
+        agentNickname = String(spawn.agent_nickname || agentNickname || "").trim();
+        agentRole = String(spawn.agent_role || agentRole || "").trim();
+      }
+      agentRole = String(record?.payload?.agent_role || agentRole || "").trim();
+      agentNickname = String(record?.payload?.agent_nickname || agentNickname || "").trim();
+    }
+
+    if (record.type === "event_msg" && record.payload?.type === "user_message") {
+      const rawUserMessage = String(record.payload?.message || "");
+      const normalizedUserMessage = cleanHistoricalMessageText(rawUserMessage);
+      if (!firstUserMessage && normalizedUserMessage && !isBoilerplateUserText(normalizedUserMessage)) {
+        firstUserMessage = normalizedUserMessage;
+      }
     }
 
     id = String(record.sessionId || id || "");
     cwd = String(record.cwd || cwd || "");
-    title = sanitizeTitleFragment(record.slug || title);
 
     const candidates = extractHistoricalMessagesFromRecord(record, sessionTimestamp);
     for (const candidate of candidates) {
@@ -989,10 +1029,17 @@ function parseHistoricalFile(filePath) {
     resumeSessionId: id || basenameWithoutExtension(filePath),
     cwd,
     title,
-    titleSource: firstInput || extractHistoricalTitleCandidate(title),
+    titleSource: extractHistoricalTitleCandidate(title),
+    firstUserMessage,
     firstInput,
     fallbackInput,
-    messages
+    messages,
+    sessionType,
+    parentThreadId,
+    agentRole,
+    agentNickname,
+    originator,
+    sourceType
   };
 }
 
@@ -1122,6 +1169,8 @@ export class SessionManager {
     this.providers = new Map(buildProviders(config).map((provider) => [provider.id, provider]));
     this.customNamesPath = path.join(this.config.dataDir, "session-names.json");
     this.archivedSessionsPath = path.join(this.config.dataDir, "archived-sessions.json");
+    this.codexSessionIndexPath = path.join(path.dirname(this.config.codexSessionsDir), "session_index.jsonl");
+    this.codexSessionIndexCache = { mtimeMs: -1, size: -1, byId: new Map() };
     this.customNames = new Map(
       Object.entries(readJsonFile(this.customNamesPath, {}))
         .map(([key, value]) => [normalizeCustomNameKey(key), value])
@@ -1141,6 +1190,54 @@ export class SessionManager {
           console.warn(`[app-server] ${text}`);
         }
       });
+    }
+  }
+
+  getCodexThreadName(resumeSessionId) {
+    const id = String(resumeSessionId || "").trim();
+    if (!id) {
+      return "";
+    }
+    this.ensureCodexSessionIndexCache();
+    return String(this.codexSessionIndexCache.byId.get(id) || "").trim();
+  }
+
+  hasCodexSessionIndexEntry(resumeSessionId) {
+    const id = String(resumeSessionId || "").trim();
+    if (!id) {
+      return false;
+    }
+    this.ensureCodexSessionIndexCache();
+    return this.codexSessionIndexCache.byId.has(id);
+  }
+
+  ensureCodexSessionIndexCache() {
+    try {
+      const stat = fs.statSync(this.codexSessionIndexPath);
+      const shouldReload =
+        stat.mtimeMs !== this.codexSessionIndexCache.mtimeMs || stat.size !== this.codexSessionIndexCache.size;
+      if (shouldReload) {
+        const byId = new Map();
+        const content = fs.readFileSync(this.codexSessionIndexPath, "utf8");
+        for (const line of content.split(/\r?\n/)) {
+          if (!line.trim()) {
+            continue;
+          }
+          try {
+            const record = JSON.parse(line);
+            const recordId = String(record?.id || "").trim();
+            const threadName = String(record?.thread_name || "").trim();
+            if (recordId && threadName) {
+              byId.set(recordId, threadName);
+            }
+          } catch {
+            // Ignore malformed rows.
+          }
+        }
+        this.codexSessionIndexCache = { mtimeMs: stat.mtimeMs, size: stat.size, byId };
+      }
+    } catch {
+      this.codexSessionIndexCache = { mtimeMs: -1, size: -1, byId: new Map() };
     }
   }
 
@@ -1275,12 +1372,17 @@ export class SessionManager {
         resumeBootstrapComplete: true,
         pendingResumeInput: "",
         model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+        titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
         runnerMode: preferAppServer ? "app_server" : "json_exec",
         turnRunning: false,
         turnHadVisibleOutput: false,
         turnNoReplyNotified: false,
         runningProcess: null,
-        queuedInputs: []
+        queuedInputs: [],
+        sessionType: "main",
+        parentThreadId: "",
+        agentRole: "",
+        agentNickname: ""
       };
       this.sessions.set(id, session);
       return this.serialize(session);
@@ -1320,7 +1422,12 @@ export class SessionManager {
       resumeSessionId: String(resumeSessionId || "").trim() || null,
       resumeBootstrapComplete: !String(resumeSessionId || "").trim(),
       pendingResumeInput: "",
-      model: String(model || "").trim() || resolvedProvider.defaultModel || ""
+      model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+      titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
+      sessionType: "main",
+      parentThreadId: "",
+      agentRole: "",
+      agentNickname: ""
     };
 
     shell.onData((chunk) => {
@@ -1862,7 +1969,12 @@ export class SessionManager {
       autoNamed: session.autoNamed,
       inputPreview: session.inputPreview,
       resumeSessionId: session.resumeSessionId,
-      model: session.model || ""
+      model: session.model || "",
+      titleSource: session.titleSource || "",
+      sessionType: session.sessionType || "main",
+      parentThreadId: session.parentThreadId || "",
+      agentRole: session.agentRole || "",
+      agentNickname: session.agentNickname || ""
     };
   }
 
@@ -1903,17 +2015,40 @@ export class SessionManager {
         if (!id) {
           continue;
         }
+        const isCodexCliSession =
+          /codex_cli/i.test(String(parsed.originator || "")) || /^cli$/i.test(String(parsed.sourceType || ""));
+        if (provider.id === "codex") {
+          const inIndex = this.hasCodexSessionIndexEntry(id);
+          const keepByTemp = isSystemTemporaryCwd(parsed.cwd);
+          const keepByCli = isCodexCliSession;
+          if (!inIndex && !keepByTemp && !keepByCli) {
+            continue;
+          }
+        }
+        const indexedTitle = provider.id === "codex" ? this.getCodexThreadName(id) : "";
+        const parsedTitle = String(parsed.title || "").trim();
+        const effectiveTitle = String(indexedTitle || parsedTitle).trim();
+        const effectiveTitleSource = indexedTitle
+          ? "codex_session_index"
+          : parsedTitle
+            ? "session_meta"
+            : "";
 
         entries.push({
           filePath,
           stat,
           resumeSessionId: id,
           cwd: parsed.cwd || this.config.defaultCwd,
-          title: parsed.title,
+          title: effectiveTitle,
+          titleSource: effectiveTitleSource,
+          firstUserMessage: parsed.firstUserMessage,
           firstInput: parsed.firstInput,
           fallbackInput: parsed.fallbackInput,
-          titleSource: parsed.titleSource,
-          messages: parsed.messages
+          messages: parsed.messages,
+          sessionType: parsed.sessionType === "subagent" ? "subagent" : "main",
+          parentThreadId: String(parsed.parentThreadId || "").trim(),
+          agentRole: String(parsed.agentRole || "").trim(),
+          agentNickname: String(parsed.agentNickname || "").trim()
         });
       } catch {
         // Ignore malformed or unreadable session files.
@@ -1928,30 +2063,28 @@ export class SessionManager {
       entry.stat.mtime,
       this.config.timezone
     )}`;
-    const titleSource =
-      extractHistoricalTitleCandidate(entry.firstInput) ||
-      extractHistoricalTitleCandidate(entry.title) ||
-      extractHistoricalTitleCandidate(entry.fallbackInput);
-    const derivedName = truncateHistoricalTitle(titleSource, fallbackSavedName);
-    const canonicalTitle = truncateHistoricalTitle(entry.title);
+    const titleSource = extractHistoricalTitleCandidate(entry.title);
+    const canonicalTitle = String(entry.title || "").trim();
     const summarySource = extractHistoricalSummaryCandidate(
       entry.messages || [],
-      derivedName,
-      entry.firstInput || entry.fallbackInput || ""
+      canonicalTitle || fallbackSavedName,
+      entry.firstUserMessage || entry.firstInput || entry.fallbackInput || ""
     );
     const finalName =
       this.getCustomName(provider.id, entry.resumeSessionId) ||
-      (!isLowSignalTitle(derivedName)
-        ? derivedName
-        : canonicalTitle && !isLowSignalTitle(canonicalTitle)
-          ? canonicalTitle
-          : fallbackSavedName);
+      (canonicalTitle || fallbackSavedName);
+    const finalTitleSource = this.getCustomName(provider.id, entry.resumeSessionId)
+      ? "custom_name"
+      : canonicalTitle
+        ? (entry.titleSource || "session_meta")
+        : "fallback_saved_name";
     return {
       id: `history:${provider.id}:${entry.resumeSessionId}`,
       provider: provider.id,
       providerLabel: provider.label,
       cliLabel: provider.cliLabel,
       name: finalName,
+      titleSource: finalTitleSource,
       cwd: entry.cwd,
       kind,
       status: kind === "archived" ? "archived" : "saved",
@@ -1961,7 +2094,11 @@ export class SessionManager {
       autoNamed: false,
       inputPreview: summarySource || titleSource || entry.firstInput || entry.fallbackInput || "",
       resumeSessionId: entry.resumeSessionId,
-      archivedAt: this.getArchivedAt(provider.id, entry.resumeSessionId)
+      archivedAt: this.getArchivedAt(provider.id, entry.resumeSessionId),
+      sessionType: entry.sessionType === "subagent" ? "subagent" : "main",
+      parentThreadId: String(entry.parentThreadId || "").trim(),
+      agentRole: String(entry.agentRole || "").trim(),
+      agentNickname: String(entry.agentNickname || "").trim()
     };
   }
 
@@ -2005,6 +2142,7 @@ export class SessionManager {
 
       session.inputPreview = candidate;
       session.name = deriveSessionTitle(candidate, session.fallbackName);
+      session.titleSource = "first_user_input";
       session.autoNamed = false;
       session.updatedAt = nowIso();
       this.persistSessionName(session);

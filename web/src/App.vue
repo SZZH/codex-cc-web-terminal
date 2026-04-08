@@ -15,11 +15,8 @@ import {
   fallbackTitleForSession,
   filterTerminalNoise,
   formatRelativeTime,
-  isLowSignalTitle,
   normalizeHistoryMessages,
   normalizeLine,
-  pickPreview,
-  pickRealTitle,
   sanitizeAssistantText,
   wait,
   workspaceName
@@ -103,15 +100,19 @@ function decorateSession(session) {
   const cache = sessionCache[cacheKey(session)] || {};
   return {
     ...session,
-    displayTitle: cache.title || fallbackTitleForSession(session),
+    displayTitle: cache.title || String(session?.name || "").trim() || fallbackTitleForSession(session),
     displayPreview: cache.preview || fallbackPreviewForSession(session),
     groupName: workspaceName(session.cwd)
   };
 }
 
 const groupedSessions = computed(() => {
+  const sessionSorter = (left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt));
   const groups = new Map();
   for (const session of state.sessions.map(decorateSession)) {
+    if (String(session?.sessionType || "").trim().toLowerCase() === "subagent") {
+      continue;
+    }
     if (!groups.has(session.groupName)) {
       groups.set(session.groupName, []);
     }
@@ -121,7 +122,7 @@ const groupedSessions = computed(() => {
   return [...groups.entries()]
     .map(([name, sessions]) => ({
       name,
-      sessions: [...sessions].sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+      sessions: [...sessions].sort(sessionSorter)
     }))
     .sort((left, right) =>
       String(right.sessions[0]?.updatedAt || "").localeCompare(String(left.sessions[0]?.updatedAt || ""))
@@ -561,8 +562,8 @@ async function hydrateSession(session, { includeMessages = false, silent = false
     if (!payload) {
       const nextValue = {
         hydrated: true,
-        title: fallbackTitleForSession(session),
-        preview: fallbackPreviewForSession(session),
+        title: String(session?.name || fallbackTitleForSession(session)).trim() || fallbackTitleForSession(session),
+        preview: String(session?.inputPreview || fallbackPreviewForSession(session)).trim() || fallbackPreviewForSession(session),
         messages: [],
         session: null
       };
@@ -571,8 +572,8 @@ async function hydrateSession(session, { includeMessages = false, silent = false
     }
 
     const messages = normalizeHistoryMessages(payload.messages || []);
-    const title = pickRealTitle(messages, payload.session?.name || session.name, session);
-    const preview = pickPreview(messages, session, title);
+    const title = String(payload.session?.name || session.name || fallbackTitleForSession(session)).trim() || fallbackTitleForSession(session);
+    const preview = String(payload.session?.inputPreview || session.inputPreview || fallbackPreviewForSession(session)).trim() || fallbackPreviewForSession(session);
     const nextValue = { hydrated: true, title, preview, messages, session: payload.session || null };
     sessionCache[key] = { ...(sessionCache[key] || {}), ...nextValue };
     return sessionCache[key];
@@ -591,24 +592,21 @@ async function hydrateSession(session, { includeMessages = false, silent = false
   }
 }
 
-async function prefetchSessionTitles() {
-  const candidates = state.sessions
-    .filter(
-      (session) =>
-        session.kind === "history" &&
-        (isLowSignalTitle(session.name, session) || isLowSignalTitle(session.inputPreview, session))
-    )
-    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
-    .slice(0, 18);
-
-  for (const session of candidates) {
-    await hydrateSession(session, { silent: true });
-  }
-}
-
 async function refreshSessions() {
   const payload = await request("/api/sessions");
-  state.sessions = payload.sessions || [];
+  const sessions = payload.sessions || [];
+  for (const session of sessions) {
+    const key = cacheKey(session);
+    const title = String(session?.name || "").trim();
+    if (!title) {
+      continue;
+    }
+    sessionCache[key] = {
+      ...(sessionCache[key] || {}),
+      title
+    };
+  }
+  state.sessions = sessions;
 }
 
 function toOriginProtocol(proto) {
@@ -1145,10 +1143,17 @@ function defaultPreview(session) {
 
 watch(
   () => route.name,
-  (name) => {
+  async (name) => {
     if (name === "sessions") {
       closeSocket();
       finalizeAssistantStream();
+      if (state.isAuthenticated) {
+        try {
+          await refreshSessions();
+        } catch (error) {
+          setStatus(error?.message || String(error));
+        }
+      }
     }
   }
 );
