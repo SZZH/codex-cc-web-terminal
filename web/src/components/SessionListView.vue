@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch } from "vue";
+import { onBeforeUnmount, ref, watch } from "vue";
 
 const props = defineProps({
   groups: { type: Array, default: () => [] },
@@ -8,8 +8,13 @@ const props = defineProps({
   formatRelativeTime: { type: Function, required: true }
 });
 
-const emit = defineEmits(["open"]);
+const emit = defineEmits(["open", "create-group-session"]);
 const expandedGroups = ref(new Set());
+const openMenuGroupName = ref("");
+const openMenuPoint = ref({ x: 0, y: 0 });
+const longPressTimer = ref(null);
+const longPressGroupName = ref("");
+const suppressToggleUntil = ref(0);
 
 function buildInitialExpandedSet(groups, activeSessionId) {
   const next = new Set();
@@ -42,6 +47,9 @@ function isExpanded(name) {
 }
 
 function toggleGroup(name) {
+  if (Date.now() < suppressToggleUntil.value) {
+    return;
+  }
   const next = new Set(expandedGroups.value);
   if (next.has(name)) {
     next.delete(name);
@@ -57,13 +65,95 @@ function groupSubtitle(group) {
   const latestText = latest ? props.formatRelativeTime(latest) : "";
   return latestText ? `最近 ${latestText}` : count ? `${count} 个会话` : "暂无更新时间";
 }
+
+function closeMenu() {
+  openMenuGroupName.value = "";
+}
+
+function clearLongPressTimer() {
+  if (longPressTimer.value) {
+    window.clearTimeout(longPressTimer.value);
+    longPressTimer.value = null;
+  }
+}
+
+function onGroupPointerDown(group, event) {
+  const clientX = Number(event?.clientX || 0);
+  const clientY = Number(event?.clientY || 0);
+  openMenuPoint.value = { x: clientX, y: clientY };
+  clearLongPressTimer();
+  longPressGroupName.value = group.name;
+  longPressTimer.value = window.setTimeout(() => {
+    openMenuGroupName.value = group.name;
+    suppressToggleUntil.value = Date.now() + 260;
+    longPressTimer.value = null;
+  }, 500);
+}
+
+function onGroupPointerUp() {
+  clearLongPressTimer();
+}
+
+function onGlobalPointerDown(event) {
+  if (!openMenuGroupName.value) {
+    return;
+  }
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    closeMenu();
+    return;
+  }
+  if (target.closest(".group-action-popover")) {
+    return;
+  }
+  closeMenu();
+}
+
+function createGroupSession(group) {
+  if (!group) {
+    closeMenu();
+    return;
+  }
+  closeMenu();
+  emit("create-group-session", group);
+}
+
+function menuStyle() {
+  const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 390;
+  const x = Number(openMenuPoint.value?.x || 0);
+  const y = Number(openMenuPoint.value?.y || 0);
+  const clampedX = Math.max(12, Math.min(x, viewportWidth - 12));
+  return {
+    left: `${clampedX}px`,
+    top: `${Math.max(8, y - 10)}px`
+  };
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pointerdown", onGlobalPointerDown, true);
+}
+
+onBeforeUnmount(() => {
+  clearLongPressTimer();
+  if (typeof window !== "undefined") {
+    window.removeEventListener("pointerdown", onGlobalPointerDown, true);
+  }
+});
 </script>
 
 <template>
   <main class="session-screen">
     <section v-if="groups.length" class="session-groups">
       <section v-for="group in groups" :key="group.name" class="session-group">
-        <button class="session-group-head" type="button" @click="toggleGroup(group.name)">
+        <button
+          class="session-group-head"
+          type="button"
+          @click="toggleGroup(group.name)"
+          @pointerdown="onGroupPointerDown(group, $event)"
+          @pointerup="onGroupPointerUp"
+          @pointercancel="onGroupPointerUp"
+          @pointerleave="onGroupPointerUp"
+        >
           <div class="session-group-head-main">
             <span class="folder-icon" aria-hidden="true"></span>
             <div class="session-group-copy">
@@ -76,7 +166,6 @@ function groupSubtitle(group) {
           </div>
           <span class="session-group-toggle" :class="{ expanded: isExpanded(group.name) }" aria-hidden="true">⌄</span>
         </button>
-
         <div v-show="isExpanded(group.name)" class="session-group-body">
           <button
             v-for="session in group.sessions"
@@ -94,6 +183,19 @@ function groupSubtitle(group) {
         </div>
       </section>
     </section>
+    <div
+      v-if="openMenuGroupName"
+      class="group-action-popover floating"
+      :style="menuStyle()"
+    >
+      <button
+        type="button"
+        class="group-action-btn"
+        @click.stop="createGroupSession(groups.find((item) => item.name === openMenuGroupName))"
+      >
+        新增会话
+      </button>
+    </div>
 
     <div v-else class="empty-state">还没有可展示的会话。</div>
   </main>
@@ -116,11 +218,48 @@ function groupSubtitle(group) {
 }
 
 .session-group {
-  overflow: hidden;
+  position: relative;
+  overflow: visible;
   border: 1px solid rgba(201, 189, 177, 0.55);
   border-radius: 20px;
   background: linear-gradient(180deg, rgba(255, 251, 247, 0.98), rgba(247, 242, 237, 0.94));
   box-shadow: 0 12px 30px rgba(120, 101, 84, 0.05);
+}
+
+.group-action-popover {
+  position: absolute;
+  left: 14px;
+  top: 8px;
+  transform: translateY(-100%);
+  z-index: 5;
+  border: 1px solid rgba(206, 193, 179, 0.78);
+  border-radius: 12px;
+  background: rgba(255, 252, 248, 0.98);
+  box-shadow: 0 14px 26px rgba(84, 72, 58, 0.16);
+  padding: 6px;
+}
+
+.group-action-popover.floating {
+  position: fixed;
+  z-index: 2200;
+  transform: translate(-50%, -100%);
+}
+
+.group-action-btn {
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: rgba(70, 58, 47, 0.95);
+  font-size: 13px;
+  line-height: 1.2;
+  font-weight: 600;
+  padding: 8px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.group-action-btn:active {
+  background: rgba(171, 149, 126, 0.16);
 }
 
 .session-group-head {

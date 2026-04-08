@@ -122,6 +122,7 @@ const groupedSessions = computed(() => {
   return [...groups.entries()]
     .map(([name, sessions]) => ({
       name,
+      cwd: sessions[0]?.cwd || "",
       sessions: [...sessions].sort(sessionSorter)
     }))
     .sort((left, right) =>
@@ -990,6 +991,38 @@ async function openSessionItem(session, { skipRoute = false } = {}) {
   }
 }
 
+async function createSessionInGroup(group) {
+  const cwd = String(group?.cwd || "").trim();
+  if (!cwd) {
+    setStatus("该分组目录不可用，无法新增会话。");
+    return;
+  }
+
+  try {
+    state.pendingSessionId = "__creating__";
+    setStatus("正在创建会话…");
+    const payload = await request("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: "codex",
+        cwd
+      })
+    });
+    await refreshSessions();
+    if (payload?.session) {
+      await openSessionItem(payload.session);
+      return;
+    }
+    setStatus("会话已创建，请手动打开。");
+  } catch (error) {
+    setStatus(error?.message || String(error));
+  } finally {
+    if (state.pendingSessionId === "__creating__") {
+      state.pendingSessionId = "";
+    }
+  }
+}
+
 async function ensureLiveSession() {
   if (state.activeLiveSessionId && state.activeSocket && state.activeSocket.readyState === WebSocket.OPEN) {
     return state.activeLiveSessionId;
@@ -1311,6 +1344,7 @@ if (typeof window !== 'undefined') {
           :pending-session-id="state.pendingSessionId"
           :format-relative-time="formatRelativeTime"
           @open="openSessionItem"
+          @create-group-session="createSessionInGroup"
         />
 
         <div v-if="state.statusText" class="notice-strip">{{ state.statusText }}</div>
@@ -1337,7 +1371,7 @@ if (typeof window !== 'undefined') {
         @submit="submitInput"
       />
 
-      <section v-else class="mobile-shell">
+      <section v-else class="mobile-shell centered-shell">
         <div class="splash-card">正在加载会话页面…</div>
       </section>
     </template>

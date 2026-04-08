@@ -375,7 +375,6 @@ onBeforeUnmount(() => {
       </button>
       <div class="header-copy">
         <h1>{{ title }}</h1>
-        <p class="thread-id" :class="{ warn: threadMismatch }">{{ threadHint }}</p>
       </div>
       <span class="header-spacer" aria-hidden="true"></span>
     </header>
@@ -397,7 +396,6 @@ onBeforeUnmount(() => {
           </details>
         </article>
 
-        <div v-if="!renderedMessages.length" class="empty-state chat-empty">暂时还没有可展示的消息。</div>
       </section>
 
       <button
@@ -417,7 +415,7 @@ onBeforeUnmount(() => {
           :value="draft"
           class="composer-input"
           rows="1"
-          :placeholder="isTouchDevice ? '输入消息，换行请直接回车' : 'Enter 发送，Shift + Enter 换行'"
+          :placeholder="isTouchDevice ? '给 Codex 发消息…' : 'Enter 发送，Shift + Enter 换行'"
           :disabled="loading"
           :enterkeyhint="isTouchDevice ? 'enter' : 'send'"
           @input="handleInput"
