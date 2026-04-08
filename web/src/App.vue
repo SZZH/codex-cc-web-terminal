@@ -766,6 +766,9 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "snapshot") {
+      if (Array.isArray(historyMessages) && historyMessages.length > 0) {
+        return;
+      }
       const snapshotBuffer = String(payload?.buffer || "");
       const normalizedSnapshot = sanitizeAssistantText(
         normalizeLine(snapshotBuffer.length > 12000 ? snapshotBuffer.slice(-12000) : snapshotBuffer)
@@ -884,7 +887,8 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
   state.pendingSessionId = session.id;
   setStatus("正在连接会话…");
   state.activeSessionId = session.id;
-  state.activeSessionMeta = decorateSession(session);
+  const decorated = decorateSession(session);
+  state.activeSessionMeta = decorated;
   bumpActiveSessionOpenToken();
   if (!skipRoute && route.name !== "chat") {
     await router.push({ name: "chat", params: { sessionId: session.id } });
@@ -895,8 +899,29 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
   state.replayGuardUntil = 0;
   // Refresh auth/config before WebSocket connect to avoid stale cookie + fresh process mismatch.
   await bootstrapWorkspace({ includeSessions: false });
-  setMessages([]);
-  await attachLiveSocket(session.id, []);
+  let historyMessages = [];
+  if (session.resumeSessionId) {
+    const hydrated = await hydrateSession(
+      {
+        ...session,
+        id: `history:${session.provider}:${session.resumeSessionId}`,
+        kind: "history",
+        status: "saved"
+      },
+      { includeMessages: true, silent: true }
+    );
+    historyMessages = hydrated?.messages || [];
+    if (hydrated?.session) {
+      state.activeSessionMeta = {
+        ...state.activeSessionMeta,
+        displayTitle: hydrated.title || state.activeSessionMeta.displayTitle,
+        displayPreview: hydrated.preview || state.activeSessionMeta.displayPreview,
+        cwd: hydrated.session.cwd || state.activeSessionMeta.cwd || ""
+      };
+    }
+  }
+  setMessages(historyMessages);
+  await attachLiveSocket(session.id, historyMessages);
   setStatus("");
   state.pendingSessionId = "";
 }
@@ -933,7 +958,7 @@ async function openHistoricalSession(session, { skipRoute = false } = {}) {
 
 async function openSessionItem(session, { skipRoute = false } = {}) {
   try {
-    if (session.kind === "history" || session.resumeSessionId) {
+    if (session.kind === "history") {
       const historySession =
         session.kind === "history"
           ? session

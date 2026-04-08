@@ -1481,10 +1481,7 @@ export class SessionManager {
     session.updatedAt = nowIso();
     try {
       const result = await this.appServerBridge.startTurn(session, prompt);
-      const hadOutput = this.handleAppServerTurnResult(session, result);
-      if (!hadOutput && !session.turnHadVisibleOutput) {
-        emitNoReplyFallback(this, session);
-      }
+      this.handleAppServerTurnResult(session, result);
       session.turnRunning = false;
       session.updatedAt = nowIso();
       this.broadcast(session, { type: "session_updated", session: this.serialize(session) });
