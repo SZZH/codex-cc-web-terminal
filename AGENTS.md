@@ -19,14 +19,17 @@
 - Validate changes with the smallest relevant checks before closing a task.
 - Do not include secrets, personal paths, screenshots, temp files, or local debug artifacts in commits.
 
-## Commit Rules
+## Git Rules
 
-- This is an open-source project. Every commit message must use a clear tag prefix such as `feat(...)`, `fix(...)`, `refactor(...)`, `docs(...)`, `chore(...)`.
-- The commit title must describe the main user-facing or maintainer-facing outcome, not the implementation process.
-- The commit body should list only the core additions or the most important fixes.
+- This is an open-source project. Use Git tags for releases or important feature milestones.
+- Git tags should use version-style names such as `v0.1.0` for releases or milestone snapshots unless the maintainer asks for another format.
+- Tag annotations must be written in Chinese.
+- Tag annotations should summarize the recent core work of that milestone, not step-by-step implementation logs.
+- If many fixes happened in the same milestone, summarize only the few most important ones.
+- Commit titles should still describe the main shipped outcome, but they do not need a forced `feat(...)` / `fix(...)` prefix unless the maintainer asks for it.
+- If a commit body is used, list only the core additions or a few key fixes.
 - Do not write step-by-step work logs, terminal actions, or review narration into commit messages.
-- If many bugs were fixed together, summarize only the few most important ones.
-- Prefer messages that remain readable in release notes and GitHub history.
+- If many bugs were fixed together, summarize only the most important ones.
 
 ## Default Delivery
 
