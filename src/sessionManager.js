@@ -247,7 +247,7 @@ function extractImagePartsFromMarkdown(text) {
   }
 
   const images = [];
-  const cleaned = source.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/gi, (_, alt, url) => {
+  const cleaned = source.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, url) => {
     images.push({
       type: "image",
       alt: String(alt || "").trim(),
@@ -352,10 +352,7 @@ function deriveSessionTitle(value, fallback) {
 }
 
 const HISTORICAL_META_LINE_PATTERNS = [
-  /^[-*•]\s+/,
-  /^\d+[.)、]\s+/,
   /^#+\s+/,
-  /^```/,
   /^accessibility override/i,
   /^auth-required override/i,
   /^automatic routing rule/i,
@@ -389,13 +386,23 @@ function isHistoricalMetaLine(value) {
   if (!line) {
     return true;
   }
-  return HISTORICAL_META_LINE_PATTERNS.some((pattern) => pattern.test(line));
+  const withoutListPrefix = line.replace(/^[-*•]\s+/, "").replace(/^\d+[.)、]\s+/, "").trim();
+  return HISTORICAL_META_LINE_PATTERNS.some((pattern) => pattern.test(line) || pattern.test(withoutListPrefix));
+}
+
+function sanitizeHistoricalLine(value) {
+  return stripControlChars(applyBackspaces(String(value || "")))
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
+    .replace(/\u001b[@-_]/g, " ")
+    .replace(/\t/g, "  ")
+    .trimEnd();
 }
 
 function historicalMeaningfulLines(value) {
   return normalizeHistoricalText(value)
     .split("\n")
-    .map((line) => sanitizeTitleFragment(line))
+    .map((line) => sanitizeHistoricalLine(line))
     .filter(Boolean)
     .filter((line) => !isBoilerplateUserText(line))
     .filter((line) => !isHistoricalMetaLine(line))
@@ -476,7 +483,7 @@ function cleanHistoricalMessageText(value) {
 
   const lines = normalized
     .split("\n")
-    .map((line) => sanitizeTitleFragment(line))
+    .map((line) => sanitizeHistoricalLine(line))
     .filter(Boolean)
     .filter((line) => !isBoilerplateUserText(line))
     .filter((line) => !isHistoricalMetaLine(line))
@@ -681,6 +688,78 @@ function extractTextContentFromPayload(payload) {
   return pieces;
 }
 
+function summarizeEventPayload(payload, maxLen = 240) {
+  const text = extractTextContentFromPayload(payload)
+    .map((item) => sanitizeTitleFragment(item))
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  if (!text) {
+    return "";
+  }
+  if (text.length <= maxLen) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLen - 3)).trimEnd()}...`;
+}
+
+function normalizeEventPartType(rawType) {
+  const normalized = normalizeSymbolToken(rawType);
+  if (!normalized) {
+    return "event";
+  }
+  if (
+    normalized.includes("commandexecution") ||
+    normalized.includes("filechange") ||
+    normalized.includes("toolcall") ||
+    normalized.includes("mcptool")
+  ) {
+    return "tool";
+  }
+  if (normalized.includes("subagent") || normalized.includes("collab")) {
+    return "subagent";
+  }
+  if (normalized.includes("reference") || normalized.includes("citation")) {
+    return "reference";
+  }
+  return "event";
+}
+
+function buildEventPartFromItem(item) {
+  const rawType = String(item?.type || "").trim();
+  if (!rawType || isAgentMessageType(rawType)) {
+    return null;
+  }
+  const compactPayload = {
+    id: String(item?.id || "").trim(),
+    status: String(item?.status || "").trim(),
+    title: String(item?.title || "").trim(),
+    kind: String(item?.kind || "").trim(),
+    command: String(item?.command || "").trim(),
+    toolName: String(item?.tool_name || item?.toolName || "").trim(),
+    path: String(item?.path || "").trim(),
+    agentNickname: String(item?.agent_nickname || item?.agentNickname || "").trim(),
+    agentRole: String(item?.agent_role || item?.agentRole || "").trim()
+  };
+  const summary =
+    summarizeEventPayload(item, 280) ||
+    [
+      String(compactPayload.toolName || "").trim(),
+      String(compactPayload.command || "").trim(),
+      String(compactPayload.title || "").trim(),
+      String(compactPayload.path || "").trim(),
+      String(compactPayload.status || "").trim()
+    ]
+      .filter(Boolean)
+      .join(" | ");
+  return {
+    type: normalizeEventPartType(rawType),
+    rawType,
+    summary: summary || rawType,
+    payload: compactPayload
+  };
+}
+
 function resolveRecordTimestamp(record, fallbackTimestamp = nowIso()) {
   const rawTimestamp =
     record?.timestamp ||
@@ -719,7 +798,69 @@ function normalizeHistoricalRole(record) {
   return "";
 }
 
+function buildHistoricalProcessEntry(record, fallbackTimestamp) {
+  const timestamp = resolveRecordTimestamp(record, fallbackTimestamp);
+
+  if (record?.type === "event_msg") {
+    const payload = record?.payload || {};
+    const type = String(payload?.type || "").trim().toLowerCase();
+    if (type !== "agent_message") {
+      return null;
+    }
+    const phase = String(payload?.phase || "").trim().toLowerCase();
+    if (!phase || phase === "final_answer") {
+      return null;
+    }
+    const rawText =
+      typeof payload.message === "string" ? payload.message : extractTextContentFromPayload(payload).join("\n");
+    const text = cleanHistoricalMessageText(rawText);
+    if (!text) {
+      return null;
+    }
+    return {
+      role: "assistant",
+      text,
+      timestamp,
+      partType: "event",
+      payload: {
+        summary: text,
+        rawType: "agent_message",
+        payload: {
+          phase
+        }
+      },
+      rawType: "agent_message"
+    };
+  }
+
+  if (record?.type === "item.completed") {
+    const eventPart = buildEventPartFromItem(record.item || {});
+    if (!eventPart) {
+      return null;
+    }
+    return {
+      role: "assistant",
+      text: String(eventPart.summary || "").trim(),
+      timestamp,
+      partType: eventPart.type,
+      payload: {
+        summary: eventPart.summary,
+        rawType: eventPart.rawType,
+        payload: eventPart.payload
+      },
+      rawType: eventPart.rawType
+    };
+  }
+
+  return null;
+}
+
 function extractHistoricalMessagesFromRecord(record, fallbackTimestamp) {
+  const processEntry = buildHistoricalProcessEntry(record, fallbackTimestamp);
+  if (processEntry) {
+    return [processEntry];
+  }
+
   const role = normalizeHistoricalRole(record);
   if (!role) {
     return [];
@@ -727,26 +868,96 @@ function extractHistoricalMessagesFromRecord(record, fallbackTimestamp) {
 
   const payload = record?.payload || {};
   const timestamp = resolveRecordTimestamp(record, fallbackTimestamp);
+  const imageItems = extractImagePayloadItems(payload);
   const rawText =
     typeof payload.message === "string" ? payload.message : extractTextContentFromPayload(payload).join("\n");
-  if (role === "user" && isBoilerplateUserText(rawText)) {
+  if (role === "user" && isBoilerplateUserText(rawText) && imageItems.length === 0) {
     return [];
   }
   const text = cleanHistoricalMessageText(rawText);
-  if (!text) {
+  if (!text && imageItems.length === 0) {
     return [];
   }
 
-  return [{ role, text, timestamp }];
+  const messages = imageItems.map((image) => ({
+    role,
+    text: "",
+    timestamp,
+    partType: "image",
+    payload: image,
+    rawType: ""
+  }));
+  if (text) {
+    messages.push({ role, text, timestamp, partType: "markdown", payload: {}, rawType: "" });
+  }
+  return messages;
+}
+
+function extractHistoricalImageMessagesFromFile(filePath) {
+  const results = [];
+  let fallbackTimestamp = nowIso();
+  let content = "";
+  try {
+    content = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return results;
+  }
+
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const timestamp = resolveRecordTimestamp(record, fallbackTimestamp);
+    fallbackTimestamp = timestamp;
+    const payload = record?.payload || {};
+    const images = extractImagePayloadItems(payload);
+    if (!images.length) {
+      continue;
+    }
+
+    const role =
+      record?.type === "event_msg" && String(payload?.type || "").trim().toLowerCase() === "user_message"
+        ? "user"
+        : payload?.role === "user" || payload?.message?.role === "user"
+          ? "user"
+          : "assistant";
+
+    for (const image of images) {
+      results.push({
+        role,
+        text: "",
+        timestamp,
+        partType: "image",
+        payload: image,
+        rawType: ""
+      });
+    }
+  }
+
+  return results;
 }
 
 function appendHistoricalMessage(messages, candidate) {
-  if (!candidate || !candidate.role || !candidate.text) {
+  if (!candidate || !candidate.role) {
+    return;
+  }
+  if (!candidate.text && !((candidate.partType || "") === "image" && String(candidate?.payload?.url || "").trim())) {
     return;
   }
 
   const last = messages[messages.length - 1];
-  if (last && last.role === candidate.role) {
+  if (
+    last &&
+    last.role === candidate.role &&
+    (last.partType || "markdown") === "markdown" &&
+    (candidate.partType || "markdown") === "markdown"
+  ) {
     const lastTimestamp = Date.parse(last.timestamp);
     const candidateTimestamp = Date.parse(candidate.timestamp);
     const gap = Math.abs(lastTimestamp - candidateTimestamp);
@@ -779,7 +990,10 @@ function appendHistoricalMessage(messages, candidate) {
   messages.push({
     role: candidate.role,
     text: candidate.text,
-    timestamp: candidate.timestamp
+    timestamp: candidate.timestamp,
+    partType: candidate.partType || "markdown",
+    payload: candidate.payload || {},
+    rawType: candidate.rawType || ""
   });
 }
 
@@ -900,6 +1114,89 @@ function contentTextItems(content) {
   }
 
   return items;
+}
+
+function contentImageItems(content) {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  const items = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const imageUrl = String(item.image_url || item.url || item.path || "").trim();
+    if ((item.type === "input_image" || item.type === "image" || item.type === "output_image") && imageUrl) {
+      items.push({
+        url: imageUrl,
+        alt: String(item.alt || item.name || "image").trim() || "image"
+      });
+      continue;
+    }
+
+    if (Array.isArray(item.content)) {
+      items.push(...contentImageItems(item.content));
+    }
+  }
+
+  return items;
+}
+
+function extractImagePayloadItems(payload) {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const images = [];
+  const pushImage = (url, alt = "image") => {
+    const normalizedUrl = String(url || "").trim();
+    if (!normalizedUrl) {
+      return;
+    }
+    images.push({
+      url: normalizedUrl,
+      alt: String(alt || "image").trim() || "image"
+    });
+  };
+
+  if (Array.isArray(payload.images)) {
+    for (const item of payload.images) {
+      if (typeof item === "string") {
+        pushImage(item);
+      } else if (item && typeof item === "object") {
+        pushImage(item.url || item.image_url || item.path, item.alt || item.name);
+      }
+    }
+  }
+
+  if (Array.isArray(payload.local_images)) {
+    for (const item of payload.local_images) {
+      if (typeof item === "string") {
+        pushImage(item);
+      } else if (item && typeof item === "object") {
+        pushImage(item.path || item.url || item.image_url, item.alt || item.name);
+      }
+    }
+  }
+
+  if (Array.isArray(payload.content)) {
+    images.push(...contentImageItems(payload.content));
+  }
+
+  if (payload.message?.role === "user" && Array.isArray(payload.message?.content)) {
+    images.push(...contentImageItems(payload.message.content));
+  }
+
+  const seen = new Set();
+  return images.filter((item) => {
+    if (!item?.url || seen.has(item.url)) {
+      return false;
+    }
+    seen.add(item.url);
+    return true;
+  });
 }
 
 function userTextsFromPayload(payload) {
@@ -1623,6 +1920,16 @@ export class SessionManager {
     let hadOutput = false;
     for (const item of items) {
       if (!isAgentMessageType(item?.type)) {
+        const eventPart = buildEventPartFromItem(item);
+        if (eventPart) {
+          this.broadcast(session, {
+            type: "message_part",
+            role: "assistant",
+            part: eventPart,
+            phase: "final",
+            timestamp: nowIso()
+          });
+        }
         continue;
       }
       const text = String(item?.text || "").trim();
@@ -1774,6 +2081,16 @@ export class SessionManager {
     if (event.type === "item.completed") {
       const item = event.item || {};
       if (String(item.type || "").trim() !== "agent_message") {
+        const eventPart = buildEventPartFromItem(item);
+        if (eventPart) {
+          this.broadcast(session, {
+            type: "message_part",
+            role: "assistant",
+            part: eventPart,
+            phase: "final",
+            timestamp: nowIso()
+          });
+        }
         return false;
       }
       const text = String(item.text || "").trim();
@@ -1829,6 +2146,16 @@ export class SessionManager {
       if (method === "item/completed" || normalizedMethod === "itemcompleted") {
         const item = params?.item || {};
         if (!isAgentMessageType(item?.type)) {
+          const eventPart = buildEventPartFromItem(item);
+          if (eventPart) {
+            this.broadcast(session, {
+              type: "message_part",
+              role: "assistant",
+              part: eventPart,
+              phase: "final",
+              timestamp: nowIso()
+            });
+          }
           continue;
         }
         const text = String(item?.text || "").trim();
@@ -2119,9 +2446,37 @@ export class SessionManager {
     }
 
     const entry = entries.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0];
+    let liveParsedMessages = entry.messages || [];
+    try {
+      liveParsedMessages = parseHistoricalFile(entry.filePath).messages || liveParsedMessages;
+    } catch {
+      // Fall back to scanned messages if direct reparse fails.
+    }
+    try {
+      const imageMessages = extractHistoricalImageMessagesFromFile(entry.filePath);
+      if (imageMessages.length) {
+        const seen = new Set(
+          liveParsedMessages
+            .filter((item) => String(item?.partType || "") === "image" && String(item?.payload?.url || "").trim())
+            .map((item) => `${item.timestamp}|${String(item.payload.url).trim()}`)
+        );
+        for (const image of imageMessages) {
+          const key = `${image.timestamp}|${String(image?.payload?.url || "").trim()}`;
+          if (!seen.has(key)) {
+            liveParsedMessages.push(image);
+            seen.add(key);
+          }
+        }
+        liveParsedMessages.sort(
+          (left, right) => Date.parse(String(left?.timestamp || "")) - Date.parse(String(right?.timestamp || ""))
+        );
+      }
+    } catch {
+      // Keep text-only historical messages if image recovery fails.
+    }
     return {
       session: this.buildHistoricalSession(provider, entry, this.isArchived(provider.id, entry.resumeSessionId) ? "archived" : "history"),
-      messages: entry.messages || []
+      messages: liveParsedMessages
     };
   }
 

@@ -24,8 +24,6 @@ const TITLE_NOISE_PATTERNS = [
 ];
 
 const HISTORICAL_META_LINE_PATTERNS = [
-  /^[-*•]\s+/,
-  /^\d+[.)、]\s+/,
   /^#+\s+/,
   /^```/,
   /^accessibility override/i,
@@ -158,6 +156,8 @@ function isProcessNoiseLine(value) {
     return true;
   }
 
+  const shortBulletProgress = /^•\s*[a-z\u4e00-\u9fff]{1,10}$/i.test(text) && !/[。！？.!?:：]/.test(text);
+
   return (
     /^working\(/.test(text) ||
     /esc to interrupt/.test(text) ||
@@ -172,7 +172,7 @@ function isProcessNoiseLine(value) {
     /^@[a-z0-9._/-]+/.test(text) ||
     /^›/.test(text) ||
     /^>/.test(text) ||
-    /^•/.test(text) ||
+    shortBulletProgress ||
     /^[=~`._-]{1,12}$/.test(text)
   );
 }
@@ -274,7 +274,8 @@ export function isHistoricalMetaLine(value) {
   if (!text) {
     return true;
   }
-  return HISTORICAL_META_LINE_PATTERNS.some((pattern) => pattern.test(text));
+  const withoutListPrefix = text.replace(/^[-*•]\s+/, "").replace(/^\d+[.)、]\s+/, "").trim();
+  return HISTORICAL_META_LINE_PATTERNS.some((pattern) => pattern.test(text) || pattern.test(withoutListPrefix));
 }
 
 export function historicalMeaningfulLines(value) {
@@ -405,10 +406,20 @@ export function normalizeHistoryMessages(messages) {
   for (const item of messages || []) {
     const role = item?.role === "user" ? "user" : "assistant";
     const text = normalizeLine(item?.text || "");
-    if (!text) {
+    const partType = String(item?.partType || "markdown").trim() || "markdown";
+    const payload = item?.payload && typeof item.payload === "object" ? item.payload : {};
+    const imageUrl = String(payload?.url || "").trim();
+    if (!text && !(partType === "image" && imageUrl)) {
       continue;
     }
-    normalized.push(createMessage(role, text, item?.timestamp || "", { source: "history" }));
+    normalized.push(
+      createMessage(role, text, item?.timestamp || "", {
+        source: "history",
+        partType,
+        payload,
+        rawType: String(item?.rawType || "").trim()
+      })
+    );
   }
   return normalized;
 }

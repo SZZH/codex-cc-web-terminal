@@ -5,7 +5,7 @@ import { useRoute, useRouter } from "vue-router";
 import ChatView from "./components/ChatView.vue";
 import LoginView from "./components/LoginView.vue";
 import SessionListView from "./components/SessionListView.vue";
-import { request, requestHistoryMessages, requestSessionById } from "./lib/api.js";
+import { AUTH_EXPIRED_EVENT, request, requestHistoryMessages, requestSessionById } from "./lib/api.js";
 import { normalizeServerPayload } from "./lib/normalize-events.js";
 import {
   PREVIEW_FALLBACK,
@@ -72,7 +72,8 @@ const state = reactive({
   lastSubmitText: "",
   lastSubmitAt: 0,
   backendHttpOrigin: "",
-  backendWsOrigin: ""
+  backendWsOrigin: "",
+  authExpiredHandler: null
 });
 let syncingRouteOpen = false;
 
@@ -163,7 +164,7 @@ const threadMismatch = computed(() => {
   }
   return expectedThreadId.value !== activeThreadId.value;
 });
-const canSend = computed(() => Boolean(composerDraft.value.trim()));
+const canSend = computed(() => Boolean(composerDraft.value.trim()) && !state.loading);
 const canInterrupt = computed(() => {
   const socketReady =
     Boolean(state.activeLiveSessionId) &&
@@ -257,9 +258,42 @@ function saveTokenPreference(token) {
   }
 }
 
+async function forceBackToLogin(statusMessage = "登录状态已失效，请重新登录。") {
+  clearSubmitFallbackTimer();
+  closeSocket();
+  finalizeAssistantStream();
+  state.loading = false;
+  state.isAuthenticated = false;
+  state.sessions = [];
+  state.activeSessionId = "";
+  state.activeLiveSessionId = "";
+  state.activeSessionMeta = null;
+  state.pendingSessionId = "";
+  composerDraft.value = "";
+  setMessages([]);
+  setStatus(statusMessage);
+  const savedToken = getSavedToken();
+  state.accessToken = savedToken;
+  state.rememberToken = Boolean(savedToken);
+  if (route.name !== "login") {
+    const redirect = route.fullPath || "/sessions";
+    await router.replace({ name: "login", query: { redirect } });
+  }
+}
+
 function setMessages(messages) {
-  state.activeMessages = messages.filter((message) => message?.text);
+  state.activeMessages = messages.filter(
+    (message) => message?.text || (message?.partType === "image" && String(message?.payload?.url || "").trim())
+  );
   rebuildReplaySuppressionLines(state.activeMessages);
+}
+function buildSubmissionText(text) {
+  const fragments = [];
+  const trimmedText = String(text || "").trim();
+  if (trimmedText) {
+    fragments.push(trimmedText);
+  }
+  return fragments.join("\n\n").trim();
 }
 
 function bumpActiveSessionOpenToken() {
@@ -483,6 +517,29 @@ function appendNormalizedParts(parts = []) {
       continue;
     }
 
+    if (partType === "tool" || partType === "subagent" || partType === "reference" || partType === "event") {
+      const summary = sanitizeAssistantText(
+        normalizeLine(
+          String(payload.summary || payload.text || payload.message || "").trim() ||
+            String(payload.rawType || partType)
+        )
+      );
+      if (!summary) {
+        continue;
+      }
+      finalizeAssistantStream();
+      messages.push(
+        createMessage(role === "system" ? "system" : "assistant", summary, ts, {
+          source: part?.source || "normalized",
+          partType,
+          payload,
+          rawType: part?.rawType || String(payload.rawType || "")
+        })
+      );
+      touched = true;
+      continue;
+    }
+
     if (partType === "image") {
       const url = String(payload.url || "").trim();
       if (!url) {
@@ -537,19 +594,19 @@ function clearPendingReplyStatus() {
   }
 }
 
-async function hydrateSession(session, { includeMessages = false, silent = false } = {}) {
+async function hydrateSession(session, { includeMessages = false, silent = false, forceRefresh = false } = {}) {
   if (!session || session.kind !== "history" || !session.resumeSessionId) {
     return null;
   }
 
   const key = cacheKey(session);
   const cached = sessionCache[key];
-  if (cached?.hydrated && (!includeMessages || cached.messages)) {
+  if (!forceRefresh && cached?.hydrated && (!includeMessages || cached.messages)) {
     return cached;
   }
 
   if (pendingHydrations.has(key)) {
-    if (!includeMessages) {
+    if (!includeMessages && !forceRefresh) {
       return cached || null;
     }
     while (pendingHydrations.has(key)) {
@@ -765,9 +822,6 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "snapshot") {
-      if (Array.isArray(historyMessages) && historyMessages.length > 0) {
-        return;
-      }
       const snapshotBuffer = String(payload?.buffer || "");
       const normalizedSnapshot = sanitizeAssistantText(
         normalizeLine(snapshotBuffer.length > 12000 ? snapshotBuffer.slice(-12000) : snapshotBuffer)
@@ -907,7 +961,7 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
         kind: "history",
         status: "saved"
       },
-      { includeMessages: true, silent: true }
+      { includeMessages: true, silent: true, forceRefresh: true }
     );
     historyMessages = hydrated?.messages || [];
     if (hydrated?.session) {
@@ -931,7 +985,7 @@ async function openHistoricalSession(session, { skipRoute = false } = {}) {
   state.pendingSessionId = session.id;
   setStatus("正在加载会话…");
   const decorated = decorateSession(session);
-  const hydrated = await hydrateSession(session, { includeMessages: true });
+  const hydrated = await hydrateSession(session, { includeMessages: true, forceRefresh: true });
   const historyMessages = hydrated?.messages || [];
 
   state.activeSessionId = session.id;
@@ -1094,10 +1148,11 @@ async function submitInput() {
     return;
   }
   const now = Date.now();
-  if (text === state.lastSubmitText && now - Number(state.lastSubmitAt || 0) < 2500) {
+  const submissionText = buildSubmissionText(text);
+  if (submissionText === state.lastSubmitText && now - Number(state.lastSubmitAt || 0) < 2500) {
     return;
   }
-  state.lastSubmitText = text;
+  state.lastSubmitText = submissionText;
   state.lastSubmitAt = now;
 
   try {
@@ -1118,15 +1173,15 @@ async function submitInput() {
       );
     }
     finalizeAssistantStream();
-    state.activeSocket.send(JSON.stringify({ type: "input", data: `${text}\n` }));
+    state.activeSocket.send(JSON.stringify({ type: "input", data: `${submissionText}\n` }));
     clearSubmitFallbackTimer();
     if (state.replayGuardActive) {
-      state.replayGuardPrompt = text;
+      state.replayGuardPrompt = submissionText;
     }
-    rebuildReplaySuppressionLines([...state.activeMessages, createMessage("user", text, new Date().toISOString())]);
+    rebuildReplaySuppressionLines([...state.activeMessages, createMessage("user", submissionText, new Date().toISOString())]);
     setMessages([
       ...state.activeMessages,
-      createMessage("user", text, new Date().toISOString(), { source: "draft" })
+      createMessage("user", submissionText, new Date().toISOString(), { source: "draft" })
     ]);
     composerDraft.value = "";
     setStatus("等待 Codex 回复…");
@@ -1281,6 +1336,11 @@ watch(
 );
 
 onMounted(async () => {
+  const handleAuthExpired = () => {
+    forceBackToLogin("登录状态已失效，请重新登录。");
+  };
+  window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+  state.authExpiredHandler = handleAuthExpired;
   try {
     const savedToken = getSavedToken();
     if (savedToken) {
@@ -1303,6 +1363,10 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  if (state.authExpiredHandler) {
+    window.removeEventListener(AUTH_EXPIRED_EVENT, state.authExpiredHandler);
+    state.authExpiredHandler = null;
+  }
   closeSocket();
 });
 
