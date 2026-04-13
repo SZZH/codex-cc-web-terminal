@@ -1,3 +1,12 @@
+export const AUTH_EXPIRED_EVENT = "codex-auth-expired";
+
+function notifyAuthExpired() {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
+}
+
 export async function request(url, options = {}, attempt = 0) {
   const response = await fetch(url, {
     ...options,
@@ -13,6 +22,9 @@ export async function request(url, options = {}, attempt = 0) {
     if (relogged) {
       return request(url, options, attempt + 1);
     }
+  }
+  if (response.status === 401) {
+    notifyAuthExpired();
   }
 
   if (!response.ok) {
@@ -66,6 +78,9 @@ export async function requestHistoryMessages(session, historyApiAvailable, attem
     if (relogged) {
       return requestHistoryMessages(session, historyApiAvailable, attempt + 1);
     }
+  }
+  if (response.status === 401) {
+    notifyAuthExpired();
   }
 
   if (response.status === 503 && attempt === 0) {
