@@ -8,3 +8,6 @@ server.err.log
 tmp-*.log
 *-test*.png
 web/dist/
+.harness/last-recall.json
+.harness/repo-index.json
+.harness/dep-graph.json
