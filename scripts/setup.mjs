@@ -11,6 +11,7 @@ const projectRoot = process.cwd();
 const envExamplePath = path.join(projectRoot, '.env.example');
 const envPath = path.join(projectRoot, '.env');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const isWindows = process.platform === 'win32';
 
 function logStep(title) {
   output.write(`\n=== ${title} ===\n`);
@@ -61,6 +62,77 @@ function toEnvContent(map) {
 function validPort(value) {
   const n = Number(value);
   return Number.isInteger(n) && n >= 1 && n <= 65535;
+}
+
+function runCommand(command, args) {
+  output.write(`> ${command} ${args.join(' ')}\n`);
+  const ret = spawnSync(command, args, { stdio: 'inherit' });
+  if (ret.error) {
+    output.write(`命令执行异常: ${ret.error.message}\n`);
+  }
+  return ret;
+}
+
+function isSuccess(ret) {
+  return ret.status === 0 && !ret.error;
+}
+
+function exitByResult(ret) {
+  if (ret.signal) {
+    output.write(`命令被信号中断: ${ret.signal}\n`);
+  }
+  process.exit(typeof ret.status === 'number' ? ret.status : 1);
+}
+
+function runInstallWithRetry() {
+  const attempts = [
+    { args: ['install'], note: '首次执行 npm install' },
+    { args: ['install', '--include=optional'], note: '重试并包含可选依赖（修复 npm 可选依赖偶发问题）' }
+  ];
+  let lastRet = null;
+  for (let i = 0; i < attempts.length; i += 1) {
+    const attempt = attempts[i];
+    if (i > 0) {
+      output.write(`${attempt.note}\n`);
+    }
+    const ret = runCommand(npmCommand, attempt.args);
+    if (isSuccess(ret)) {
+      return ret;
+    }
+    lastRet = ret;
+  }
+  return lastRet;
+}
+
+function verifyAndRepairWindowsBuild() {
+  logStep('依赖自检');
+  output.write('执行前端构建检查，确认 Windows 原生依赖可用...\n');
+  let ret = runCommand(npmCommand, ['run', 'web:build']);
+  if (isSuccess(ret)) {
+    return ret;
+  }
+
+  output.write('检测到前端构建异常，尝试自动修复 rolldown Windows 绑定...\n');
+  const repairSteps = [
+    { args: ['rebuild', '@rolldown/binding-win32-x64-msvc'], note: '重建 @rolldown/binding-win32-x64-msvc' },
+    { args: ['install', '--include=optional'], note: '重新安装并包含可选依赖' }
+  ];
+  for (const step of repairSteps) {
+    output.write(`${step.note}\n`);
+    const repairRet = runCommand(npmCommand, step.args);
+    if (!isSuccess(repairRet)) {
+      ret = repairRet;
+      continue;
+    }
+    ret = runCommand(npmCommand, ['run', 'web:build']);
+    if (isSuccess(ret)) {
+      output.write('已自动修复依赖问题。\n');
+      return ret;
+    }
+  }
+
+  output.write('仍未修复。请关闭占用 node_modules 中 *.node 文件的进程（如杀毒扫描或其他 Node 进程）后重试。\n');
+  return ret;
 }
 
 async function main() {
@@ -153,11 +225,20 @@ async function main() {
   const installDeps = await askYesNo('现在安装依赖（npm install）？', true);
   if (installDeps) {
     logStep('安装依赖');
-    const ret = spawnSync(npmCommand, ['install'], { stdio: 'inherit' });
-    if (ret.status !== 0) {
+    const ret = runInstallWithRetry();
+    if (!isSuccess(ret)) {
       output.write('npm install 失败，请修复后重试。\n');
       await rl.close();
-      process.exit(ret.status ?? 1);
+      exitByResult(ret);
+    }
+
+    if (isWindows) {
+      const checkRet = verifyAndRepairWindowsBuild();
+      if (!isSuccess(checkRet)) {
+        output.write('依赖安装后自检失败，请修复后重试。\n');
+        await rl.close();
+        exitByResult(checkRet);
+      }
     }
   }
 
@@ -165,11 +246,11 @@ async function main() {
   const startNow = await askYesNo(`现在启动开发服务（npm run ${startScript}）？`, true);
   if (startNow) {
     logStep('启动服务');
-    const ret = spawnSync(npmCommand, ['run', startScript], { stdio: 'inherit' });
-    if (ret.status !== 0) {
+    const ret = runCommand(npmCommand, ['run', startScript]);
+    if (!isSuccess(ret)) {
       output.write('启动失败，请查看日志排查。\n');
       await rl.close();
-      process.exit(ret.status ?? 1);
+      exitByResult(ret);
     }
   }
 
