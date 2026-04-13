@@ -1,0 +1,2 @@
+include = ["src/", "app/", "lib/", "packages/", "tests/"]
+exclude = ["node_modules/", "dist/", "build/", ".next/"]

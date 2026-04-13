@@ -1,0 +1,5 @@
+auto_recall = true
+auto_summarize = true
+fallback_to_context_summary = true
+minimum_capture_categories = ["user_preferences", "project_constraints", "stage_decisions", "pending_items"]
+high_confidence_keywords = ["默认", "以后", "长期", "下次继续", "记住", "always", "default", "remember", "next time"]

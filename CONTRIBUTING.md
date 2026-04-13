@@ -27,6 +27,23 @@ Run:
 npm run check
 ```
 
+## Documentation Rules
+
+- Use root docs for entry-level repository guidance only:
+  - `README.md`
+  - `README.zh-CN.md`
+  - `AGENTS.md`
+  - `CONTRIBUTING.md`
+- Put formal long-term project documentation in `docs/`.
+- Use `.harness/` only for lightweight execution notes, temporary plans, or agent-oriented coordination material.
+- Do not add new long-lived project standards to `.harness/`.
+- Follow [documentation-standards.md](./docs/contributing/documentation-standards.md) when creating or moving docs.
+- Prefer the templates in [document-templates.md](./docs/contributing/document-templates.md) when adding formal docs.
+- Keep `docs/README.md` updated when a new formal documentation area is added.
+- Follow [change-scope-rules.md](./docs/contributing/change-scope-rules.md) to avoid out-of-scope edits.
+- Follow [verification-matrix.md](./docs/contributing/verification-matrix.md) for minimum required checks.
+- Follow [sync-checklists.md](./docs/contributing/sync-checklists.md) when a change requires docs or rule synchronization.
+
 ## Scope Guidelines
 
 - Prefer minimal, local changes.

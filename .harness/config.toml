@@ -1,0 +1,8 @@
+default_mode = "smart-lite"
+max_tokens_per_task = 12000
+max_runtime_minutes = 45
+max_retries = 2
+enable_memory = true
+enable_openspace = true
+critical_paths = ["core/", "api/", "auth/", "billing/", "shared/"]
+full_reindex_days = 7
