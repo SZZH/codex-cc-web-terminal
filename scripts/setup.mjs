@@ -41,6 +41,13 @@ function askWithDefault(question, fallback) {
   });
 }
 
+function askWithDisplayDefault(question, fallback, displayFallback) {
+  return rl.question(`${question} (${displayFallback}) `).then((raw) => {
+    const v = raw.trim();
+    return v || fallback;
+  });
+}
+
 function parseEnv(content) {
   const map = new Map();
   const lines = content.split(/\r?\n/);
@@ -62,6 +69,27 @@ function toEnvContent(map) {
 function validPort(value) {
   const n = Number(value);
   return Number.isInteger(n) && n >= 1 && n <= 65535;
+}
+
+function isValidTimezone(value) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTimezone(value) {
+  return String(value || '').trim();
+}
+
+function resolveTimezoneDefault(value) {
+  const normalized = normalizeTimezone(value);
+  if (!normalized) {
+    return 'UTC';
+  }
+  return isValidTimezone(normalized) ? normalized : 'UTC';
 }
 
 function runCommand(command, args) {
@@ -171,7 +199,7 @@ async function main() {
 
   logStep('交互式配置');
   const currentPort = base.get('PORT') || '3210';
-  let port = await askWithDefault('服务端口 PORT', currentPort);
+  let port = await askWithDefault('服务端口 PORT（1-65535）', currentPort);
   while (!validPort(port)) {
     port = await askWithDefault('端口无效，请输入 1-65535 的整数端口', currentPort);
   }
@@ -185,16 +213,36 @@ async function main() {
   }
   base.set('ACCESS_TOKEN', token);
 
-  const host = await askWithDefault('监听地址 HOST', base.get('HOST') || '0.0.0.0');
+  const host = await askWithDefault('监听地址 HOST（0.0.0.0 对局域网可见，127.0.0.1 仅本机）', base.get('HOST') || '0.0.0.0');
   base.set('HOST', host);
 
   const tailscaleOnly = await askYesNo('是否仅允许本机 + Tailscale 访问（TAILSCALE_ONLY）？', String(base.get('TAILSCALE_ONLY')).toLowerCase() === 'true');
   base.set('TAILSCALE_ONLY', tailscaleOnly ? 'true' : 'false');
 
-  const timezone = await askWithDefault('展示时区 DISPLAY_TIMEZONE', base.get('DISPLAY_TIMEZONE') || 'Asia/Shanghai');
+  const rawTimezone = base.get('DISPLAY_TIMEZONE');
+  const timezoneDefault = resolveTimezoneDefault(rawTimezone);
+  if (normalizeTimezone(rawTimezone) && timezoneDefault !== normalizeTimezone(rawTimezone)) {
+    output.write(`检测到 DISPLAY_TIMEZONE=${rawTimezone} 无效，已回退为 ${timezoneDefault}。\n`);
+  }
+  let timezone = await askWithDefault(
+    '展示时区 DISPLAY_TIMEZONE（IANA 时区，如 Asia/Shanghai、UTC）',
+    timezoneDefault
+  );
+  while (!isValidTimezone(timezone)) {
+    timezone = await askWithDefault(
+      '时区无效，请输入 IANA 时区（如 Asia/Shanghai、UTC）',
+      timezoneDefault
+    );
+  }
   base.set('DISPLAY_TIMEZONE', timezone);
 
-  const defaultCwd = await askWithDefault('默认工作目录 DEFAULT_CWD（可留空）', base.get('DEFAULT_CWD') || projectRoot);
+  const suggestedDefaultCwd = base.get('DEFAULT_CWD') || projectRoot;
+  const defaultCwdRaw = await askWithDisplayDefault(
+    '默认工作目录 DEFAULT_CWD（回车使用建议值，输入 - 清空）',
+    suggestedDefaultCwd,
+    suggestedDefaultCwd
+  );
+  const defaultCwd = defaultCwdRaw === '-' ? '' : defaultCwdRaw;
   base.set('DEFAULT_CWD', defaultCwd);
 
   logStep('写入 .env');

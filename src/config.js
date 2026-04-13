@@ -121,5 +121,5 @@ export const config = {
   dataDir: path.join(root, "data"),
   codexSessionsDir: env("CODEX_SESSIONS_DIR", path.join(home, ".codex", "sessions")),
   ccSessionsDir: env("CC_SESSIONS_DIR", path.join(home, ".claude", "projects")),
-  timezone: env("DISPLAY_TIMEZONE", "Australia/Melbourne")
+  timezone: env("DISPLAY_TIMEZONE", "UTC")
 };
