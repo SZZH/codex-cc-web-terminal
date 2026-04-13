@@ -33,3 +33,9 @@ npm run check
 - Do not include secrets, personal paths, or local debug artifacts in commits.
 - Keep `web/dist/` out of git history (already ignored).
 
+## Commit Message Guidelines
+
+- Use a tagged commit title such as `feat(...)`, `fix(...)`, `refactor(...)`, `docs(...)`, or `chore(...)`.
+- Keep the title focused on the main shipped outcome.
+- If you add a commit body, list only core features or the most important fixes.
+- Do not use step-by-step work logs or implementation narration in commit messages.
