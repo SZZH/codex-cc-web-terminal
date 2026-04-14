@@ -165,7 +165,7 @@ function normalizeHistoricalRole(record) {
     }
     if (type === "agent_message") {
       const phase = String(record.payload?.phase || "").trim().toLowerCase();
-      if (phase && phase !== "final_answer") {
+      if (phase && phase !== "final_answer" && phase !== "commentary") {
         return "";
       }
       return "assistant";
@@ -184,7 +184,7 @@ function buildHistoricalProcessEntry(record, fallbackTimestamp) {
       return null;
     }
     const phase = String(payload?.phase || "").trim().toLowerCase();
-    if (!phase || phase === "final_answer") {
+    if (!phase || phase === "final_answer" || phase === "commentary") {
       return null;
     }
     const rawText = typeof payload.message === "string" ? payload.message : extractTextContentFromPayload(payload).join("\n");
@@ -252,6 +252,20 @@ function contentImageItems(content) {
   return items;
 }
 
+function isRenderableImageUrl(url) {
+  const value = String(url || "").trim();
+  if (!value) {
+    return false;
+  }
+  return (
+    /^data:image\//i.test(value) ||
+    /^https?:\/\//i.test(value) ||
+    /^blob:/i.test(value) ||
+    value.startsWith("/uploads/") ||
+    value.startsWith("/api/")
+  );
+}
+
 function extractImagePayloadItems(payload) {
   if (!payload || typeof payload !== "object") {
     return [];
@@ -259,7 +273,7 @@ function extractImagePayloadItems(payload) {
   const images = [];
   const pushImage = (url, alt = "image") => {
     const normalizedUrl = String(url || "").trim();
-    if (!normalizedUrl) {
+    if (!normalizedUrl || !isRenderableImageUrl(normalizedUrl)) {
       return;
     }
     images.push({

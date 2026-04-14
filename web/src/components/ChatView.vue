@@ -490,6 +490,7 @@ const hasAssistantBody = computed(() =>
     (message) => message.role === "assistant" && message.renderKind === "markdown" && compactText(message.displayText)
   )
 );
+const shouldCollapseCompletedGroups = computed(() => hasAssistantBody.value && !props.canInterrupt && !props.loading);
 function isEventGroupExpanded(toggleId) {
   return expandedEventGroups.value.has(toggleId);
 }
@@ -505,23 +506,23 @@ function toggleEventGroup(toggleId) {
 }
 
 const visibleMessages = computed(() => {
-  if (!hasAssistantBody.value) {
+  if (!shouldCollapseCompletedGroups.value) {
     return renderedMessages.value;
   }
 
   const output = [];
-  let pendingAssistantGroup = [];
+  let pendingEventGroup = [];
   const flushPending = () => {
-    if (!pendingAssistantGroup.length) {
+    if (!pendingEventGroup.length) {
       return;
     }
-    const toggleId = `event-toggle-${pendingAssistantGroup[0].id}`;
-    if (pendingAssistantGroup.length === 1) {
-      output.push(...pendingAssistantGroup);
-      pendingAssistantGroup = [];
+    const toggleId = `event-toggle-${pendingEventGroup[0].id}`;
+    if (pendingEventGroup.length === 1) {
+      output.push(...pendingEventGroup);
+      pendingEventGroup = [];
       return;
     }
-    const timestamps = pendingAssistantGroup
+    const timestamps = pendingEventGroup
       .map((message) => Date.parse(String(message.ts || message.timestamp || "")))
       .filter((value) => Number.isFinite(value));
     const durationLabel =
@@ -530,20 +531,20 @@ const visibleMessages = computed(() => {
       id: toggleId,
       toggleId,
       renderKind: "event-toggle",
-      count: Math.max(0, pendingAssistantGroup.length - 1),
+      count: pendingEventGroup.length,
       durationLabel
     });
     if (isEventGroupExpanded(toggleId)) {
-      output.push(...pendingAssistantGroup);
+      output.push(...pendingEventGroup);
     } else {
-      output.push(pendingAssistantGroup[pendingAssistantGroup.length - 1]);
+      output.push(pendingEventGroup[pendingEventGroup.length - 1]);
     }
-    pendingAssistantGroup = [];
+    pendingEventGroup = [];
   };
 
   for (const message of renderedMessages.value) {
-    if (message.role === "assistant") {
-      pendingAssistantGroup.push(message);
+    if (message.role === "assistant" && message.renderKind === "event") {
+      pendingEventGroup.push(message);
       continue;
     }
     flushPending();
@@ -1128,6 +1129,8 @@ onBeforeUnmount(() => {
 .image-bubble {
   padding: 6px;
   background: rgba(255, 252, 248, 0.98);
+  width: fit-content;
+  max-width: 168px;
 }
 
 .event-bubble {
@@ -1255,9 +1258,11 @@ onBeforeUnmount(() => {
 
 .message-image {
   display: block;
-  max-width: min(100%, 420px);
-  width: auto;
+  width: 156px;
+  max-width: 156px;
+  max-height: 156px;
   height: auto;
+  object-fit: cover;
   border-radius: 10px;
   cursor: zoom-in;
 }
@@ -1466,9 +1471,11 @@ onBeforeUnmount(() => {
 
 .markdown-body :deep(img) {
   display: block;
-  max-width: min(100%, 420px);
-  width: auto;
+  width: 156px;
+  max-width: 156px;
+  max-height: 156px;
   height: auto;
+  object-fit: cover;
   margin: 6px 0;
   border-radius: 12px;
   border: 1px solid rgba(208, 197, 187, 0.7);
