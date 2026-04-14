@@ -10,6 +10,20 @@ function safeObject(value) {
   return value && typeof value === "object" ? value : {};
 }
 
+function isRenderableImageUrl(url) {
+  const value = String(url || "").trim();
+  if (!value) {
+    return false;
+  }
+  return (
+    /^data:image\//i.test(value) ||
+    /^https?:\/\//i.test(value) ||
+    /^blob:/i.test(value) ||
+    value.startsWith("/uploads/") ||
+    value.startsWith("/api/")
+  );
+}
+
 function normalizeKind(value) {
   return String(value || "")
     .trim()
@@ -159,7 +173,7 @@ export function normalizeMessagePartEvent(payload, sessionId = "") {
     ];
   }
 
-  if (partType === "image" && asText(part.url)) {
+  if (partType === "image" && isRenderableImageUrl(part.url)) {
     return [
       createUiPart({
         sessionId,
@@ -257,6 +271,19 @@ function normalizeEventMsgPayload(eventMsg, sessionId = "") {
       const phase = asText(msg.phase).toLowerCase();
       if (!text) {
         return [];
+      }
+      if (phase === "commentary") {
+        return [
+          createUiPart({
+            sessionId,
+            role: "assistant",
+            partType: "markdown",
+            payload: { text },
+            phase: "final",
+            source: "event_msg",
+            rawType
+          })
+        ];
       }
       if (phase && phase !== "final_answer") {
         return [
