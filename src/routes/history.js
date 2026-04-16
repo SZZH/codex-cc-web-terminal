@@ -36,6 +36,28 @@ export async function handleHistoryRoute(ctx, runtime) {
     return true;
   }
 
+  if (ctx.path.startsWith("/api/history-sessions/") && ctx.path.endsWith("/conversation") && ctx.method === "GET") {
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+
+    const parts = ctx.path.split("/");
+    if (parts.length !== 6) {
+      runtime.json(ctx, 404, { error: "Not Found" });
+      return true;
+    }
+
+    const provider = String(parts[3] || "codex").trim();
+    const resumeSessionId = String(parts[4] || "").trim();
+    try {
+      const payload = runtime.sessionManager.getHistoricalMessages(provider, resumeSessionId);
+      runtime.json(ctx, 200, payload.conversationSnapshot || payload.conversation || {});
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err) });
+    }
+    return true;
+  }
+
   if (ctx.path === "/api/history-sessions/archive" && ctx.method === "POST") {
     if (runtime.forbidCrossOrigin(ctx)) {
       return true;

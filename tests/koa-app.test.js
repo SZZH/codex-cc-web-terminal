@@ -79,7 +79,21 @@ function createSessionManagerStub() {
       calls.history.push({ provider, resumeSessionId });
       return {
         session: { id: `history:${provider}:${resumeSessionId}` },
-        messages: [{ role: "assistant", text: "历史消息", timestamp: new Date().toISOString() }]
+        messages: [{ role: "assistant", text: "历史消息", timestamp: new Date().toISOString() }],
+        turns: [
+          {
+            id: "turn-1",
+            user: { id: "user-1", text: "用户问题", ts: new Date().toISOString() },
+            assistant: {
+              body: [{ id: "body-1", kind: "markdown", text: "历史消息", payload: {}, ts: new Date().toISOString() }],
+              process: [],
+              status: "completed",
+              startedAt: new Date().toISOString(),
+              finishedAt: new Date().toISOString()
+            }
+          }
+        ],
+        backgroundAgents: []
       };
     },
     archiveHistoricalSession(provider, resumeSessionId) {

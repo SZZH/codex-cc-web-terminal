@@ -277,11 +277,17 @@ function normalizeEventMsgPayload(eventMsg, sessionId = "") {
           createUiPart({
             sessionId,
             role: "assistant",
-            partType: "markdown",
-            payload: { text },
+            partType: "event",
+            payload: {
+              summary: text,
+              rawType: "reasoning",
+              payload: {
+                phase
+              }
+            },
             phase: "final",
             source: "event_msg",
-            rawType
+            rawType: "reasoning"
           })
         ];
       }
@@ -420,6 +426,26 @@ function normalizeResponseItemPayload(payload, sessionId = "") {
   }
   if (!text) {
     return [];
+  }
+
+  const phase = asText(item?.phase || payload?.phase).toLowerCase();
+  if (phase === "commentary") {
+    return [
+      createUiPart({
+        sessionId,
+        role: role === "user" ? "user" : role === "system" ? "system" : "assistant",
+        partType: "event",
+        payload: {
+          summary: text,
+          rawType: "reasoning",
+          payload: item
+        },
+        ts,
+        phase: "final",
+        source: "response_item",
+        rawType: "reasoning"
+      })
+    ];
   }
 
   return [

@@ -6,6 +6,15 @@ import ChatView from "./components/ChatView.vue";
 import LoginView from "./components/LoginView.vue";
 import SessionListView from "./components/SessionListView.vue";
 import { AUTH_EXPIRED_EVENT, request, requestHistoryMessages, requestSessionById } from "./lib/api.js";
+import {
+  applyConversationDeltaPayload,
+  buildTimelineMessages,
+  buildTimelineMessagesFromConversation,
+  buildConversationStateFromPayload,
+  compareConversationContent,
+  createConversationState,
+  reconcileTimelineWithSnapshotBuffer
+} from "./lib/conversation-timeline.js";
 import { normalizeServerPayload } from "./lib/normalize-events.js";
 import {
   PREVIEW_FALLBACK,
@@ -32,6 +41,7 @@ const TOKEN_STORAGE_KEY = "codex-web-terminal.saved-token";
 let autoLoginTried = false;
 let replaySuppressionLines = new Set();
 let submitFallbackTimer = null;
+let historySyncTimer = null;
 
 const LIVE_BOOTSTRAP_LINE_PATTERNS = [
   /^[╭╰│─]+$/,
@@ -62,6 +72,10 @@ const state = reactive({
   activeLiveSessionId: "",
   activeSessionMeta: null,
   activeMessages: [],
+  activeConversation: createConversationState(),
+  hasConversationSnapshot: false,
+  hasConversationDelta: false,
+  backgroundAgents: [],
   activeSocket: null,
   activeStreamBuffer: "",
   pendingSessionId: "",
@@ -190,6 +204,14 @@ function setStatus(message = "") {
   state.statusText = message;
 }
 
+async function requestConversationSnapshotBySessionId(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id) {
+    return null;
+  }
+  return request(`/api/sessions/${encodeURIComponent(id)}/conversation`);
+}
+
 function clearSubmitFallbackTimer() {
   if (submitFallbackTimer) {
     window.clearTimeout(submitFallbackTimer);
@@ -271,6 +293,10 @@ async function forceBackToLogin(statusMessage = "登录状态已失效，请重�
   state.pendingSessionId = "";
   composerDraft.value = "";
   setMessages([]);
+  state.activeConversation = createConversationState();
+  state.hasConversationSnapshot = false;
+  state.hasConversationDelta = false;
+  setBackgroundAgents([]);
   setStatus(statusMessage);
   const savedToken = getSavedToken();
   state.accessToken = savedToken;
@@ -286,6 +312,53 @@ function setMessages(messages) {
     (message) => message?.text || (message?.partType === "image" && String(message?.payload?.url || "").trim())
   );
   rebuildReplaySuppressionLines(state.activeMessages);
+}
+
+function setBackgroundAgents(backgroundAgents = []) {
+  state.backgroundAgents = Array.isArray(backgroundAgents) ? backgroundAgents : [];
+}
+
+function collectConversationFallbackMessages(messages = []) {
+  return (Array.isArray(messages) ? messages : []).filter((message) => message?.source === "draft" || message?.streaming);
+}
+
+function shouldApplyIncomingConversation(nextConversation, { force = false } = {}) {
+  if (force) {
+    return true;
+  }
+  const current = createConversationState(state.activeConversation);
+  const incoming = createConversationState(nextConversation);
+  if (incoming.sessionId && current.sessionId && incoming.sessionId !== current.sessionId) {
+    return true;
+  }
+
+  const currentVersion = Number(current.version || 0);
+  const incomingVersion = Number(incoming.version || 0);
+  if (incomingVersion < currentVersion) {
+    return false;
+  }
+  if (incomingVersion === currentVersion && incoming.turns.length < current.turns.length) {
+    return false;
+  }
+  if (incomingVersion === currentVersion && compareConversationContent(incoming, current) < 0) {
+    return false;
+  }
+  return true;
+}
+
+function setConversation(conversation, { fallbackMessages = [], buffer = "", force = false } = {}) {
+  const nextConversation = createConversationState(conversation);
+  if (!shouldApplyIncomingConversation(nextConversation, { force })) {
+    return false;
+  }
+  state.activeConversation = nextConversation;
+  setBackgroundAgents(state.activeConversation.backgroundAgents);
+  let nextMessages = buildTimelineMessagesFromConversation(state.activeConversation, fallbackMessages);
+  if (!state.activeConversation.turns.length && buffer) {
+    nextMessages = reconcileTimelineWithSnapshotBuffer(nextMessages, buffer);
+  }
+  setMessages(nextMessages);
+  return true;
 }
 function buildSubmissionText(text) {
   const fragments = [];
@@ -433,7 +506,20 @@ function appendAssistantChunk(chunk, { source = "normalized" } = {}) {
     setStatus("");
   }
 
-  state.activeStreamBuffer += normalized;
+  const previousBuffer = normalizeLine(state.activeStreamBuffer || "");
+  if (!previousBuffer) {
+    state.activeStreamBuffer = normalized;
+  } else if (normalized === previousBuffer) {
+    state.activeStreamBuffer = previousBuffer;
+  } else if (normalized.startsWith(previousBuffer)) {
+    // Some providers resend the whole current draft instead of a pure delta.
+    state.activeStreamBuffer = normalized;
+  } else if (previousBuffer.startsWith(normalized) && normalized.length >= 24) {
+    // Ignore shorter stale snapshots that would make the visible reply jump backwards.
+    state.activeStreamBuffer = previousBuffer;
+  } else {
+    state.activeStreamBuffer = `${state.activeStreamBuffer}${normalized}`;
+  }
   let mergedText = sanitizeAssistantText(normalizeLine(state.activeStreamBuffer));
   const lastUserMessage = [...state.activeMessages].reverse().find((message) => message.role === "user")?.text || "";
   if (lastUserMessage && mergedText.startsWith(lastUserMessage)) {
@@ -623,6 +709,11 @@ async function hydrateSession(session, { includeMessages = false, silent = false
         title: String(session?.name || fallbackTitleForSession(session)).trim() || fallbackTitleForSession(session),
         preview: String(session?.inputPreview || fallbackPreviewForSession(session)).trim() || fallbackPreviewForSession(session),
         messages: [],
+        turns: [],
+        backgroundAgents: [],
+        conversation: createConversationState({
+          threadId: String(session?.resumeSessionId || "")
+        }),
         session: null
       };
       sessionCache[key] = { ...(sessionCache[key] || {}), ...nextValue };
@@ -630,9 +721,16 @@ async function hydrateSession(session, { includeMessages = false, silent = false
     }
 
     const messages = normalizeHistoryMessages(payload.messages || []);
+    const turns = Array.isArray(payload.turns) ? payload.turns : [];
+    const backgroundAgents = Array.isArray(payload.backgroundAgents) ? payload.backgroundAgents : [];
+    const conversation = buildConversationStateFromPayload(payload, {
+      threadId: String(session?.resumeSessionId || ""),
+      turns,
+      backgroundAgents
+    });
     const title = String(payload.session?.name || session.name || fallbackTitleForSession(session)).trim() || fallbackTitleForSession(session);
     const preview = String(payload.session?.inputPreview || session.inputPreview || fallbackPreviewForSession(session)).trim() || fallbackPreviewForSession(session);
-    const nextValue = { hydrated: true, title, preview, messages, session: payload.session || null };
+    const nextValue = { hydrated: true, title, preview, messages, turns, backgroundAgents, conversation, session: payload.session || null };
     sessionCache[key] = { ...(sessionCache[key] || {}), ...nextValue };
     return sessionCache[key];
   })();
@@ -665,6 +763,82 @@ async function refreshSessions() {
     };
   }
   state.sessions = sessions;
+}
+
+function stopHistorySyncLoop() {
+  if (historySyncTimer) {
+    window.clearInterval(historySyncTimer);
+    historySyncTimer = null;
+  }
+}
+
+function currentHistorySyncTarget() {
+  const routeTarget = routeHistoryTarget.value;
+  if (routeTarget) {
+    return {
+      id: `history:${routeTarget.provider}:${routeTarget.resumeSessionId}`,
+      kind: "history",
+      status: "saved",
+      provider: routeTarget.provider,
+      resumeSessionId: routeTarget.resumeSessionId,
+      name: state.activeSessionMeta?.name || "历史会话",
+      cwd: state.activeSessionMeta?.cwd || ""
+    };
+  }
+  if (state.activeSessionMeta?.kind === "history" && state.activeSessionMeta?.resumeSessionId) {
+    return state.activeSessionMeta;
+  }
+  return null;
+}
+
+async function syncActiveHistorySession({ silent = true } = {}) {
+  const target = currentHistorySyncTarget();
+  if (!target?.resumeSessionId) {
+    return false;
+  }
+
+  const hydrated = await hydrateSession(target, {
+    includeMessages: true,
+    forceRefresh: true,
+    silent
+  });
+  if (!hydrated) {
+    return false;
+  }
+
+  const nextConversation = buildConversationStateFromPayload(hydrated.conversation || {}, {
+    sessionId: state.activeConversation.sessionId || "",
+    threadId: String(target.resumeSessionId || ""),
+    turns: hydrated.turns || [],
+    backgroundAgents: hydrated.backgroundAgents || []
+  });
+
+  const applied = setConversation(nextConversation, { force: false });
+  if (state.activeSessionMeta && target.resumeSessionId === state.activeSessionMeta.resumeSessionId) {
+    state.activeSessionMeta = {
+      ...state.activeSessionMeta,
+      displayTitle: hydrated.title || state.activeSessionMeta.displayTitle,
+      displayPreview: hydrated.preview || state.activeSessionMeta.displayPreview,
+      cwd: hydrated?.session?.cwd || state.activeSessionMeta.cwd || ""
+    };
+  }
+  return applied;
+}
+
+function startHistorySyncLoop() {
+  stopHistorySyncLoop();
+  if (typeof window === "undefined") {
+    return;
+  }
+  historySyncTimer = window.setInterval(() => {
+    if (!state.ready || !state.isAuthenticated || route.name !== "chat") {
+      return;
+    }
+    if (!currentHistorySyncTarget()) {
+      return;
+    }
+    syncActiveHistorySession({ silent: true }).catch(() => {});
+  }, 4000);
 }
 
 function toOriginProtocol(proto) {
@@ -805,11 +979,13 @@ function waitForSocketOpen(socket, timeoutMs = 4000) {
   });
 }
 
-function attachLiveSocket(sessionId, historyMessages = []) {
+function attachLiveSocket(sessionId) {
   closeSocket();
   finalizeAssistantStream();
   state.activeLiveSessionId = sessionId;
   state.activeStreamBuffer = "";
+  state.hasConversationSnapshot = false;
+  state.hasConversationDelta = false;
   const socket = new WebSocket(resolveWsUrl(sessionId));
   state.activeSocket = socket;
 
@@ -821,23 +997,53 @@ function attachLiveSocket(sessionId, historyMessages = []) {
       return;
     }
 
+    if (payload.type === "conversation.snapshot") {
+      const applied = setConversation(buildConversationStateFromPayload(payload, state.activeConversation), {
+        fallbackMessages: collectConversationFallbackMessages(state.activeMessages),
+        buffer: payload?.buffer || ""
+      });
+      if (applied) {
+        state.hasConversationSnapshot = true;
+      }
+      return;
+    }
+
+    if (payload.type === "conversation.delta") {
+      clearPendingReplyStatus();
+      const applied = applyConversationDeltaPayload(state.activeConversation, payload);
+      const updated = setConversation(applied.conversation, {
+        fallbackMessages: collectConversationFallbackMessages(state.activeMessages)
+      });
+      if (updated) {
+        state.hasConversationSnapshot = true;
+        state.hasConversationDelta = true;
+      }
+      return;
+    }
+
     if (payload.type === "snapshot") {
-      const snapshotBuffer = String(payload?.buffer || "");
-      const normalizedSnapshot = sanitizeAssistantText(
-        normalizeLine(snapshotBuffer.length > 12000 ? snapshotBuffer.slice(-12000) : snapshotBuffer)
-      );
-      if (normalizedSnapshot) {
-        const lastAssistant = [...state.activeMessages]
-          .reverse()
-          .find((message) => message.role === "assistant");
-        if (normalizeLine(String(lastAssistant?.text || "")) !== normalizedSnapshot) {
-          setMessages([
-            ...state.activeMessages,
-            createMessage("assistant", normalizedSnapshot, new Date().toISOString(), {
-              source: "snapshot"
-            })
-          ]);
-        }
+      if (state.hasConversationSnapshot || state.hasConversationDelta) {
+        return;
+      }
+      const applied = setConversation(buildConversationStateFromPayload(payload, state.activeConversation), {
+        fallbackMessages: state.activeMessages,
+        buffer: payload?.buffer || ""
+      });
+      if (applied) {
+        state.hasConversationSnapshot = true;
+      }
+      return;
+    }
+
+    if (payload.type === "conversation_snapshot") {
+      if (state.hasConversationSnapshot || state.hasConversationDelta) {
+        return;
+      }
+      const applied = setConversation(buildConversationStateFromPayload(payload, state.activeConversation), {
+        fallbackMessages: state.activeMessages
+      });
+      if (applied) {
+        state.hasConversationSnapshot = true;
       }
       return;
     }
@@ -858,6 +1064,9 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "data") {
+      if (state.hasConversationDelta) {
+        return;
+      }
       if (payload.data && String(payload.data).trim()) {
         clearPendingReplyStatus();
       }
@@ -866,6 +1075,9 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "message_part") {
+      if (state.hasConversationDelta) {
+        return;
+      }
       if (payload?.part?.type === "text" && String(payload?.part?.text || "").trim()) {
         clearPendingReplyStatus();
       }
@@ -874,6 +1086,17 @@ function attachLiveSocket(sessionId, historyMessages = []) {
     }
 
     if (payload.type === "event_msg") {
+      if (state.hasConversationDelta) {
+        return;
+      }
+      appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
+      return;
+    }
+
+    if (payload.type === "response_item") {
+      if (state.hasConversationDelta) {
+        return;
+      }
       appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
       return;
     }
@@ -937,6 +1160,7 @@ function attachLiveSocket(sessionId, historyMessages = []) {
 }
 
 async function openLiveSession(session, { skipRoute = false } = {}) {
+  stopHistorySyncLoop();
   state.pendingSessionId = session.id;
   setStatus("正在连接会话…");
   state.activeSessionId = session.id;
@@ -953,6 +1177,12 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
   // Refresh auth/config before WebSocket connect to avoid stale cookie + fresh process mismatch.
   await bootstrapWorkspace({ includeSessions: false });
   let historyMessages = [];
+  let historyTurns = [];
+  let historyAgents = [];
+  let historyConversation = createConversationState({
+    sessionId: session.id,
+    threadId: String(session.resumeSessionId || "")
+  });
   if (session.resumeSessionId) {
     const hydrated = await hydrateSession(
       {
@@ -964,6 +1194,14 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
       { includeMessages: true, silent: true, forceRefresh: true }
     );
     historyMessages = hydrated?.messages || [];
+    historyTurns = hydrated?.turns || [];
+    historyAgents = hydrated?.backgroundAgents || [];
+    historyConversation = buildConversationStateFromPayload(hydrated?.conversation || {}, {
+      sessionId: session.id,
+      threadId: String(session.resumeSessionId || ""),
+      turns: historyTurns,
+      backgroundAgents: historyAgents
+    });
     if (hydrated?.session) {
       state.activeSessionMeta = {
         ...state.activeSessionMeta,
@@ -973,20 +1211,54 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
       };
     }
   }
-  setMessages(historyMessages);
-  await attachLiveSocket(session.id, historyMessages);
+  setConversation(historyConversation, {
+    force: true
+  });
+  await attachLiveSocket(session.id);
   setStatus("");
   state.pendingSessionId = "";
 }
 
 async function openHistoricalSession(session, { skipRoute = false } = {}) {
   closeSocket();
+  stopHistorySyncLoop();
   finalizeAssistantStream();
   state.pendingSessionId = session.id;
   setStatus("正在加载会话…");
   const decorated = decorateSession(session);
   const hydrated = await hydrateSession(session, { includeMessages: true, forceRefresh: true });
   const historyMessages = hydrated?.messages || [];
+  const historyTurns = hydrated?.turns || [];
+  const historyAgents = hydrated?.backgroundAgents || [];
+  let historyConversation = buildConversationStateFromPayload(hydrated?.conversation || {}, {
+    sessionId: "",
+    threadId: String(session.resumeSessionId || ""),
+    turns: historyTurns,
+    backgroundAgents: historyAgents
+  });
+  const reusableLive = state.sessions
+    .filter(
+      (item) =>
+        item.kind === "live" &&
+        item.status !== "exited" &&
+        String(item.provider || "").trim().toLowerCase() === String(session.provider || "").trim().toLowerCase() &&
+        String(item.resumeSessionId || "").trim() === String(session.resumeSessionId || "").trim()
+    )
+    .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
+  if (reusableLive?.id) {
+    try {
+      const livePayload = await requestConversationSnapshotBySessionId(reusableLive.id);
+      const liveConversation = buildConversationStateFromPayload(livePayload || {}, historyConversation);
+      if (
+        Number(liveConversation.version || 0) > Number(historyConversation.version || 0) ||
+        (liveConversation.turns?.length || 0) > (historyConversation.turns?.length || 0)
+      ) {
+        historyConversation = liveConversation;
+      }
+    } catch {
+      // Keep historical snapshot if live conversation lookup fails.
+    }
+  }
 
   state.activeSessionId = session.id;
   state.activeSessionMeta = {
@@ -1003,8 +1275,11 @@ async function openHistoricalSession(session, { skipRoute = false } = {}) {
   state.replayGuardActive = false;
   state.replayGuardPrompt = "";
   state.replayGuardUntil = 0;
-  setMessages(historyMessages);
+  setConversation(historyConversation, {
+    force: true
+  });
   state.activeLiveSessionId = "";
+  startHistorySyncLoop();
   setStatus("");
   state.pendingSessionId = "";
 }
@@ -1086,7 +1361,7 @@ async function ensureLiveSession() {
   }
 
   if (state.activeSessionMeta.kind === "live") {
-    await attachLiveSocket(state.activeSessionMeta.id, []);
+    await attachLiveSocket(state.activeSessionMeta.id);
     return state.activeSessionMeta.id;
   }
 
@@ -1105,7 +1380,7 @@ async function ensureLiveSession() {
     if (reusable) {
       state.activeSessionMeta = decorateSession(reusable);
       state.activeLiveSessionId = reusable.id;
-      await attachLiveSocket(reusable.id, state.activeMessages);
+      await attachLiveSocket(reusable.id);
       return reusable.id;
     }
   }
@@ -1129,7 +1404,7 @@ async function ensureLiveSession() {
   };
   state.activeLiveSessionId = resumed.session.id;
   await refreshSessions();
-  await attachLiveSocket(resumed.session.id, state.activeMessages);
+  await attachLiveSocket(resumed.session.id);
   setStatus("正在恢复会话上下文…");
   state.replayGuardActive = true;
   state.replayGuardUntil = Date.now() + 20_000;
@@ -1181,7 +1456,7 @@ async function submitInput() {
     rebuildReplaySuppressionLines([...state.activeMessages, createMessage("user", submissionText, new Date().toISOString())]);
     setMessages([
       ...state.activeMessages,
-      createMessage("user", submissionText, new Date().toISOString(), { source: "draft" })
+      createMessage("user", submissionText, new Date().toISOString(), { source: "draft", partType: "text", payload: {} })
     ]);
     composerDraft.value = "";
     setStatus("等待 Codex 回复…");
@@ -1210,6 +1485,7 @@ function interruptActiveSession() {
 async function backToList() {
   clearSubmitFallbackTimer();
   closeSocket();
+  stopHistorySyncLoop();
   finalizeAssistantStream();
   state.replayGuardActive = false;
   state.replayGuardPrompt = "";
@@ -1219,6 +1495,10 @@ async function backToList() {
   state.activeSessionMeta = null;
   composerDraft.value = "";
   setMessages([]);
+  state.activeConversation = createConversationState();
+  state.hasConversationSnapshot = false;
+  state.hasConversationDelta = false;
+  setBackgroundAgents([]);
   if (route.name !== "sessions") {
     await router.push({ name: "sessions" });
   }
@@ -1234,6 +1514,7 @@ watch(
   async (name) => {
     if (name === "sessions") {
       closeSocket();
+      stopHistorySyncLoop();
       finalizeAssistantStream();
       if (state.isAuthenticated) {
         try {
@@ -1367,6 +1648,7 @@ onBeforeUnmount(() => {
     window.removeEventListener(AUTH_EXPIRED_EVENT, state.authExpiredHandler);
     state.authExpiredHandler = null;
   }
+  stopHistorySyncLoop();
   closeSocket();
 });
 
@@ -1425,6 +1707,7 @@ if (typeof window !== 'undefined') {
         :workspace-name="activeWorkspaceName"
         :assistant-name="activeAssistantName"
         :messages="state.activeMessages"
+        :background-agents="state.backgroundAgents"
         v-model:draft="composerDraft"
         :can-send="canSend"
         :can-interrupt="canInterrupt"

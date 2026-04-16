@@ -1,11 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { EventEmitter } from "node:events";
 
 import { WebSocket } from "ws";
 
 import { createKoaApp } from "../src/koa-app.js";
 import { installWebSocketServer } from "../src/routes/ws.js";
+import { SessionManager } from "../src/sessionManager.js";
 import { createBaseConfig, createTempDir, login, waitForCondition } from "./helpers/backendTestUtils.js";
 
 function connectWebSocket(url, options = {}) {
@@ -88,6 +92,15 @@ function closeWebSocket(ws) {
       resolve();
     }
   });
+}
+
+function writeJsonl(filePath, records) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(
+    filePath,
+    `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+    "utf8"
+  );
 }
 
 test("websocket rejects unauthenticated clients", async (t) => {
@@ -331,4 +344,87 @@ test("websocket sends error event for malformed frame payload", async (t) => {
   ws.send("{invalid-json");
   const message = JSON.parse(String(await ws.awaitMessage()));
   assert.equal(message.type, "error");
+});
+
+test("websocket emits conversation snapshot on connect and conversation delta after input", async (t) => {
+  class AppServerBridgeStub extends EventEmitter {
+    async startTurn(_session, text) {
+      return { turn: { items: [{ type: "agent_message", text: `reply:${text}` }] } };
+    }
+  }
+
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir });
+
+  const sessionIndexPath = path.join(path.dirname(codexSessionsDir), "session_index.jsonl");
+  writeJsonl(sessionIndexPath, [{ id: "thread-h1", thread_name: "历史会话" }]);
+  writeJsonl(path.join(codexSessionsDir, "project-a", "thread-h1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-h1", cwd: rootDir, thread_name: "历史会话" },
+      timestamp: "2026-04-13T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "用户：历史问题" },
+      timestamp: "2026-04-13T10:00:01.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "agent_message", phase: "final_answer", message: "历史回答" },
+      timestamp: "2026-04-13T10:00:02.000Z"
+    }
+  ]);
+
+  const sessionManager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+  const session = sessionManager.create({ provider: "codex", cwd: rootDir, resumeSessionId: "thread-h1" });
+  const { app, runtime } = createKoaApp({ config, sessionManager });
+  const server = http.createServer(app.callback());
+  const wsRuntime = installWebSocketServer(server, runtime);
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    wsRuntime.closeClients("test-cleanup");
+    wsRuntime.stop();
+    await new Promise((resolve) => wsRuntime.wss.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const port = server.address().port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const auth = await login(baseUrl, config.accessToken);
+  const ws = await connectWebSocket(`ws://127.0.0.1:${port}/ws?sessionId=${session.id}`, {
+    headers: {
+      origin: baseUrl,
+      cookie: auth.cookies
+    }
+  });
+  t.after(async () => {
+    await closeWebSocket(ws);
+  });
+
+  const incoming = [];
+  ws.on("message", (raw) => {
+    incoming.push(JSON.parse(String(raw)));
+  });
+
+  const initialA = JSON.parse(String(await ws.awaitMessage()));
+  const initialB = JSON.parse(String(await ws.awaitMessage()));
+  const initial = [initialA, initialB];
+  assert.ok(initial.some((item) => item.type === "conversation.snapshot"));
+  assert.ok(initial.some((item) => item.type === "snapshot"));
+
+  const convSnapshot = initial.find((item) => item.type === "conversation.snapshot");
+  assert.equal(convSnapshot.sessionId, session.id);
+  assert.equal(convSnapshot.threadId, "thread-h1");
+  assert.equal(convSnapshot.conversation.turns.length, 1);
+
+  ws.send(JSON.stringify({ type: "input", data: "follow up" }));
+  await waitForCondition(() => incoming.some((item) => item.type === "conversation.delta"), { timeoutMs: 1000 });
+  const deltaPayload = incoming.find((item) => item.type === "conversation.delta");
+  assert.ok(deltaPayload);
+  assert.ok(deltaPayload.toVersion >= deltaPayload.fromVersion);
+  assert.ok(Array.isArray(deltaPayload.deltas));
+  assert.ok(deltaPayload.deltas.length > 0);
 });

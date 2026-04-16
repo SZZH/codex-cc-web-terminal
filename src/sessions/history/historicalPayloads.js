@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-import { isAgentMessageType, normalizeSymbolToken, nowIso, sanitizeTitleFragment } from "../shared/text.js";
+import { extractAgentTextFromItem, isAgentMessageType, normalizeSymbolToken, nowIso, sanitizeTitleFragment } from "../shared/text.js";
 import { cleanHistoricalMessageText, isBoilerplateUserText } from "./historicalText.js";
 
 function extractTextFromNode(value) {
@@ -107,7 +107,7 @@ function normalizeEventPartType(rawType) {
 
 export function buildEventPartFromItem(item) {
   const rawType = String(item?.type || "").trim();
-  if (!rawType || isAgentMessageType(rawType)) {
+  if (!rawType || extractAgentTextFromItem(item)) {
     return null;
   }
   const compactPayload = {
@@ -165,7 +165,7 @@ function normalizeHistoricalRole(record) {
     }
     if (type === "agent_message") {
       const phase = String(record.payload?.phase || "").trim().toLowerCase();
-      if (phase && phase !== "final_answer" && phase !== "commentary") {
+      if (phase && phase !== "final_answer") {
         return "";
       }
       return "assistant";
@@ -184,7 +184,7 @@ function buildHistoricalProcessEntry(record, fallbackTimestamp) {
       return null;
     }
     const phase = String(payload?.phase || "").trim().toLowerCase();
-    if (!phase || phase === "final_answer" || phase === "commentary") {
+    if (!phase || phase === "final_answer") {
       return null;
     }
     const rawText = typeof payload.message === "string" ? payload.message : extractTextContentFromPayload(payload).join("\n");
@@ -192,6 +192,7 @@ function buildHistoricalProcessEntry(record, fallbackTimestamp) {
     if (!text) {
       return null;
     }
+    const processType = phase === "commentary" ? "reasoning" : "event";
     return {
       role: "assistant",
       text,
@@ -199,10 +200,10 @@ function buildHistoricalProcessEntry(record, fallbackTimestamp) {
       partType: "event",
       payload: {
         summary: text,
-        rawType: "agent_message",
+        rawType: processType,
         payload: { phase }
       },
-      rawType: "agent_message"
+      rawType: processType
     };
   }
 

@@ -1,4 +1,5 @@
 import { deriveSessionTitle, extractImagePartsFromMarkdown, filterLiveOutputChunk, nowIso, sanitizeTitleFragment, stripTerminalControlSequences } from "../shared/text.js";
+import { buildConversationSnapshotPayload, buildLegacySnapshotPayload } from "../conversation/protocol.js";
 
 export function pushSessionBuffer(session, text = "", config) {
   const value = String(text || "");
@@ -27,14 +28,11 @@ export function attachClient(manager, id, ws) {
     throw new Error(`Session not found: ${id}`);
   }
 
+  manager.seedConversationStateFromHistory(session);
   session.clients.add(ws);
-  ws.send(
-    JSON.stringify({
-      type: "snapshot",
-      session: manager.serialize(session),
-      buffer: session.buffer
-    })
-  );
+  const snapshotPayload = manager.getConversationSnapshot(id) || buildConversationSnapshotPayload(session, manager.serialize(session));
+  ws.send(JSON.stringify(snapshotPayload));
+  ws.send(JSON.stringify(buildLegacySnapshotPayload(session, snapshotPayload.session || manager.serialize(session))));
 
   ws.on("close", () => {
     session.clients.delete(ws);

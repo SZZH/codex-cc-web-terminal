@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { compactTranscriptText, sanitizeTitleFragment } from "../shared/text.js";
+import { compactTranscriptText, normalizeSymbolToken, sanitizeTitleFragment } from "../shared/text.js";
+import { applyDelta, createEmptyConversationState } from "../normalize/turnState.js";
 import {
   appendHistoricalMessage,
   extractHistoricalImageMessagesFromFile,
@@ -14,6 +15,7 @@ import {
   isBoilerplateUserText,
   isSystemTemporaryCwd
 } from "./historicalText.js";
+import { createTurnCompletedDelta, createTurnCreatedDelta, normalizeRecordToDeltas } from "../normalize/turnDeltas.js";
 
 function basenameWithoutExtension(filePath) {
   return path.basename(filePath, path.extname(filePath));
@@ -51,6 +53,7 @@ export function parseHistoricalFile(filePath) {
   let firstUserMessage = "";
   let fallbackInput = "";
   const messages = [];
+  const records = [];
   let sessionTimestamp = "";
   let sessionType = "main";
   let parentThreadId = "";
@@ -116,22 +119,23 @@ export function parseHistoricalFile(filePath) {
   }
 
   return {
-    resumeSessionId: id || basenameWithoutExtension(filePath),
-    cwd,
-    title,
-    titleSource: extractHistoricalTitleCandidate(title),
-    firstUserMessage,
-    firstInput,
-    fallbackInput,
-    messages,
-    sessionType,
-    parentThreadId,
-    agentRole,
-    agentNickname,
-    originator,
-    sourceType
-  };
-}
+      resumeSessionId: id || basenameWithoutExtension(filePath),
+      cwd,
+      title,
+      titleSource: extractHistoricalTitleCandidate(title),
+      firstUserMessage,
+      firstInput,
+      fallbackInput,
+      messages,
+      records,
+      sessionType,
+      parentThreadId,
+      agentRole,
+      agentNickname,
+      originator,
+      sourceType
+    };
+  }
 
 export function summarizeHistoricalSession(entry, fallbackSavedName) {
   const canonicalTitle = String(entry.title || "").trim();
@@ -149,6 +153,83 @@ export function summarizeHistoricalSession(entry, fallbackSavedName) {
       entry.fallbackInput ||
       "",
     compactTitle: compactTranscriptText(canonicalTitle)
+  };
+}
+
+export function buildHistoricalConversationFromFile(filePath) {
+  const state = createEmptyConversationState();
+  let content = "";
+  let activeTurnId = "";
+  let turnIndex = 0;
+  let lastTimestamp = "";
+
+  try {
+    content = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return { turns: [], backgroundAgents: [] };
+  }
+
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const timestamp = String(record?.timestamp || record?.payload?.timestamp || lastTimestamp || "");
+    lastTimestamp = timestamp || lastTimestamp;
+    const recordType = normalizeSymbolToken(record?.type);
+    const payloadType = normalizeSymbolToken(record?.payload?.type);
+    const isUserMessageRecord = recordType === "eventmsg" && payloadType === "usermessage";
+    const isTurnCompletedRecord = payloadType === "turncompleted" || payloadType === "turncomplete";
+    const isTurnFailedRecord = payloadType === "turnfailed";
+    const isTurnInterruptedRecord = payloadType === "turnaborted" || payloadType === "turninterrupted";
+
+    if (isUserMessageRecord) {
+      if (activeTurnId) {
+        Object.assign(state, applyDelta(state, createTurnCompletedDelta(activeTurnId, "completed", timestamp || undefined)));
+        activeTurnId = "";
+      }
+      turnIndex += 1;
+      activeTurnId = `history-turn-${turnIndex}`;
+      Object.assign(state, applyDelta(state, createTurnCreatedDelta(activeTurnId, String(record?.payload?.message || "").trim(), timestamp)));
+      continue;
+    }
+    if (activeTurnId && (isTurnCompletedRecord || isTurnFailedRecord || isTurnInterruptedRecord)) {
+      const status = isTurnFailedRecord ? "failed" : isTurnInterruptedRecord ? "interrupted" : "completed";
+      Object.assign(state, applyDelta(state, createTurnCompletedDelta(activeTurnId, status, timestamp || undefined)));
+      activeTurnId = "";
+      continue;
+    }
+    if (!activeTurnId) {
+      const previewTurnId = `history-turn-${turnIndex + 1}`;
+      const previewDeltas = normalizeRecordToDeltas(record, { turnId: previewTurnId });
+      if (!previewDeltas.length) {
+        continue;
+      }
+      turnIndex += 1;
+      activeTurnId = previewTurnId;
+      Object.assign(state, applyDelta(state, createTurnCreatedDelta(activeTurnId, "", timestamp)));
+      for (const delta of previewDeltas) {
+        Object.assign(state, applyDelta(state, delta));
+      }
+      continue;
+    }
+    for (const delta of normalizeRecordToDeltas(record, { turnId: activeTurnId })) {
+      Object.assign(state, applyDelta(state, delta));
+    }
+  }
+
+  if (activeTurnId) {
+    Object.assign(state, applyDelta(state, createTurnCompletedDelta(activeTurnId, "completed", lastTimestamp || undefined)));
+  }
+
+  return {
+    turns: state.turns,
+    backgroundAgents: state.backgroundAgents
   };
 }
 

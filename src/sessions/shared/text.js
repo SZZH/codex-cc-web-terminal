@@ -198,7 +198,8 @@ export function normalizeSymbolToken(value) {
 }
 
 export function isAgentMessageType(value) {
-  return normalizeSymbolToken(value) === "agentmessage";
+  const normalized = normalizeSymbolToken(value);
+  return normalized === "agentmessage" || normalized === "message";
 }
 
 export function extractTurnItems(result) {
@@ -211,6 +212,65 @@ export function extractTurnItems(result) {
     return fallback;
   }
   return [];
+}
+
+function collectTextSegments(node) {
+  if (node == null) {
+    return [];
+  }
+  if (typeof node === "string" || typeof node === "number" || typeof node === "boolean") {
+    return [String(node)];
+  }
+  if (Array.isArray(node)) {
+    return node.flatMap((child) => collectTextSegments(child));
+  }
+  if (typeof node !== "object") {
+    return [];
+  }
+
+  const parts = [];
+  for (const key of ["text", "message", "value"]) {
+    if (key in node) {
+      parts.push(...collectTextSegments(node[key]));
+    }
+  }
+  if (Array.isArray(node.content)) {
+    parts.push(...node.content.flatMap((child) => collectTextSegments(child)));
+  }
+  if (Array.isArray(node.output)) {
+    parts.push(...node.output.flatMap((child) => collectTextSegments(child)));
+  }
+  if (Array.isArray(node.parts)) {
+    parts.push(...node.parts.flatMap((child) => collectTextSegments(child)));
+  }
+  return parts;
+}
+
+export function extractAgentTextFromItem(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  const rawType = normalizeSymbolToken(item.type);
+  const role = normalizeSymbolToken(item.role);
+  if (rawType === "message" && role && role !== "assistant") {
+    return "";
+  }
+  if (rawType !== "message" && rawType !== "agentmessage") {
+    return "";
+  }
+
+  const directText = String(item.text || "").trim();
+  if (directText) {
+    return directText;
+  }
+
+  const text = collectTextSegments(item)
+    .map((segment) => sanitizeTitleFragment(segment))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  return text;
 }
 
 export function extractEmbeddedUserRequest(value) {

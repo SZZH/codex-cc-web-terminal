@@ -17,6 +17,7 @@ const props = defineProps({
   workspaceName: { type: String, default: "" },
   assistantName: { type: String, default: "Codex" },
   messages: { type: Array, default: () => [] },
+  backgroundAgents: { type: Array, default: () => [] },
   draft: { type: String, default: "" },
   canSend: Boolean,
   canInterrupt: Boolean,
@@ -31,7 +32,6 @@ const viewportHeight = ref(0);
 const keyboardInset = ref(0);
 const isPinnedToBottom = ref(true);
 const isTouchDevice = ref(false);
-const showProcessDetails = ref(false);
 const expandedEventGroups = ref(new Set());
 const lightboxImage = ref(null);
 const lightboxScale = ref(1);
@@ -87,6 +87,8 @@ const PROCESS_PATTERNS = [
   /current changes/i,
   /\bworkdir\b/i
 ];
+
+const subagentPanelExpanded = ref(false);
 
 const LANGUAGE_ALIAS = {
   sh: "bash",
@@ -170,7 +172,7 @@ function renderCodeFence(sourceText, languageTag) {
   return [
     `<pre class="code-block language-${resolvedLanguage} family-${family}">`,
     `<span class="code-lang">${languageLabel}</span>`,
-    `<code class="hljs language-${resolvedLanguage}">${highlighted}</code>`,
+    `<span class="code-scroll"><code class="hljs language-${resolvedLanguage}">${highlighted}</code></span>`,
     "</pre>"
   ].join("");
 }
@@ -484,13 +486,20 @@ const renderedMessages = computed(() =>
   })
 );
 
-const hasAnyProcessDetails = computed(() => renderedMessages.value.some((message) => message.hasProcessDetails));
+const normalizedBackgroundAgents = computed(() =>
+  (props.backgroundAgents || []).map((agent, index) => ({
+    id: String(agent?.agentId || agent?.agentPath || agent?.nickname || `agent-${index}`),
+    name: String(agent?.nickname || agent?.agentPath || agent?.agentId || `Agent ${index + 1}`),
+    status: String(agent?.status || "running").trim() || "running"
+  }))
+);
+
 const hasAssistantBody = computed(() =>
   renderedMessages.value.some(
     (message) => message.role === "assistant" && message.renderKind === "markdown" && compactText(message.displayText)
   )
 );
-const shouldCollapseCompletedGroups = computed(() => hasAssistantBody.value && !props.canInterrupt && !props.loading);
+const shouldCollapseCompletedGroups = computed(() => hasAssistantBody.value);
 function isEventGroupExpanded(toggleId) {
   return expandedEventGroups.value.has(toggleId);
 }
@@ -536,8 +545,6 @@ const visibleMessages = computed(() => {
     });
     if (isEventGroupExpanded(toggleId)) {
       output.push(...pendingEventGroup);
-    } else {
-      output.push(pendingEventGroup[pendingEventGroup.length - 1]);
     }
     pendingEventGroup = [];
   };
@@ -919,24 +926,24 @@ onBeforeUnmount(() => {
             </div>
           </section>
 
-          <details v-if="showProcessDetails && message.hasProcessDetails" class="message-process">
-            <summary>{{ message.processSummary }}</summary>
-            <pre class="message-process-text">{{ message.processText }}</pre>
-          </details>
         </article>
 
       </section>
 
-      <button
-        v-if="hasAnyProcessDetails"
-        class="process-toggle"
-        type="button"
-        @click="showProcessDetails = !showProcessDetails"
-      >
-        {{ showProcessDetails ? "隐藏过程详情" : "显示过程详情" }}
-      </button>
-
       <p v-if="statusText" class="chat-status">{{ statusText }}</p>
+
+      <section v-if="normalizedBackgroundAgents.length" class="subagent-panel">
+        <button type="button" class="subagent-panel-toggle" @click="subagentPanelExpanded = !subagentPanelExpanded">
+          <span>{{ normalizedBackgroundAgents.length }} background agents</span>
+          <span class="subagent-panel-chevron" :class="{ expanded: subagentPanelExpanded }">›</span>
+        </button>
+        <div v-if="subagentPanelExpanded" class="subagent-panel-list">
+          <article v-for="agent in normalizedBackgroundAgents" :key="agent.id" class="subagent-panel-item">
+            <span class="subagent-panel-name">{{ agent.name }}</span>
+            <span class="subagent-panel-status" :data-status="agent.status">{{ agent.status }}</span>
+          </article>
+        </div>
+      </section>
 
       <form class="composer" @submit.prevent="emit('submit')">
         <textarea
@@ -1352,6 +1359,7 @@ onBeforeUnmount(() => {
 .markdown-body :deep(pre.code-block) {
   position: relative;
   padding-top: 28px;
+  overflow: hidden;
 }
 
 .markdown-body :deep(pre.code-block .code-lang) {
@@ -1367,6 +1375,12 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(170, 160, 149, 0.42);
   background: rgba(255, 255, 255, 0.76);
   color: #7a6a5c;
+}
+
+.markdown-body :deep(pre.code-block .code-scroll) {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .markdown-body :deep(pre.code-block.family-sql) {
@@ -1385,6 +1399,8 @@ onBeforeUnmount(() => {
 }
 
 .markdown-body :deep(pre.code-block .hljs) {
+  display: block;
+  min-width: max-content;
   color: #2f2a27;
   background: transparent;
 }
@@ -1525,36 +1541,22 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
-.message-process {
-  width: 100%;
-  max-width: 100%;
-  border: 1px solid rgba(223, 214, 206, 0.8);
-  border-radius: 16px;
-  background: rgba(255, 251, 247, 0.72);
-  overflow: hidden;
+
+.turn-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
-.message-process summary {
-  list-style: none;
-  padding: 10px 14px;
-  color: #8b7f73;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
+.turn-process-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 
-.message-process summary::-webkit-details-marker {
-  display: none;
-}
-
-.message-process-text {
-  margin: 0;
-  padding: 0 14px 14px;
-  color: #74675b;
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
+.turn-process-item {
+  align-self: stretch;
 }
 
 .empty-state {
@@ -1580,16 +1582,87 @@ onBeforeUnmount(() => {
   color: #99897c;
 }
 
-.process-toggle {
-  align-self: flex-start;
-  margin: 0 14px 8px;
-  padding: 0;
+.subagent-panel {
+  margin: 0 14px 10px;
+  border: 1px solid rgba(220, 211, 201, 0.9);
+  border-radius: 18px;
+  background: rgba(255, 251, 248, 0.92);
+  overflow: hidden;
+}
+
+.subagent-panel-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
   border: 0;
   background: transparent;
+  color: #6d6156;
+  font-size: 14px;
+  text-align: left;
+}
+
+.subagent-panel-chevron {
+  font-size: 18px;
+  line-height: 1;
+  transform: rotate(90deg);
+  transition: transform 160ms ease;
+}
+
+.subagent-panel-chevron.expanded {
+  transform: rotate(-90deg);
+}
+
+.subagent-panel-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border-top: 1px solid rgba(228, 220, 212, 0.9);
+}
+
+.subagent-panel-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(244, 238, 233, 0.9);
+}
+
+.subagent-panel-item:first-child {
+  border-top: 0;
+}
+
+.subagent-panel-name {
+  min-width: 0;
+  color: #433831;
+  font-size: 14px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subagent-panel-status {
+  flex-shrink: 0;
   color: #8d7d70;
   font-size: 12px;
-  line-height: 1.4;
+  text-transform: lowercase;
 }
+
+.subagent-panel-status[data-status="running"] {
+  color: #8b6d34;
+}
+
+.subagent-panel-status[data-status="done"] {
+  color: #3f7d54;
+}
+
+.subagent-panel-status[data-status="failed"] {
+  color: #b5483d;
+}
+
 
 .composer {
   position: sticky;

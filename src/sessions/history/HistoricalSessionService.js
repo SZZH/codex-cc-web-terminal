@@ -1,7 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { parseHistoricalFile, extractHistoricalImageMessagesFromFile, isSystemTemporaryCwd, summarizeHistoricalSession, walkJsonlFiles } from "./historicalParsing.js";
+import {
+  buildHistoricalConversationFromFile,
+  parseHistoricalFile,
+  extractHistoricalImageMessagesFromFile,
+  isSystemTemporaryCwd,
+  summarizeHistoricalSession,
+  walkJsonlFiles
+} from "./historicalParsing.js";
+import { buildConversationStateFromHistory } from "../conversation/state.js";
+import { CONVERSATION_PROTOCOL_VERSION } from "../conversation/protocol.js";
+import { nowIso } from "../shared/text.js";
 
 function readJsonFile(filePath, fallbackValue) {
   try {
@@ -223,10 +233,17 @@ export class HistoricalSessionService {
 
     const entry = entries.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0];
     let liveParsedMessages = entry.messages || [];
+    let conversation = { turns: [], backgroundAgents: [] };
     try {
-      liveParsedMessages = parseHistoricalFile(entry.filePath).messages || liveParsedMessages;
+      const reparsed = parseHistoricalFile(entry.filePath);
+      liveParsedMessages = reparsed.messages || liveParsedMessages;
     } catch {
       // Fall back to scanned messages if direct reparse fails.
+    }
+    try {
+      conversation = buildHistoricalConversationFromFile(entry.filePath);
+    } catch {
+      conversation = { turns: [], backgroundAgents: [] };
     }
     try {
       const imageMessages = extractHistoricalImageMessagesFromFile(entry.filePath);
@@ -250,9 +267,35 @@ export class HistoricalSessionService {
     } catch {
       // Keep text-only historical messages if image recovery fails.
     }
+    const historicalSession = this.buildHistoricalSession(
+      provider,
+      entry,
+      this.isArchived(provider.id, entry.resumeSessionId) ? "archived" : "history"
+    );
+    const conversationState = buildConversationStateFromHistory(conversation, {
+      sessionId: String(historicalSession.id || ""),
+      threadId: targetId,
+      status: conversation.turns?.length || conversation.backgroundAgents?.length ? "completed" : "idle"
+    });
+    const conversationSnapshot = {
+      type: "conversation.snapshot",
+      protocolVersion: CONVERSATION_PROTOCOL_VERSION,
+      timestamp: nowIso(),
+      session: historicalSession,
+      sessionId: conversationState.sessionId,
+      threadId: conversationState.threadId,
+      conversation: conversationState,
+      buffer: "",
+      turns: conversationState.turns,
+      backgroundAgents: conversationState.backgroundAgents
+    };
     return {
-      session: this.buildHistoricalSession(provider, entry, this.isArchived(provider.id, entry.resumeSessionId) ? "archived" : "history"),
-      messages: liveParsedMessages
+      session: historicalSession,
+      messages: liveParsedMessages,
+      turns: conversation.turns || [],
+      backgroundAgents: conversation.backgroundAgents || [],
+      conversation: conversationState,
+      conversationSnapshot
     };
   }
 

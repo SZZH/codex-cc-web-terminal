@@ -8,7 +8,12 @@ export async function handleSessionRoute(ctx, runtime) {
     return true;
   }
 
-  if (ctx.path.startsWith("/api/sessions/") && ctx.method === "GET" && !ctx.path.endsWith("/resize")) {
+  if (
+    ctx.path.startsWith("/api/sessions/") &&
+    ctx.method === "GET" &&
+    !ctx.path.endsWith("/resize") &&
+    !ctx.path.endsWith("/conversation")
+  ) {
     if (runtime.forbidCrossOrigin(ctx)) {
       return true;
     }
@@ -24,6 +29,29 @@ export async function handleSessionRoute(ctx, runtime) {
       return true;
     }
     runtime.json(ctx, 200, { session: runtime.sessionManager.serialize(session) });
+    return true;
+  }
+
+  if (ctx.path.startsWith("/api/sessions/") && ctx.path.endsWith("/conversation") && ctx.method === "GET") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+
+    const parts = ctx.path.split("/");
+    if (parts.length !== 5) {
+      runtime.json(ctx, 404, { error: "Not Found" });
+      return true;
+    }
+    const id = decodeURIComponent(parts[3] || "");
+    const snapshot = runtime.sessionManager.getConversationSnapshot(id);
+    if (!snapshot) {
+      runtime.json(ctx, 404, { error: "Session not found" });
+      return true;
+    }
+    runtime.json(ctx, 200, snapshot);
     return true;
   }
 

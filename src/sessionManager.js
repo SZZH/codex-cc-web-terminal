@@ -5,9 +5,25 @@ import path from "node:path";
 import pty from "node-pty";
 
 import { HistoricalSessionService } from "./sessions/history/HistoricalSessionService.js";
-import { buildEventPartFromItem } from "./sessions/history/historicalPayloads.js";
+import {
+  createTurnCompletedDelta,
+  createTurnCreatedDelta,
+  createTurnStatusDelta,
+  normalizeRecordToDeltas
+} from "./sessions/normalize/turnDeltas.js";
 import { attachClient, broadcast, maybeAutoAdvanceClaudeStartup, maybeAutoRename, pushSessionBuffer, registerPtySessionHandlers } from "./sessions/live/sessionOutput.js";
 import { buildProviders } from "./sessions/providers/buildProviders.js";
+import {
+  buildConversationDeltaPayload,
+  buildConversationSnapshotPayload,
+  buildLegacyConversationSnapshotPayload
+} from "./sessions/conversation/protocol.js";
+import {
+  applyConversationDeltas as applyConversationDeltaBatch,
+  buildConversationStateFromHistory,
+  compareConversationContent,
+  createConversationState
+} from "./sessions/conversation/state.js";
 import {
   nowIso
 } from "./sessions/shared/text.js";
@@ -187,11 +203,20 @@ export class SessionManager {
         turnNoReplyNotified: false,
         runningProcess: null,
         queuedInputs: [],
+        queuedTurnIds: [],
+        conversationState: createConversationState({
+          sessionId: id,
+          threadId: String(resumeSessionId || "").trim(),
+          status: "idle"
+        }),
+        currentTurnId: "",
         sessionType: "main",
         parentThreadId: "",
         agentRole: "",
-        agentNickname: ""
+        agentNickname: "",
+        turnSequence: 0
       };
+      this.seedConversationStateFromHistory(session, resolvedProvider);
       this.sessions.set(id, session);
       return this.serialize(session);
     }
@@ -232,14 +257,23 @@ export class SessionManager {
       pendingResumeInput: "",
       model: String(model || "").trim() || resolvedProvider.defaultModel || "",
       titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
+      conversationState: createConversationState({
+        sessionId: id,
+        threadId: String(resumeSessionId || "").trim(),
+        status: "idle"
+      }),
+      currentTurnId: "",
+      queuedTurnIds: [],
       sessionType: "main",
       parentThreadId: "",
       agentRole: "",
-      agentNickname: ""
+      agentNickname: "",
+      turnSequence: 0
     };
 
     registerPtySessionHandlers(this, session, shell);
 
+    this.seedConversationStateFromHistory(session, resolvedProvider);
     this.sessions.set(id, session);
     return this.serialize(session);
   }
@@ -254,6 +288,189 @@ export class SessionManager {
 
   attachClient(id, ws) {
     attachClient(this, id, ws);
+  }
+
+  ensureConversationState(session, { status = "" } = {}) {
+    if (!session) {
+      return createConversationState();
+    }
+    session.conversationState = createConversationState({
+      ...(session.conversationState || {}),
+      sessionId: String(session.id || ""),
+      threadId: String(session.resumeSessionId || session.conversationState?.threadId || ""),
+      status: status || session.conversationState?.status || "idle",
+      updatedAt: session.updatedAt || session.conversationState?.updatedAt || nowIso()
+    });
+    return session.conversationState;
+  }
+
+  seedConversationStateFromHistory(session, provider = null) {
+    if (!session?.resumeSessionId) {
+      this.ensureConversationState(session);
+      return;
+    }
+    if ((session.conversationState?.turns || []).length > 0) {
+      this.ensureConversationState(session);
+      return;
+    }
+    const resolvedProvider = provider || this.getProvider(session.provider);
+    try {
+      const historical = this.historyService.getHistoricalMessages(resolvedProvider, session.resumeSessionId);
+      const hasRecoveredTurns = Array.isArray(historical?.turns) && historical.turns.length > 0;
+      const hasRecoveredAgents = Array.isArray(historical?.backgroundAgents) && historical.backgroundAgents.length > 0;
+      session.conversationState = buildConversationStateFromHistory(historical, {
+        sessionId: String(session.id || ""),
+        threadId: String(session.resumeSessionId || ""),
+        status: hasRecoveredTurns || hasRecoveredAgents ? "completed" : "idle",
+        updatedAt: session.updatedAt || nowIso()
+      });
+    } catch {
+      this.ensureConversationState(session);
+    }
+  }
+
+  applyConversationDeltas(session, deltas = [], { broadcast: shouldBroadcast = true } = {}) {
+    if (!session) {
+      return [];
+    }
+    const current = this.ensureConversationState(session);
+    const prepared = (Array.isArray(deltas) ? deltas : [])
+      .filter((delta) => delta && typeof delta === "object")
+      .filter((delta) => String(delta.kind || "").trim().length > 0)
+      .map((delta) => ({
+        ...delta,
+        sessionId: String(delta.sessionId || session.id || current.sessionId || ""),
+        threadId: String(delta.threadId || session.resumeSessionId || current.threadId || ""),
+        timestamp: delta.timestamp || nowIso()
+      }));
+    if (!prepared.length) {
+      return [];
+    }
+    const appliedResult = applyConversationDeltaBatch(current, prepared);
+    session.conversationState = appliedResult.state;
+    if (shouldBroadcast) {
+      this.broadcastConversationDelta(session, appliedResult.applied);
+    }
+    return appliedResult.applied.map((entry) => entry.delta);
+  }
+
+  createConversationTurn(session, userText, timestamp = nowIso()) {
+    if (!session) {
+      return null;
+    }
+    session.turnSequence = Math.max(0, Number(session.turnSequence) || 0) + 1;
+    const suffix = typeof crypto.randomUUID === "function" ? crypto.randomUUID().slice(0, 8) : String(Date.now());
+    const turnId = `${session.id}-turn-${Date.now()}-${session.turnSequence}-${suffix}`;
+    session.currentTurnId = turnId;
+    this.applyConversationDeltas(session, [createTurnCreatedDelta(turnId, userText, timestamp)]);
+    return turnId;
+  }
+
+  applyConversationRecord(session, record, { turnId = session?.currentTurnId || session?.conversationState?.activeTurnId || "" } = {}) {
+    if (!session || !turnId) {
+      return [];
+    }
+    const deltas = normalizeRecordToDeltas(record, { turnId });
+    if (!deltas.length) {
+      return [];
+    }
+    return this.applyConversationDeltas(session, deltas);
+  }
+
+  finalizeConversationTurn(session, status = "completed", timestamp = nowIso()) {
+    const targetTurnId = String(session?.currentTurnId || session?.conversationState?.activeTurnId || "");
+    if (!targetTurnId) {
+      return;
+    }
+    this.applyConversationDeltas(session, [createTurnCompletedDelta(targetTurnId, status, timestamp)]);
+    session.currentTurnId = "";
+  }
+
+  updateConversationTurnStatus(session, status = "running", timestamp = nowIso()) {
+    const targetTurnId = String(session?.currentTurnId || session?.conversationState?.activeTurnId || "");
+    if (!targetTurnId) {
+      return;
+    }
+    this.applyConversationDeltas(session, [createTurnStatusDelta(targetTurnId, status, timestamp)]);
+  }
+
+  scheduleConversationHistoryResync(session, { attempts = 12, delayMs = 2_000 } = {}) {
+    if (!session?.resumeSessionId) {
+      return;
+    }
+    const providerId = String(session.provider || "").trim();
+    const resumeSessionId = String(session.resumeSessionId || "").trim();
+    const sessionId = String(session.id || "");
+    if (!providerId || !resumeSessionId || !sessionId) {
+      return;
+    }
+
+    for (let index = 0; index < attempts; index += 1) {
+      const waitMs = delayMs * (index + 1);
+      setTimeout(() => {
+        const live = this.sessions.get(sessionId);
+        if (!live || live.status === "exited") {
+          return;
+        }
+        let historical;
+        try {
+          historical = this.historyService.getHistoricalMessages(this.getProvider(providerId), resumeSessionId);
+        } catch {
+          return;
+        }
+        const current = this.ensureConversationState(live);
+        const incoming = createConversationState({
+          ...(historical?.conversation || {}),
+          sessionId: current.sessionId,
+          threadId: current.threadId || resumeSessionId
+        });
+        const shouldReplace =
+          Number(incoming.version || 0) > Number(current.version || 0) ||
+          (incoming.turns?.length || 0) > (current.turns?.length || 0);
+        if (!shouldReplace) {
+          return;
+        }
+        live.conversationState = incoming;
+        live.updatedAt = nowIso();
+        this.broadcastConversationSnapshot(live);
+      }, waitMs).unref?.();
+    }
+  }
+
+  broadcastConversationSnapshot(session) {
+    if (!session) {
+      return;
+    }
+    this.ensureConversationState(session);
+    const sessionView = this.serialize(session);
+    const snapshotPayload = buildConversationSnapshotPayload(session, sessionView);
+    this.broadcast(session, snapshotPayload);
+    this.broadcast(
+      session,
+      buildLegacyConversationSnapshotPayload(session, {
+        fromVersion: snapshotPayload.conversation?.version || 0,
+        toVersion: snapshotPayload.conversation?.version || 0
+      })
+    );
+  }
+
+  broadcastConversationDelta(session, applied = []) {
+    if (!session) {
+      return;
+    }
+    this.ensureConversationState(session);
+    const payload = buildConversationDeltaPayload(session, applied);
+    if (!payload) {
+      return;
+    }
+    this.broadcast(session, payload);
+    this.broadcast(
+      session,
+      buildLegacyConversationSnapshotPayload(session, {
+        fromVersion: payload.fromVersion,
+        toVersion: payload.toVersion
+      })
+    );
   }
 
   enqueueJsonExecInput(session, data) {
@@ -412,9 +629,57 @@ export class SessionManager {
     };
   }
 
+  getConversationSnapshot(id) {
+    const session = this.get(id);
+    if (!session) {
+      return null;
+    }
+    this.ensureConversationState(session);
+    return buildConversationSnapshotPayload(session, this.serialize(session));
+  }
+
   getHistoricalMessages(providerId, resumeSessionId) {
     const provider = this.getProvider(providerId);
-    return this.historyService.getHistoricalMessages(provider, resumeSessionId);
+    const historical = this.historyService.getHistoricalMessages(provider, resumeSessionId);
+    const liveSession = [...this.sessions.values()]
+      .filter(
+        (session) =>
+          session.provider === provider.id &&
+          session.status !== "exited" &&
+          String(session.resumeSessionId || "").trim() === String(resumeSessionId || "").trim()
+      )
+      .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
+    if (!liveSession?.conversationState) {
+      return historical;
+    }
+
+    const liveConversation = this.ensureConversationState(liveSession);
+    const historicalConversation = historical?.conversation || createConversationState({
+      threadId: String(resumeSessionId || "")
+    });
+    const liveTurns = Array.isArray(liveConversation.turns) ? liveConversation.turns : [];
+    const historicalTurns = Array.isArray(historicalConversation.turns) ? historicalConversation.turns : [];
+    const contentComparison = compareConversationContent(liveConversation, historicalConversation);
+    const sameContent = contentComparison === 0;
+    const shouldPreferLive =
+      liveTurns.length > historicalTurns.length ||
+      contentComparison > 0 ||
+      (sameContent && Number(liveConversation.version || 0) > Number(historicalConversation.version || 0));
+
+    if (!shouldPreferLive) {
+      return historical;
+    }
+
+    return {
+      ...historical,
+      turns: liveTurns,
+      backgroundAgents: Array.isArray(liveConversation.backgroundAgents) ? liveConversation.backgroundAgents : [],
+      conversation: createConversationState({
+        ...liveConversation,
+        sessionId: historical?.session?.id || historicalConversation.sessionId || "",
+        threadId: String(resumeSessionId || liveConversation.threadId || "")
+      })
+    };
   }
 
   maybeAutoRename(session, chunk) {
