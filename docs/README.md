@@ -1,6 +1,6 @@
 # Docs Index
 
-Last updated: 2026-04-13
+Last updated: 2026-04-21
 
 ## Purpose
 
@@ -49,6 +49,7 @@ docs/
 - [Verification Matrix](/workspace/codex-cc-web-terminal/docs/contributing/verification-matrix.md)
 - [Sync Checklists](/workspace/codex-cc-web-terminal/docs/contributing/sync-checklists.md)
 - [Regression Plan](/workspace/codex-cc-web-terminal/docs/testing/regression-plan.md)
+- [Codex Thread / Turn / Item Bridge Refactor](/workspace/codex-cc-web-terminal/docs/refactoring/codex-thread-item-bridge-refactor.md)
 
 ## Placement Quick Rules
 

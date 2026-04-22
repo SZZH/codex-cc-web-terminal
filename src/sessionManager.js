@@ -19,9 +19,7 @@ import {
   buildLegacyConversationSnapshotPayload
 } from "./sessions/conversation/protocol.js";
 import {
-  applyConversationDeltas as applyConversationDeltaBatch,
-  buildConversationStateFromHistory,
-  compareConversationContent,
+  buildConversationStateFromThreadSnapshot,
   createConversationState
 } from "./sessions/conversation/state.js";
 import {
@@ -36,6 +34,15 @@ import {
   startAppServerTurn,
   startJsonExecRun
 } from "./sessions/runners/codexRunner.js";
+import {
+  createRawRecord,
+  canonicalizeRawRecord,
+  reduceCanonicalEvents,
+  getActiveTurnLiveOverlay,
+  createCanonicalizerState,
+  deriveConversationStateFromThreadSnapshot,
+  deriveThreadSnapshotFromConversationState
+} from "./threads/index.js";
 
 function normalizeName(value, fallback) {
   const text = String(value || "").trim();
@@ -209,6 +216,9 @@ export class SessionManager {
           threadId: String(resumeSessionId || "").trim(),
           status: "idle"
         }),
+        threadSnapshot: null,
+        liveOverlay: null,
+        threadCanonicalizerState: createCanonicalizerState(),
         currentTurnId: "",
         sessionType: "main",
         parentThreadId: "",
@@ -216,6 +226,7 @@ export class SessionManager {
         agentNickname: "",
         turnSequence: 0
       };
+      this.seedThreadSnapshotFromHistory(session, resolvedProvider);
       this.seedConversationStateFromHistory(session, resolvedProvider);
       this.sessions.set(id, session);
       return this.serialize(session);
@@ -262,6 +273,9 @@ export class SessionManager {
         threadId: String(resumeSessionId || "").trim(),
         status: "idle"
       }),
+      threadSnapshot: null,
+      liveOverlay: null,
+      threadCanonicalizerState: createCanonicalizerState(),
       currentTurnId: "",
       queuedTurnIds: [],
       sessionType: "main",
@@ -273,6 +287,7 @@ export class SessionManager {
 
     registerPtySessionHandlers(this, session, shell);
 
+    this.seedThreadSnapshotFromHistory(session, resolvedProvider);
     this.seedConversationStateFromHistory(session, resolvedProvider);
     this.sessions.set(id, session);
     return this.serialize(session);
@@ -294,6 +309,14 @@ export class SessionManager {
     if (!session) {
       return createConversationState();
     }
+    if (session.threadSnapshot) {
+      session.conversationState = deriveConversationStateFromThreadSnapshot(session.threadSnapshot, {
+        sessionId: String(session.id || ""),
+        threadId: String(session.resumeSessionId || session.threadSnapshot?.threadId || ""),
+        status: status || session.conversationState?.status || "idle"
+      });
+      return session.conversationState;
+    }
     session.conversationState = createConversationState({
       ...(session.conversationState || {}),
       sessionId: String(session.id || ""),
@@ -304,28 +327,135 @@ export class SessionManager {
     return session.conversationState;
   }
 
-  seedConversationStateFromHistory(session, provider = null) {
-    if (!session?.resumeSessionId) {
-      this.ensureConversationState(session);
+  syncConversationStateFromThreadSnapshot(session, { status = "" } = {}) {
+    if (!session) {
+      return createConversationState();
+    }
+    const snapshot = this.ensureThreadSnapshot(session);
+    session.conversationState = deriveConversationStateFromThreadSnapshot(snapshot, {
+      sessionId: String(session.id || ""),
+      threadId: String(session.resumeSessionId || snapshot?.threadId || ""),
+      status: status || session.conversationState?.status || "idle"
+    });
+    return session.conversationState;
+  }
+
+  ensureThreadSnapshot(session) {
+    if (!session) {
+      return null;
+    }
+    session.threadSnapshot ||= {
+      threadId: String(session.resumeSessionId || session.id || ""),
+      metadata: {
+        name: session.name || "",
+        preview: session.inputPreview || "",
+        model: session.model || "",
+        cwd: session.cwd || "",
+        source: session.provider || ""
+      },
+      turns: [],
+      runtime: { latestTurnContext: null },
+      metrics: { latestUsage: null },
+      version: 0,
+      lastEventSeq: 0,
+      updatedAt: session.updatedAt || nowIso(),
+      activeTurnId: null
+    };
+    session.threadSnapshot.threadId = String(session.resumeSessionId || session.threadSnapshot.threadId || session.id || "");
+    session.threadSnapshot.metadata = {
+      ...session.threadSnapshot.metadata,
+      name: session.name || "",
+      preview: session.inputPreview || "",
+      model: session.model || "",
+      cwd: session.cwd || "",
+      source: session.provider || ""
+    };
+    return session.threadSnapshot;
+  }
+
+  seedThreadSnapshotFromHistory(session, provider = null) {
+    if (!session) {
       return;
     }
-    if ((session.conversationState?.turns || []).length > 0) {
-      this.ensureConversationState(session);
+    const current = this.ensureThreadSnapshot(session);
+    if ((current?.turns || []).length > 0) {
+      session.liveOverlay = getActiveTurnLiveOverlay(current);
+      return;
+    }
+    if (!session.resumeSessionId) {
+      session.liveOverlay = null;
       return;
     }
     const resolvedProvider = provider || this.getProvider(session.provider);
     try {
       const historical = this.historyService.getHistoricalMessages(resolvedProvider, session.resumeSessionId);
-      const hasRecoveredTurns = Array.isArray(historical?.turns) && historical.turns.length > 0;
-      const hasRecoveredAgents = Array.isArray(historical?.backgroundAgents) && historical.backgroundAgents.length > 0;
-      session.conversationState = buildConversationStateFromHistory(historical, {
+      if (historical?.threadSnapshot) {
+        session.threadSnapshot = {
+          ...historical.threadSnapshot,
+          metadata: {
+            ...(historical.threadSnapshot.metadata || {}),
+            name: session.name || historical.threadSnapshot.metadata?.name || "",
+            preview: session.inputPreview || historical.threadSnapshot.metadata?.preview || "",
+            model: session.model || historical.threadSnapshot.metadata?.model || "",
+            cwd: session.cwd || historical.threadSnapshot.metadata?.cwd || "",
+            source: session.provider || historical.threadSnapshot.metadata?.source || ""
+          }
+        };
+        session.liveOverlay = getActiveTurnLiveOverlay(session.threadSnapshot);
+      }
+    } catch {
+      session.liveOverlay = getActiveTurnLiveOverlay(this.ensureThreadSnapshot(session));
+    }
+  }
+
+  applyThreadRawRecord(session, record, { turnId = "" } = {}) {
+    if (!session || !record) {
+      return null;
+    }
+    const snapshot = this.ensureThreadSnapshot(session);
+    const rawRecord = createRawRecord({
+      id: `raw:${session.id}:${snapshot.lastEventSeq + 1}`,
+      threadId: String(session.resumeSessionId || snapshot.threadId || session.id || ""),
+      turnId: String(turnId || record?.turnId || record?.turn_id || record?.payload?.turn_id || session.currentTurnId || snapshot.activeTurnId || ""),
+      source: "session_manager",
+      raw: record,
+      seq: snapshot.lastEventSeq + 1,
+      recordTs: record?.timestamp || record?.payload?.timestamp || nowIso()
+    });
+    const canonicalizerState = session.threadCanonicalizerState || createCanonicalizerState();
+    session.threadCanonicalizerState = canonicalizerState;
+    const events = canonicalizeRawRecord(rawRecord, canonicalizerState);
+    if (!events.length) {
+      return null;
+    }
+    session.threadSnapshot = reduceCanonicalEvents(events, { snapshot });
+    session.liveOverlay = getActiveTurnLiveOverlay(session.threadSnapshot);
+    this.syncConversationStateFromThreadSnapshot(session);
+    return session.threadSnapshot;
+  }
+
+  seedConversationStateFromHistory(session, provider = null) {
+    if (!session) {
+      return createConversationState();
+    }
+    if (!session.resumeSessionId) {
+      return this.ensureConversationState(session);
+    }
+    if ((session.conversationState?.turns || []).length > 0) {
+      return this.ensureConversationState(session);
+    }
+    const resolvedProvider = provider || this.getProvider(session.provider);
+    try {
+      const historical = this.historyService.getHistoricalMessages(resolvedProvider, session.resumeSessionId);
+      session.conversationState = createConversationState({
+        ...(historical?.conversation || {}),
         sessionId: String(session.id || ""),
         threadId: String(session.resumeSessionId || ""),
-        status: hasRecoveredTurns || hasRecoveredAgents ? "completed" : "idle",
         updatedAt: session.updatedAt || nowIso()
       });
+      return session.conversationState;
     } catch {
-      this.ensureConversationState(session);
+      return this.ensureConversationState(session);
     }
   }
 
@@ -333,25 +463,36 @@ export class SessionManager {
     if (!session) {
       return [];
     }
-    const current = this.ensureConversationState(session);
-    const prepared = (Array.isArray(deltas) ? deltas : [])
-      .filter((delta) => delta && typeof delta === "object")
-      .filter((delta) => String(delta.kind || "").trim().length > 0)
-      .map((delta) => ({
-        ...delta,
-        sessionId: String(delta.sessionId || session.id || current.sessionId || ""),
-        threadId: String(delta.threadId || session.resumeSessionId || current.threadId || ""),
-        timestamp: delta.timestamp || nowIso()
-      }));
-    if (!prepared.length) {
-      return [];
-    }
-    const appliedResult = applyConversationDeltaBatch(current, prepared);
-    session.conversationState = appliedResult.state;
+    this.syncConversationStateFromThreadSnapshot(session);
     if (shouldBroadcast) {
-      this.broadcastConversationDelta(session, appliedResult.applied);
+      this.broadcastConversationSnapshot(session);
     }
-    return appliedResult.applied.map((entry) => entry.delta);
+    return [];
+  }
+
+  broadcastDerivedConversationDelta(session, previousState = null) {
+    if (!session) {
+      return;
+    }
+    const before = createConversationState(previousState || {});
+    const after = this.ensureConversationState(session);
+    if (before.version === after.version) {
+      return;
+    }
+    this.broadcastConversationDelta(session, [
+      {
+        delta: {
+          kind: "conversation_replaced",
+          conversation: after,
+          sessionId: after.sessionId,
+          threadId: after.threadId,
+          timestamp: after.updatedAt
+        },
+        fromVersion: before.version,
+        toVersion: after.version,
+        timestamp: after.updatedAt
+      }
+    ]);
   }
 
   createConversationTurn(session, userText, timestamp = nowIso()) {
@@ -362,36 +503,64 @@ export class SessionManager {
     const suffix = typeof crypto.randomUUID === "function" ? crypto.randomUUID().slice(0, 8) : String(Date.now());
     const turnId = `${session.id}-turn-${Date.now()}-${session.turnSequence}-${suffix}`;
     session.currentTurnId = turnId;
-    this.applyConversationDeltas(session, [createTurnCreatedDelta(turnId, userText, timestamp)]);
+    const previous = createConversationState(session.conversationState);
+    this.applyThreadRawRecord(
+      session,
+      {
+        type: "event_msg",
+        timestamp,
+        payload: {
+          type: "user_message",
+          message: userText,
+          content: [{ type: "input_text", text: userText }]
+        }
+      },
+      { turnId }
+    );
+    this.broadcastDerivedConversationDelta(session, previous);
     return turnId;
   }
 
-  applyConversationRecord(session, record, { turnId = session?.currentTurnId || session?.conversationState?.activeTurnId || "" } = {}) {
+  applyConversationRecord(session, record, { turnId = session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || "" } = {}) {
     if (!session || !turnId) {
       return [];
     }
-    const deltas = normalizeRecordToDeltas(record, { turnId });
-    if (!deltas.length) {
-      return [];
-    }
-    return this.applyConversationDeltas(session, deltas);
+    const previous = createConversationState(session.conversationState);
+    this.applyThreadRawRecord(session, record, { turnId });
+    this.broadcastDerivedConversationDelta(session, previous);
+    this.broadcastConversationSnapshot(session);
+    return [];
   }
 
   finalizeConversationTurn(session, status = "completed", timestamp = nowIso()) {
-    const targetTurnId = String(session?.currentTurnId || session?.conversationState?.activeTurnId || "");
+    const targetTurnId = String(session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || "");
     if (!targetTurnId) {
       return;
     }
-    this.applyConversationDeltas(session, [createTurnCompletedDelta(targetTurnId, status, timestamp)]);
+    const previous = createConversationState(session.conversationState);
+    this.applyThreadRawRecord(
+      session,
+      {
+        type: "event_msg",
+        timestamp,
+        payload: {
+          type: status === "failed" ? "task_failed" : status === "aborted" || status === "interrupted" ? "turn_aborted" : "task_complete",
+          status
+        }
+      },
+      { turnId: targetTurnId }
+    );
     session.currentTurnId = "";
+    this.broadcastDerivedConversationDelta(session, previous);
+    this.broadcastConversationSnapshot(session);
   }
 
   updateConversationTurnStatus(session, status = "running", timestamp = nowIso()) {
-    const targetTurnId = String(session?.currentTurnId || session?.conversationState?.activeTurnId || "");
+    const targetTurnId = String(session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || "");
     if (!targetTurnId) {
       return;
     }
-    this.applyConversationDeltas(session, [createTurnStatusDelta(targetTurnId, status, timestamp)]);
+    this.syncConversationStateFromThreadSnapshot(session, { status });
   }
 
   scheduleConversationHistoryResync(session, { attempts = 12, delayMs = 2_000 } = {}) {
@@ -418,19 +587,19 @@ export class SessionManager {
         } catch {
           return;
         }
-        const current = this.ensureConversationState(live);
-        const incoming = createConversationState({
-          ...(historical?.conversation || {}),
-          sessionId: current.sessionId,
-          threadId: current.threadId || resumeSessionId
-        });
+        const currentSnapshot = this.ensureThreadSnapshot(live);
+        const incomingSnapshot = historical?.threadSnapshot || null;
         const shouldReplace =
-          Number(incoming.version || 0) > Number(current.version || 0) ||
-          (incoming.turns?.length || 0) > (current.turns?.length || 0);
+          Number(incomingSnapshot?.lastEventSeq || 0) > Number(currentSnapshot?.lastEventSeq || 0) ||
+          Number(incomingSnapshot?.version || 0) > Number(currentSnapshot?.version || 0);
         if (!shouldReplace) {
           return;
         }
-        live.conversationState = incoming;
+        if (incomingSnapshot) {
+          live.threadSnapshot = incomingSnapshot;
+          live.liveOverlay = historical.liveOverlay || getActiveTurnLiveOverlay(incomingSnapshot);
+        }
+        this.syncConversationStateFromThreadSnapshot(live);
         live.updatedAt = nowIso();
         this.broadcastConversationSnapshot(live);
       }, waitMs).unref?.();
@@ -441,7 +610,7 @@ export class SessionManager {
     if (!session) {
       return;
     }
-    this.ensureConversationState(session);
+    this.syncConversationStateFromThreadSnapshot(session);
     const sessionView = this.serialize(session);
     const snapshotPayload = buildConversationSnapshotPayload(session, sessionView);
     this.broadcast(session, snapshotPayload);
@@ -458,7 +627,7 @@ export class SessionManager {
     if (!session) {
       return;
     }
-    this.ensureConversationState(session);
+    this.syncConversationStateFromThreadSnapshot(session);
     const payload = buildConversationDeltaPayload(session, applied);
     if (!payload) {
       return;
@@ -635,51 +804,79 @@ export class SessionManager {
       return null;
     }
     this.ensureConversationState(session);
+    this.ensureThreadSnapshot(session);
     return buildConversationSnapshotPayload(session, this.serialize(session));
   }
 
   getHistoricalMessages(providerId, resumeSessionId) {
     const provider = this.getProvider(providerId);
-    const historical = this.historyService.getHistoricalMessages(provider, resumeSessionId);
+    return this.historyService.getHistoricalMessages(provider, resumeSessionId);
+  }
+
+  getThreadSnapshotBundle(providerId, resumeSessionId) {
+    const provider = this.getProvider(providerId);
+    let historical = null;
+    try {
+      historical = this.historyService.getHistoricalMessages(provider, resumeSessionId);
+    } catch {
+      historical = null;
+    }
+    return {
+      session: historical?.session || null,
+      threadSnapshot: historical?.threadSnapshot || null,
+      liveOverlay: historical?.liveOverlay || null,
+      conversation: historical?.conversation || null,
+      conversationSnapshot: historical?.conversationSnapshot || null
+    };
+  }
+
+  getLiveHistoryContinuation(providerId, resumeSessionId) {
+    const provider = this.getProvider(providerId);
+    const targetResumeId = String(resumeSessionId || "").trim();
+    if (!targetResumeId) {
+      return null;
+    }
     const liveSession = [...this.sessions.values()]
       .filter(
         (session) =>
           session.provider === provider.id &&
           session.status !== "exited" &&
-          String(session.resumeSessionId || "").trim() === String(resumeSessionId || "").trim()
+          String(session.resumeSessionId || "").trim() === targetResumeId
       )
       .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
-    if (!liveSession?.conversationState) {
-      return historical;
+    if (!liveSession) {
+      return null;
     }
-
-    const liveConversation = this.ensureConversationState(liveSession);
-    const historicalConversation = historical?.conversation || createConversationState({
-      threadId: String(resumeSessionId || "")
-    });
-    const liveTurns = Array.isArray(liveConversation.turns) ? liveConversation.turns : [];
-    const historicalTurns = Array.isArray(historicalConversation.turns) ? historicalConversation.turns : [];
-    const contentComparison = compareConversationContent(liveConversation, historicalConversation);
-    const sameContent = contentComparison === 0;
-    const shouldPreferLive =
-      liveTurns.length > historicalTurns.length ||
-      contentComparison > 0 ||
-      (sameContent && Number(liveConversation.version || 0) > Number(historicalConversation.version || 0));
-
-    if (!shouldPreferLive) {
-      return historical;
+    let baseSnapshot = null;
+    try {
+      baseSnapshot = this.historyService.getHistoricalMessages(provider, targetResumeId)?.threadSnapshot || null;
+    } catch {
+      baseSnapshot = null;
     }
-
+    const currentSnapshot = this.ensureThreadSnapshot(liveSession);
+    const currentConversation = this.ensureConversationState(liveSession);
+    const mergedSnapshot =
+      (currentSnapshot?.turns?.length || 0) >= (currentConversation?.turns?.length || 0)
+        ? currentSnapshot
+        : deriveThreadSnapshotFromConversationState(currentConversation, {
+            threadId: targetResumeId,
+            metadata: currentSnapshot?.metadata || baseSnapshot?.metadata || {},
+            baseSnapshot: baseSnapshot || currentSnapshot || null
+          });
     return {
-      ...historical,
-      turns: liveTurns,
-      backgroundAgents: Array.isArray(liveConversation.backgroundAgents) ? liveConversation.backgroundAgents : [],
-      conversation: createConversationState({
-        ...liveConversation,
-        sessionId: historical?.session?.id || historicalConversation.sessionId || "",
-        threadId: String(resumeSessionId || liveConversation.threadId || "")
-      })
+      session: this.serialize(liveSession),
+      conversation: currentConversation,
+      threadSnapshot: mergedSnapshot,
+      liveOverlay: liveSession.liveOverlay || getActiveTurnLiveOverlay(mergedSnapshot)
     };
+  }
+
+  getThreadContinuation(providerId, resumeSessionId) {
+    return this.getLiveHistoryContinuation(providerId, resumeSessionId);
+  }
+
+  getThreadContinuationRuntime(providerId, resumeSessionId) {
+    return this.getLiveHistoryContinuation(providerId, resumeSessionId);
   }
 
   maybeAutoRename(session, chunk) {

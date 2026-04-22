@@ -1,4 +1,24 @@
 export async function handleAuthRoute(ctx, runtime) {
+  if (ctx.path === "/api/auth/session" && ctx.method === "GET") {
+    const { session, reason } = runtime.getAuthSessionStatus(ctx.req);
+    if (!session) {
+      runtime.clearAuthCookie(ctx);
+      runtime.json(ctx, 200, {
+        authenticated: false,
+        reason: reason || "unauthorized",
+        canReauthenticate: true
+      });
+      return true;
+    }
+
+    runtime.attachAuthSessionCookie(ctx, session);
+    runtime.json(ctx, 200, {
+      authenticated: true,
+      expiresAt: session.expiresAt
+    });
+    return true;
+  }
+
   if (ctx.path === "/api/login" && ctx.method === "POST") {
     if (runtime.forbidCrossOrigin(ctx)) {
       return true;
@@ -44,6 +64,7 @@ export async function handleAuthRoute(ctx, runtime) {
     const authSession = runtime.getAuthSession(ctx.req);
     if (authSession) {
       runtime.authSessions.delete(authSession.id);
+      runtime.saveAuthSessions?.();
     }
     runtime.clearAuthCookie(ctx);
     runtime.json(ctx, 200, { ok: true });

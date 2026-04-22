@@ -110,3 +110,23 @@ export async function requestSessionById(sessionId) {
   const payload = await request(`/api/sessions/${encodeURIComponent(id)}`);
   return payload?.session || null;
 }
+
+export async function requestAuthSession(attempt = 0) {
+  const response = await fetch("/api/auth/session", {
+    credentials: "same-origin"
+  });
+
+  if (response.status === 401 && attempt === 0) {
+    const relogged = await retryLoginFromSavedToken();
+    if (relogged) {
+      return requestAuthSession(attempt + 1);
+    }
+  }
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(payload.error || response.statusText);
+  }
+
+  return response.json();
+}

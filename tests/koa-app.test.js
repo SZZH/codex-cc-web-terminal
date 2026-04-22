@@ -96,6 +96,21 @@ function createSessionManagerStub() {
         backgroundAgents: []
       };
     },
+    getThreadSnapshotBundle(provider, resumeSessionId) {
+      return {
+        session: { id: `history:${provider}:${resumeSessionId}` },
+        threadSnapshot: {
+          threadId: resumeSessionId,
+          turns: [{ id: "turn-1", items: [] }]
+        },
+        liveOverlay: null,
+        conversation: { threadId: resumeSessionId, turns: [] },
+        conversationSnapshot: { threadId: resumeSessionId, turns: [] }
+      };
+    },
+    getThreadContinuationRuntime(provider, resumeSessionId) {
+      return null;
+    },
     archiveHistoricalSession(provider, resumeSessionId) {
       calls.archive.push({ provider, resumeSessionId });
       return { id: `history:${provider}:${resumeSessionId}`, kind: "archived" };
@@ -162,7 +177,7 @@ test("authorized requests extend auth-session expiration", async (t) => {
   const initialExpiry = server.runtime.authSessions.get(sessionId)?.expiresAt;
   assert.ok(initialExpiry);
 
-  nowMs += 1_000;
+  nowMs += 61_000;
   const configResponse = await fetch(`${server.baseUrl}/api/config`, {
     headers: { cookie: auth.cookies }
   });
@@ -170,6 +185,36 @@ test("authorized requests extend auth-session expiration", async (t) => {
 
   const refreshedExpiry = server.runtime.authSessions.get(sessionId)?.expiresAt;
   assert.ok(refreshedExpiry > initialExpiry);
+});
+
+test("stale auth cookie is rejected after server restart instead of keeping protected routes in a loading state", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const firstServer = await startTestServer({ sessionManager });
+  const auth = await login(firstServer.baseUrl, firstServer.config.accessToken);
+  assert.equal(auth.response.status, 200);
+
+  const cookieName = firstServer.config.authSessionCookieName;
+  const staleSessionId = parseCookieValue(auth.cookies, cookieName);
+  assert.ok(staleSessionId);
+
+  await firstServer.close();
+
+  const secondServer = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      authSessionCookieName: cookieName
+    }
+  });
+  t.after(async () => {
+    await secondServer.close();
+  });
+
+  const configResponse = await fetch(`${secondServer.baseUrl}/api/config`, {
+    headers: { cookie: auth.cookies }
+  });
+
+  assert.equal(configResponse.status, 401);
+  assert.equal(secondServer.runtime.authSessions.has(staleSessionId), false);
 });
 
 test("cross-origin login is rejected before token validation", async (t) => {
@@ -332,12 +377,28 @@ test("fs and history routes return manager-backed payloads", async (t) => {
   assert.equal(historyMessagesResponse.status, 200);
   const historyPayload = await historyMessagesResponse.json();
   assert.equal(historyPayload.messages.length, 1);
+  assert.equal(historyPayload.threadSnapshot.threadId, "thread-1");
+  assert.equal(historyPayload.continuation, null);
+  assert.equal(historyPayload.thread.snapshot.threadId, "thread-1");
   assert.deepEqual(sessionManager.calls.history[0], { provider: "codex", resumeSessionId: "thread-1" });
 
   const resourceStyleResponse = await fetch(`${server.baseUrl}/api/history-sessions/codex/thread-1/messages`, {
     headers: { cookie: cookies }
   });
   assert.equal(resourceStyleResponse.status, 200);
+
+  const threadRouteResponse = await fetch(`${server.baseUrl}/api/threads/codex/thread-1`, {
+    headers: { cookie: cookies }
+  });
+  assert.equal(threadRouteResponse.status, 200);
+  const threadRoutePayload = await threadRouteResponse.json();
+  assert.equal(threadRoutePayload.threadSnapshot.threadId, "thread-1");
+  assert.equal(threadRoutePayload.continuation, null);
+
+  const threadConversationResponse = await fetch(`${server.baseUrl}/api/threads/codex/thread-1/conversation`, {
+    headers: { cookie: cookies }
+  });
+  assert.equal(threadConversationResponse.status, 200);
 
   const invalidResourcePath = await fetch(`${server.baseUrl}/api/history-sessions/codex/messages`, {
     headers: { cookie: cookies }
@@ -376,6 +437,285 @@ test("fs and history routes return manager-backed payloads", async (t) => {
   assert.deepEqual(sessionManager.calls.archive[0], { provider: "codex", resumeSessionId: "thread-1" });
   assert.deepEqual(sessionManager.calls.restore[0], { provider: "codex", resumeSessionId: "thread-1" });
   assert.deepEqual(sessionManager.calls.deleteHistory[0], { provider: "codex", resumeSessionId: "thread-1" });
+});
+
+test("history messages route returns manager-owned historical snapshot without reusing live session payload", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  sessionManager.getHistoricalMessages = (provider, resumeSessionId) => {
+    sessionManager.calls.history.push({ provider, resumeSessionId });
+    return {
+      session: {
+        id: `history:${provider}:${resumeSessionId}`,
+        kind: "history",
+        resumeSessionId
+      },
+      messages: [{ role: "assistant", text: "历史答案", timestamp: new Date().toISOString() }],
+      turns: [
+        {
+          id: "turn-history-only",
+          user: { id: "user-history", text: "历史问题", ts: new Date().toISOString() },
+          assistant: {
+            body: [{ id: "body-history", kind: "markdown", text: "历史答案", payload: {}, ts: new Date().toISOString() }],
+            process: [],
+            status: "completed",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString()
+          }
+        }
+      ],
+      backgroundAgents: []
+    };
+  };
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const historyMessagesResponse = await fetch(
+    `${server.baseUrl}/api/history-messages?provider=codex&resumeSessionId=thread-1`,
+    { headers: { cookie: cookies } }
+  );
+
+  assert.equal(historyMessagesResponse.status, 200);
+  const historyPayload = await historyMessagesResponse.json();
+  assert.equal(historyPayload.session.id, "history:codex:thread-1");
+  assert.equal(historyPayload.session.kind, "history");
+  assert.equal(historyPayload.turns.length, 1);
+  assert.equal(historyPayload.turns[0].user.text, "历史问题");
+  assert.equal(historyPayload.turns[0].assistant.body[0].text, "历史答案");
+  assert.equal(sessionManager.calls.create.length, 0);
+});
+
+test("single-thread model contract: history conversation route returns the persisted thread snapshot only, without live continuation turns", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  sessionManager.getHistoricalMessages = (provider, resumeSessionId) => {
+    sessionManager.calls.history.push({ provider, resumeSessionId });
+    return {
+      session: {
+        id: `history:${provider}:${resumeSessionId}`,
+        kind: "history",
+        resumeSessionId
+      },
+      conversationSnapshot: {
+        turns: [
+          {
+            id: "turn-history-only",
+            user: { id: "user-history", text: "历史问题", ts: new Date().toISOString() },
+            assistant: {
+              body: [{ id: "body-history", kind: "markdown", text: "历史答案", payload: {}, ts: new Date().toISOString() }],
+              process: [],
+              status: "completed",
+              startedAt: new Date().toISOString(),
+              finishedAt: new Date().toISOString()
+            }
+          }
+        ]
+      },
+      threadSnapshot: {
+        threadId: resumeSessionId,
+        turns: [
+          {
+            id: "turn-history-only",
+            items: []
+          }
+        ]
+      },
+      liveOverlay: null
+    };
+  };
+  sessionManager.getThreadSnapshotBundle = (provider, resumeSessionId) => ({
+    session: {
+      id: `history:${provider}:${resumeSessionId}`,
+      kind: "history",
+      resumeSessionId
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        {
+          id: "turn-history-only",
+          items: []
+        }
+      ]
+    },
+    liveOverlay: null,
+    conversationSnapshot: {
+      turns: [
+        {
+          id: "turn-history-only",
+          user: { id: "user-history", text: "历史问题", ts: new Date().toISOString() },
+          assistant: {
+            body: [{ id: "body-history", kind: "markdown", text: "历史答案", payload: {}, ts: new Date().toISOString() }],
+            process: [],
+            status: "completed",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString()
+          }
+        }
+      ]
+    }
+  });
+  sessionManager.getThreadContinuationRuntime = () => ({
+    session: { id: "session-live-1", kind: "live" },
+    threadSnapshot: {
+      threadId: "thread-1",
+      turns: [
+        { id: "turn-history-only", items: [] },
+        { id: "turn-live-only", items: [] }
+      ]
+    },
+    liveOverlay: { turnId: "turn-live-only", text: "继续对话的实时内容" }
+  });
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/history-sessions/codex/thread-1/conversation`, {
+    headers: { cookie: cookies }
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.threadSnapshot.turns.length, 1);
+  assert.equal(payload.continuation.threadSnapshot.turns.length, 2);
+  assert.equal(payload.turns.length, 1);
+});
+
+test("single-thread model contract: continuation route returns only live continuation runtime and keeps it separate from historical conversation route", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  sessionManager.getHistoricalMessages = (provider, resumeSessionId) => ({
+    session: {
+      id: `history:${provider}:${resumeSessionId}`,
+      kind: "history",
+      resumeSessionId
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [{ id: "turn-history-only", items: [{ id: "u1", kind: "UserMessage", text: "历史问题" }] }]
+    },
+    liveOverlay: null
+  });
+  sessionManager.getThreadContinuationRuntime = (provider, resumeSessionId) => ({
+    session: {
+      id: "session-live-1",
+      kind: "live",
+      resumeSessionId
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        { id: "turn-history-only", items: [{ id: "u1", kind: "UserMessage", text: "历史问题" }] },
+        { id: "turn-live-only", items: [{ id: "u2", kind: "UserMessage", text: "继续追问" }] }
+      ]
+    },
+    liveOverlay: {
+      turnId: "turn-live-only",
+      text: "继续对话的实时内容"
+    }
+  });
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+
+  const historyResponse = await fetch(`${server.baseUrl}/api/history-sessions/codex/thread-1/conversation`, {
+    headers: { cookie: cookies }
+  });
+  const historyPayload = await historyResponse.json();
+
+  const continuationResponse = await fetch(`${server.baseUrl}/api/history-sessions/codex/thread-1/continuation`, {
+    headers: { cookie: cookies }
+  });
+  const continuationPayload = await continuationResponse.json();
+
+  assert.equal(historyResponse.status, 200);
+  assert.equal(continuationResponse.status, 200);
+  assert.equal(historyPayload.threadSnapshot.turns.length, 1);
+  assert.equal(historyPayload.turns.length, 0);
+  assert.equal(continuationPayload.hasLiveContinuation, true);
+  assert.equal(continuationPayload.continuation.threadSnapshot.turns.length, 2);
+});
+
+test("history messages route falls back to live continuation when historical session is missing", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  sessionManager.getHistoricalMessages = (provider, resumeSessionId) => {
+    sessionManager.calls.history.push({ provider, resumeSessionId });
+    throw new Error(`Historical session not found: ${provider}/${resumeSessionId}`);
+  };
+  sessionManager.getThreadSnapshotBundle = () => ({
+    session: null,
+    threadSnapshot: null,
+    liveOverlay: null,
+    conversation: null,
+    conversationSnapshot: null
+  });
+  sessionManager.getThreadContinuationRuntime = (provider, resumeSessionId) => ({
+    session: {
+      id: "session-live-only",
+      kind: "live",
+      provider,
+      resumeSessionId
+    },
+    conversation: {
+      sessionId: "session-live-only",
+      threadId: resumeSessionId,
+      version: 1,
+      status: "running",
+      turns: [
+        {
+          id: "turn-live-only",
+          user: { id: "u-live", text: "只有 live 的问题", ts: new Date().toISOString() },
+          assistant: {
+            body: [{ id: "body-live", kind: "markdown", text: "只有 live 的回答", payload: {}, ts: new Date().toISOString() }],
+            process: [],
+            status: "completed",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString()
+          }
+        }
+      ],
+      backgroundAgents: []
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        {
+          id: "turn-live-only",
+          items: [
+            { id: "u-live", kind: "UserMessage", text: "只有 live 的问题" },
+            { id: "a-live", kind: "AgentMessage", text: "只有 live 的回答" }
+          ]
+        }
+      ]
+    },
+    liveOverlay: null
+  });
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/history-messages?provider=codex&resumeSessionId=thread-live-only`, {
+    headers: { cookie: cookies }
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.session.id, "session-live-only");
+  assert.equal(payload.threadSnapshot.threadId, "thread-live-only");
+  assert.equal(payload.turns.length, 1);
+  assert.equal(payload.turns[0].assistant.body[0].text, "只有 live 的回答");
+  assert.equal(payload.messages.length, 0);
 });
 
 test("invalid input payloads return 400 for json-backed routes", async (t) => {

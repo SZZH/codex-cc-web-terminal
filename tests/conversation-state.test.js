@@ -81,6 +81,10 @@ test("conversation snapshot payload carries normalized conversation and legacy f
   assert.equal(payload.sessionId, "session-1");
   assert.equal(payload.threadId, "thread-1");
   assert.equal(payload.conversation.version, 1);
+  assert.equal(payload.continuation.threadId, "thread-1");
+  assert.equal(payload.continuation.sessionId, "session-1");
+  assert.equal(payload.thread.snapshot, null);
+  assert.equal(payload.thread.continuation.threadId, "thread-1");
   assert.equal(payload.turns.length, 1);
   assert.equal(payload.buffer, "buffer-text");
 });
@@ -103,6 +107,8 @@ test("conversation delta payload emits versioned delta entries", () => {
   assert.equal(payload.type, "conversation.delta");
   assert.equal(payload.fromVersion, 1);
   assert.equal(payload.toVersion, 2);
+  assert.equal(payload.continuation.threadId, "thread-1");
+  assert.equal(payload.thread.continuation.sessionId, "session-1");
   assert.equal(payload.deltas.length, 1);
   assert.equal(payload.deltas[0].version, 2);
 });

@@ -450,7 +450,31 @@ function applyBackgroundAgentUpserted(state, delta) {
   };
 }
 
+function isAuthoritativeConversationDelta(delta = {}) {
+  if (!delta || typeof delta !== "object" || !delta.conversation || typeof delta.conversation !== "object") {
+    return false;
+  }
+  const kind = String(delta.kind || "").trim().toLowerCase();
+  if (kind === "conversation_replaced") {
+    return true;
+  }
+  return kind.startsWith("conversation_") && Array.isArray(delta.conversation.turns);
+}
+
+function findAuthoritativeConversationDelta(deltas = []) {
+  const items = asArray(deltas);
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (isAuthoritativeConversationDelta(items[index])) {
+      return items[index];
+    }
+  }
+  return null;
+}
+
 function applyConversationDelta(state, delta) {
+  if (isAuthoritativeConversationDelta(delta)) {
+    return buildConversationStateFromPayload(delta, state);
+  }
   switch (String(delta?.kind || "")) {
     case "turn_created":
       return applyTurnCreated(state, delta);
@@ -601,19 +625,45 @@ export function reconcileTimelineWithSnapshotBuffer(currentMessages = [], buffer
 }
 
 export function buildConversationStateFromPayload(payload = {}, fallback = {}) {
-  if (payload?.conversation && typeof payload.conversation === "object") {
+  const authoritativeSource =
+    payload?.conversation && typeof payload.conversation === "object"
+      ? payload
+      : findAuthoritativeConversationDelta(payload?.deltas);
+
+  if (authoritativeSource?.conversation && typeof authoritativeSource.conversation === "object") {
     return createConversationState({
       ...fallback,
-      ...payload.conversation,
-      sessionId: payload?.conversation?.sessionId || payload?.sessionId || fallback?.sessionId || "",
-      threadId: payload?.conversation?.threadId || payload?.threadId || fallback?.threadId || "",
-      version: payload?.conversation?.version ?? payload?.version ?? fallback?.version ?? 0,
-      status: payload?.conversation?.status || payload?.conversationStatus || payload?.status || fallback?.status || "idle",
-      turns: payload?.conversation?.turns || payload?.turns || fallback?.turns || [],
+      ...authoritativeSource.conversation,
+      sessionId:
+        authoritativeSource?.conversation?.sessionId ||
+        authoritativeSource?.sessionId ||
+        payload?.sessionId ||
+        fallback?.sessionId ||
+        "",
+      threadId:
+        authoritativeSource?.conversation?.threadId ||
+        authoritativeSource?.threadId ||
+        payload?.threadId ||
+        fallback?.threadId ||
+        "",
+      version: authoritativeSource?.conversation?.version ?? authoritativeSource?.version ?? payload?.version ?? fallback?.version ?? 0,
+      status:
+        authoritativeSource?.conversation?.status ||
+        payload?.conversationStatus ||
+        authoritativeSource?.conversationStatus ||
+        authoritativeSource?.status ||
+        payload?.status ||
+        fallback?.status ||
+        "idle",
+      turns: authoritativeSource?.conversation?.turns || payload?.turns || fallback?.turns || [],
       backgroundAgents:
-        payload?.conversation?.backgroundAgents || payload?.backgroundAgents || fallback?.backgroundAgents || [],
-      activeTurnId: payload?.conversation?.activeTurnId || fallback?.activeTurnId || "",
-      updatedAt: payload?.conversation?.updatedAt || payload?.timestamp || fallback?.updatedAt
+        authoritativeSource?.conversation?.backgroundAgents ||
+        payload?.backgroundAgents ||
+        authoritativeSource?.backgroundAgents ||
+        fallback?.backgroundAgents ||
+        [],
+      activeTurnId: authoritativeSource?.conversation?.activeTurnId ?? fallback?.activeTurnId ?? "",
+      updatedAt: authoritativeSource?.conversation?.updatedAt || authoritativeSource?.timestamp || payload?.timestamp || fallback?.updatedAt
     });
   }
   return createConversationState({
@@ -633,8 +683,11 @@ export function applyConversationDeltaPayload(currentConversation = {}, payload 
   const fallbackConversation = buildConversationStateFromPayload(payload, base);
   const fromVersion = Number(payload?.fromVersion);
   const hasVersionGap = Number.isFinite(fromVersion) && fromVersion !== base.version;
+  const hasAuthoritativeConversation = Boolean(
+    (payload?.conversation && typeof payload.conversation === "object") || findAuthoritativeConversationDelta(payload?.deltas)
+  );
 
-  if (hasVersionGap && payload?.conversation) {
+  if (hasVersionGap && hasAuthoritativeConversation) {
     return {
       conversation: fallbackConversation,
       resynced: true
@@ -643,10 +696,21 @@ export function applyConversationDeltaPayload(currentConversation = {}, payload 
 
   let next = base;
   for (const delta of asArray(payload?.deltas)) {
+    const previousVersion = next.version;
     next = applyConversationDelta(next, delta);
+    const explicitDeltaVersion = Number(delta?.version);
+    const nextVersion = isAuthoritativeConversationDelta(delta)
+      ? (
+          Number.isFinite(explicitDeltaVersion)
+            ? explicitDeltaVersion
+            : Number.isFinite(Number(delta?.conversation?.version))
+              ? Number(delta.conversation.version)
+              : previousVersion + 1
+        )
+      : Math.max(previousVersion + 1, Number.isFinite(explicitDeltaVersion) ? explicitDeltaVersion : previousVersion + 1);
     next = createConversationState({
       ...next,
-      version: Math.max(next.version + 1, Number(delta?.version) || next.version + 1),
+      version: nextVersion,
       updatedAt: delta?.timestamp || payload?.timestamp || next.updatedAt
     });
   }

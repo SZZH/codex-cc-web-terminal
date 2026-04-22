@@ -1,5 +1,6 @@
 import { nowIso } from "../shared/text.js";
 import { applyDelta as applyTurnDelta, createEmptyConversationState as createLegacyTurnState } from "../normalize/turnState.js";
+import { THREAD_ITEM_KIND, TURN_STATUS } from "../../threads/itemTaxonomy.js";
 
 export const CONVERSATION_SCHEMA_VERSION = 1;
 
@@ -164,6 +165,104 @@ export function buildConversationStateFromHistory(historyPayload, options = {}) 
     backgroundAgents,
     status: hasContent ? "completed" : "idle",
     version: hasContent ? 1 : 0
+  });
+}
+
+function mapThreadTurnItemToBodyBlock(item = {}) {
+  if (item.kind !== THREAD_ITEM_KIND.AGENT_MESSAGE && item.kind !== THREAD_ITEM_KIND.PLAN) {
+    return null;
+  }
+  const text = String(item.text || item.summary || item.payload?.text || "").trim();
+  if (!text) {
+    return null;
+  }
+  return {
+    id: String(item.id || ""),
+    kind: "markdown",
+    text,
+    payload: item.payload || {},
+    ts: item.updatedAt || item.createdAt || nowIso()
+  };
+}
+
+function mapThreadTurnItemToProcessEvent(item = {}) {
+  if (
+    item.kind === THREAD_ITEM_KIND.USER_MESSAGE ||
+    item.kind === THREAD_ITEM_KIND.AGENT_MESSAGE ||
+    item.kind === THREAD_ITEM_KIND.PLAN
+  ) {
+    return null;
+  }
+  const summary = String(item.summary || item.text || item.kind || "事件").trim();
+  if (!summary) {
+    return null;
+  }
+  return {
+    id: String(item.id || ""),
+    type: String(item.kind || "event"),
+    title: String(item.kind || "event"),
+    summary,
+    content: String(item.text || "").trim(),
+    payload: item.payload || {},
+    ts: item.updatedAt || item.createdAt || nowIso()
+  };
+}
+
+function mapThreadTurnStatus(status = "") {
+  const normalized = String(status || "").trim();
+  if (normalized === TURN_STATUS.FAILED) {
+    return "failed";
+  }
+  if (normalized === TURN_STATUS.ABORTED) {
+    return "interrupted";
+  }
+  if (normalized === TURN_STATUS.COMPLETED) {
+    return "completed";
+  }
+  return "running";
+}
+
+export function buildConversationStateFromThreadSnapshot(snapshot = {}, options = {}) {
+  const turns = Array.isArray(snapshot?.turns)
+    ? snapshot.turns.map((turn) => {
+        const items = Array.isArray(turn?.items) ? turn.items : [];
+        const userItem = items.find((item) => item?.kind === THREAD_ITEM_KIND.USER_MESSAGE);
+        const userText = String(userItem?.text || "").trim();
+        return {
+          id: String(turn?.id || ""),
+          user: userText
+            ? {
+                id: String(userItem?.id || `${turn?.id || "turn"}-user`),
+                text: userText,
+                ts: turn?.startedAt || userItem?.updatedAt || userItem?.createdAt || nowIso()
+              }
+            : null,
+          assistant: {
+            status: mapThreadTurnStatus(turn?.status),
+            startedAt: turn?.startedAt || "",
+            finishedAt: turn?.completedAt || "",
+            process: items.map(mapThreadTurnItemToProcessEvent).filter(Boolean),
+            body: items.map(mapThreadTurnItemToBodyBlock).filter(Boolean)
+          }
+        };
+      })
+    : [];
+
+  const hasContent = turns.length > 0;
+  const activeTurnId =
+    String(snapshot?.activeTurnId || "").trim() ||
+    turns.find((turn) => String(turn?.assistant?.status || "").trim() === "running")?.id ||
+    "";
+
+  return createConversationState({
+    ...options,
+    threadId: String(snapshot?.threadId || options.threadId || ""),
+    turns,
+    backgroundAgents: Array.isArray(options.backgroundAgents) ? options.backgroundAgents : [],
+    status: hasContent ? "completed" : "idle",
+    activeTurnId,
+    updatedAt: snapshot?.updatedAt || options.updatedAt || nowIso(),
+    version: Number(snapshot?.version || options.version || (hasContent ? 1 : 0))
   });
 }
 

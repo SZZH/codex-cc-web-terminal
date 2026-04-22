@@ -1,3 +1,5 @@
+@import "./thread-turn-item.css";
+
 :root {
   color-scheme: light;
   --bg: #f6f4f1;

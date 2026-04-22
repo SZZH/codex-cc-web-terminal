@@ -5,7 +5,7 @@ import { useRoute, useRouter } from "vue-router";
 import ChatView from "./components/ChatView.vue";
 import LoginView from "./components/LoginView.vue";
 import SessionListView from "./components/SessionListView.vue";
-import { AUTH_EXPIRED_EVENT, request, requestHistoryMessages, requestSessionById } from "./lib/api.js";
+import { AUTH_EXPIRED_EVENT, request, requestAuthSession, requestHistoryMessages, requestSessionById } from "./lib/api.js";
 import {
   applyConversationDeltaPayload,
   buildTimelineMessages,
@@ -16,6 +16,8 @@ import {
   reconcileTimelineWithSnapshotBuffer
 } from "./lib/conversation-timeline.js";
 import { normalizeServerPayload } from "./lib/normalize-events.js";
+import { resolveInitialAuthBootstrap } from "./lib/auth-bootstrap.js";
+import { buildDisplayedThreadSnapshot, shouldSyncPersistedThread } from "./lib/thread-display-state.js";
 import {
   PREVIEW_FALLBACK,
   compactLine,
@@ -68,21 +70,33 @@ const state = reactive({
   rememberToken: true,
   statusText: "",
   sessions: [],
-  activeSessionId: "",
-  activeLiveSessionId: "",
-  activeSessionMeta: null,
-  activeMessages: [],
-  activeConversation: createConversationState(),
-  hasConversationSnapshot: false,
-  hasConversationDelta: false,
-  backgroundAgents: [],
-  activeSocket: null,
-  activeStreamBuffer: "",
+  routeSessionId: "",
+  liveView: {
+    sessionId: "",
+    liveSessionId: "",
+    sessionMeta: null,
+    messages: [],
+    conversation: createConversationState(),
+    liveOverlay: null,
+    hasConversationSnapshot: false,
+    hasConversationDelta: false,
+    backgroundAgents: [],
+    socket: null,
+    streamBuffer: "",
+    openToken: 0,
+    replayGuardActive: false,
+    replayGuardPrompt: "",
+    replayGuardUntil: 0
+  },
+  threadView: {
+    sessionId: "",
+    meta: null,
+    threadId: "",
+    persistedSnapshot: null,
+    authoritativeSnapshot: null,
+    openToken: 0
+  },
   pendingSessionId: "",
-  activeSessionOpenToken: 0,
-  replayGuardActive: false,
-  replayGuardPrompt: "",
-  replayGuardUntil: 0,
   lastSubmitText: "",
   lastSubmitAt: 0,
   backendHttpOrigin: "",
@@ -92,9 +106,35 @@ const state = reactive({
 let syncingRouteOpen = false;
 
 function cacheKey(session) {
-  return session?.kind === "history"
-    ? `history:${session.provider}:${session.resumeSessionId}`
+  const kind = String(session?.kind || "").trim().toLowerCase();
+  return kind === "history" || kind === "thread"
+    ? `thread:${session.provider}:${session.resumeSessionId}`
     : `live:${session?.id || "unknown"}`;
+}
+
+function resetLiveView() {
+  state.liveView.sessionId = "";
+  state.liveView.liveSessionId = "";
+  state.liveView.sessionMeta = null;
+  state.liveView.messages = [];
+  state.liveView.conversation = createConversationState();
+  state.liveView.liveOverlay = null;
+  state.liveView.hasConversationSnapshot = false;
+  state.liveView.hasConversationDelta = false;
+  state.liveView.backgroundAgents = [];
+  state.liveView.socket = null;
+  state.liveView.streamBuffer = "";
+  state.liveView.replayGuardActive = false;
+  state.liveView.replayGuardPrompt = "";
+  state.liveView.replayGuardUntil = 0;
+}
+
+function resetThreadView() {
+  state.threadView.sessionId = "";
+  state.threadView.meta = null;
+  state.threadView.threadId = "";
+  state.threadView.persistedSnapshot = null;
+  state.threadView.authoritativeSnapshot = null;
 }
 
 function parseHistoryRouteSessionId(value) {
@@ -121,6 +161,18 @@ function decorateSession(session) {
   };
 }
 
+function syncThreadViewFromInteraction() {
+  // liveOverlay should be cleared only by authoritative socket/state updates.
+}
+
+function getPreferredThreadSnapshot() {
+  return state.threadView.authoritativeSnapshot || state.threadView.persistedSnapshot || null;
+}
+
+function clearAuthoritativeThreadSnapshot() {
+  state.threadView.authoritativeSnapshot = null;
+}
+
 const groupedSessions = computed(() => {
   const sessionSorter = (left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt));
   const groups = new Map();
@@ -145,22 +197,13 @@ const groupedSessions = computed(() => {
     );
 });
 
-const activeSessionTitle = computed(() => {
-  if (!state.activeSessionMeta) {
-    return "会话";
-  }
-  const cached = sessionCache[cacheKey(state.activeSessionMeta)] || {};
-  return cached.title || state.activeSessionMeta.displayTitle || state.activeSessionMeta.name || "会话";
-});
-
-const activeWorkspaceName = computed(() => workspaceName(state.activeSessionMeta?.cwd || ""));
-const activeAssistantName = computed(() => state.activeSessionMeta?.providerLabel || "Codex");
 const routeHistoryTarget = computed(() => {
   if (route.name !== "chat") {
     return null;
   }
   return parseHistoryRouteSessionId(route.params.sessionId);
 });
+const routeThreadId = computed(() => String(routeHistoryTarget.value?.resumeSessionId || "").trim());
 const expectedThreadId = computed(() => {
   const target = routeHistoryTarget.value;
   if (!target || target.provider !== "codex") {
@@ -168,7 +211,66 @@ const expectedThreadId = computed(() => {
   }
   return target.resumeSessionId;
 });
-const activeThreadId = computed(() => String(state.activeSessionMeta?.resumeSessionId || "").trim());
+const interactiveThreadId = computed(() =>
+  String(state.liveView.sessionMeta?.resumeSessionId || state.threadView.threadId || "").trim()
+);
+const activeThreadId = computed(() => {
+  return routeThreadId.value || state.threadView.threadId || interactiveThreadId.value;
+});
+const displayedSessionMeta = computed(() => {
+  const preferredThreadSnapshot = getPreferredThreadSnapshot();
+  if (state.liveView.sessionMeta) {
+    return state.liveView.sessionMeta;
+  }
+  if (state.threadView.meta) {
+    return state.threadView.meta;
+  }
+  if (routeHistoryTarget.value) {
+    return {
+      id: state.threadView.sessionId || `history:${routeHistoryTarget.value.provider}:${routeHistoryTarget.value.resumeSessionId}`,
+      kind: "thread",
+      status: "saved",
+      provider: routeHistoryTarget.value.provider || "codex",
+      providerLabel: "Codex",
+      resumeSessionId: routeHistoryTarget.value.resumeSessionId || state.threadView.threadId || "",
+      cwd: preferredThreadSnapshot?.metadata?.cwd || "",
+      displayTitle: String(preferredThreadSnapshot?.metadata?.name || "").trim() || "会话",
+      displayPreview: String(preferredThreadSnapshot?.metadata?.preview || "").trim() || ""
+    };
+  }
+  return null;
+});
+const displayedThreadSnapshot = computed(() => {
+  return buildDisplayedThreadSnapshot({
+    persistedSnapshot: state.threadView.persistedSnapshot,
+    authoritativeSnapshot: state.threadView.authoritativeSnapshot,
+    liveConversation: state.liveView.conversation,
+    runtimeMessages: state.liveView.messages,
+    threadId: activeThreadId.value,
+    liveSessionMeta: state.liveView.sessionMeta,
+    threadMeta: state.threadView.meta
+  });
+});
+const displayedLiveOverlay = computed(() => {
+  return state.liveView.liveOverlay;
+});
+const activeSessionTitle = computed(() => {
+  if (displayedSessionMeta.value) {
+    const cached = sessionCache[cacheKey(displayedSessionMeta.value)] || {};
+    return (
+      cached.title ||
+      displayedSessionMeta.value.displayTitle ||
+      displayedSessionMeta.value.name ||
+      String(displayedThreadSnapshot.value?.metadata?.name || "").trim() ||
+      "会话"
+    );
+  }
+  return String(displayedThreadSnapshot.value?.metadata?.name || "").trim() || "会话";
+});
+const activeWorkspaceName = computed(() =>
+  workspaceName(displayedSessionMeta.value?.cwd || displayedThreadSnapshot.value?.metadata?.cwd || "")
+);
+const activeAssistantName = computed(() => displayedSessionMeta.value?.providerLabel || "Codex");
 const threadMismatch = computed(() => {
   if (!expectedThreadId.value) {
     return false;
@@ -178,12 +280,18 @@ const threadMismatch = computed(() => {
   }
   return expectedThreadId.value !== activeThreadId.value;
 });
-const canSend = computed(() => Boolean(composerDraft.value.trim()) && !state.loading);
+const canSend = computed(() => Boolean(composerDraft.value.trim()) && !state.loading && Boolean(activeThreadId.value || displayedSessionMeta.value));
+const canRenderChatView = computed(() => {
+  if (route.name !== "chat") {
+    return false;
+  }
+  return Boolean(displayedSessionMeta.value || displayedThreadSnapshot.value);
+});
 const canInterrupt = computed(() => {
   const socketReady =
-    Boolean(state.activeLiveSessionId) &&
-    Boolean(state.activeSocket) &&
-    state.activeSocket.readyState === WebSocket.OPEN;
+    Boolean(state.liveView.liveSessionId) &&
+    Boolean(state.liveView.socket) &&
+    state.liveView.socket.readyState === WebSocket.OPEN;
   if (!socketReady) {
     return false;
   }
@@ -193,10 +301,10 @@ const canInterrupt = computed(() => {
   if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
     return true;
   }
-  if (String(state.activeStreamBuffer || "").trim()) {
+  if (String(state.liveView.streamBuffer || "").trim()) {
     return true;
   }
-  const lastMessage = state.activeMessages[state.activeMessages.length - 1];
+  const lastMessage = state.liveView.messages[state.liveView.messages.length - 1];
   return Boolean(lastMessage?.role === "assistant" && lastMessage?.streaming);
 });
 
@@ -287,16 +395,11 @@ async function forceBackToLogin(statusMessage = "登录状态已失效，请重�
   state.loading = false;
   state.isAuthenticated = false;
   state.sessions = [];
-  state.activeSessionId = "";
-  state.activeLiveSessionId = "";
-  state.activeSessionMeta = null;
+  state.routeSessionId = "";
   state.pendingSessionId = "";
   composerDraft.value = "";
-  setMessages([]);
-  state.activeConversation = createConversationState();
-  state.hasConversationSnapshot = false;
-  state.hasConversationDelta = false;
-  setBackgroundAgents([]);
+  resetLiveView();
+  resetThreadView();
   setStatus(statusMessage);
   const savedToken = getSavedToken();
   state.accessToken = savedToken;
@@ -308,14 +411,47 @@ async function forceBackToLogin(statusMessage = "登录状态已失效，请重�
 }
 
 function setMessages(messages) {
-  state.activeMessages = messages.filter(
+  state.liveView.messages = messages.filter(
     (message) => message?.text || (message?.partType === "image" && String(message?.payload?.url || "").trim())
   );
-  rebuildReplaySuppressionLines(state.activeMessages);
+  rebuildReplaySuppressionLines(state.liveView.messages);
+  syncThreadViewFromInteraction();
 }
 
 function setBackgroundAgents(backgroundAgents = []) {
-  state.backgroundAgents = Array.isArray(backgroundAgents) ? backgroundAgents : [];
+  state.liveView.backgroundAgents = Array.isArray(backgroundAgents) ? backgroundAgents : [];
+}
+
+function setLiveOverlay(liveOverlay = null) {
+  state.liveView.liveOverlay = liveOverlay && typeof liveOverlay === "object" ? liveOverlay : null;
+}
+
+function setLiveThreadSnapshot(snapshot = null, liveOverlay = null) {
+  state.threadView.authoritativeSnapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
+  state.threadView.threadId = String(
+    snapshot?.threadId || state.threadView.threadId || state.threadView.persistedSnapshot?.threadId || ""
+  ).trim();
+  setLiveOverlay(liveOverlay);
+  syncThreadViewFromInteraction();
+}
+
+function payloadOwnsKey(payload, key) {
+  return Boolean(payload && Object.prototype.hasOwnProperty.call(payload, key));
+}
+
+function resolvePayloadValue(payload, key, fallback = null) {
+  if (payloadOwnsKey(payload, key)) {
+    return payload[key] ?? null;
+  }
+  return fallback;
+}
+
+function setThreadSnapshot(snapshot = null) {
+  state.threadView.persistedSnapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
+  state.threadView.threadId = String(
+    snapshot?.threadId || state.threadView.authoritativeSnapshot?.threadId || ""
+  ).trim();
+  syncThreadViewFromInteraction();
 }
 
 function collectConversationFallbackMessages(messages = []) {
@@ -326,7 +462,7 @@ function shouldApplyIncomingConversation(nextConversation, { force = false } = {
   if (force) {
     return true;
   }
-  const current = createConversationState(state.activeConversation);
+  const current = createConversationState(state.liveView.conversation);
   const incoming = createConversationState(nextConversation);
   if (incoming.sessionId && current.sessionId && incoming.sessionId !== current.sessionId) {
     return true;
@@ -351,13 +487,14 @@ function setConversation(conversation, { fallbackMessages = [], buffer = "", for
   if (!shouldApplyIncomingConversation(nextConversation, { force })) {
     return false;
   }
-  state.activeConversation = nextConversation;
-  setBackgroundAgents(state.activeConversation.backgroundAgents);
-  let nextMessages = buildTimelineMessagesFromConversation(state.activeConversation, fallbackMessages);
-  if (!state.activeConversation.turns.length && buffer) {
+  state.liveView.conversation = nextConversation;
+  setBackgroundAgents(state.liveView.conversation.backgroundAgents);
+  let nextMessages = buildTimelineMessagesFromConversation(state.liveView.conversation, fallbackMessages);
+  if (!state.liveView.conversation.turns.length && buffer) {
     nextMessages = reconcileTimelineWithSnapshotBuffer(nextMessages, buffer);
   }
   setMessages(nextMessages);
+  syncThreadViewFromInteraction();
   return true;
 }
 function buildSubmissionText(text) {
@@ -370,7 +507,11 @@ function buildSubmissionText(text) {
 }
 
 function bumpActiveSessionOpenToken() {
-  state.activeSessionOpenToken += 1;
+  if (state.liveView.liveSessionId) {
+    state.liveView.openToken += 1;
+    return;
+  }
+  state.threadView.openToken += 1;
 }
 
 function rebuildReplaySuppressionLines(messages) {
@@ -443,10 +584,10 @@ function pruneMessagePartNoise(value) {
 }
 
 function finalizeAssistantStream() {
-  if (!state.activeStreamBuffer) {
+  if (!state.liveView.streamBuffer) {
     return;
   }
-  const messages = [...state.activeMessages];
+  const messages = [...state.liveView.messages];
   const last = messages[messages.length - 1];
   if (last?.streaming) {
     last.streaming = false;
@@ -454,18 +595,18 @@ function finalizeAssistantStream() {
     if (!last.text) {
       messages.pop();
     }
-    state.activeMessages = messages;
+    setMessages(messages);
   }
-  state.activeStreamBuffer = "";
+  state.liveView.streamBuffer = "";
 }
 
 function discardPendingAssistantStream() {
-  state.activeStreamBuffer = "";
-  const messages = [...state.activeMessages];
+  state.liveView.streamBuffer = "";
+  const messages = [...state.liveView.messages];
   const last = messages[messages.length - 1];
   if (last?.role === "assistant" && last.streaming) {
     messages.pop();
-    state.activeMessages = messages;
+    setMessages(messages);
   }
 }
 
@@ -506,27 +647,27 @@ function appendAssistantChunk(chunk, { source = "normalized" } = {}) {
     setStatus("");
   }
 
-  const previousBuffer = normalizeLine(state.activeStreamBuffer || "");
+  const previousBuffer = normalizeLine(state.liveView.streamBuffer || "");
   if (!previousBuffer) {
-    state.activeStreamBuffer = normalized;
+    state.liveView.streamBuffer = normalized;
   } else if (normalized === previousBuffer) {
-    state.activeStreamBuffer = previousBuffer;
+    state.liveView.streamBuffer = previousBuffer;
   } else if (normalized.startsWith(previousBuffer)) {
     // Some providers resend the whole current draft instead of a pure delta.
-    state.activeStreamBuffer = normalized;
+    state.liveView.streamBuffer = normalized;
   } else if (previousBuffer.startsWith(normalized) && normalized.length >= 24) {
     // Ignore shorter stale snapshots that would make the visible reply jump backwards.
-    state.activeStreamBuffer = previousBuffer;
+    state.liveView.streamBuffer = previousBuffer;
   } else {
-    state.activeStreamBuffer = `${state.activeStreamBuffer}${normalized}`;
+    state.liveView.streamBuffer = `${state.liveView.streamBuffer}${normalized}`;
   }
-  let mergedText = sanitizeAssistantText(normalizeLine(state.activeStreamBuffer));
-  const lastUserMessage = [...state.activeMessages].reverse().find((message) => message.role === "user")?.text || "";
+  let mergedText = sanitizeAssistantText(normalizeLine(state.liveView.streamBuffer));
+  const lastUserMessage = [...state.liveView.messages].reverse().find((message) => message.role === "user")?.text || "";
   if (lastUserMessage && mergedText.startsWith(lastUserMessage)) {
     const tail = mergedText.slice(lastUserMessage.length).trim();
     if (!tail || /^[>›)\]}\-_=:.~|/\\\dA-Za-z]{1,24}$/.test(tail)) {
       mergedText = "";
-      state.activeStreamBuffer = "";
+      state.liveView.streamBuffer = "";
     }
   }
   if (!mergedText || isDisposableAssistantFragment(mergedText)) {
@@ -536,7 +677,7 @@ function appendAssistantChunk(chunk, { source = "normalized" } = {}) {
     return;
   }
 
-  const messages = [...state.activeMessages];
+  const messages = [...state.liveView.messages];
   const last = messages[messages.length - 1];
   if (last?.role === "assistant" && last.streaming) {
     last.text = mergedText;
@@ -548,7 +689,7 @@ function appendAssistantChunk(chunk, { source = "normalized" } = {}) {
       })
     );
   }
-  state.activeMessages = messages;
+  setMessages(messages);
 }
 
 function appendNormalizedParts(parts = []) {
@@ -557,7 +698,7 @@ function appendNormalizedParts(parts = []) {
     return;
   }
 
-  let messages = [...state.activeMessages];
+  let messages = [...state.liveView.messages];
   let touched = false;
   let hasStreamingUpdate = false;
 
@@ -665,12 +806,12 @@ function appendNormalizedParts(parts = []) {
   }
 
   if (touched) {
-    // Streaming chunks mutate `state.activeMessages` in appendAssistantChunk.
+    // Streaming chunks mutate `liveView.messages` in appendAssistantChunk.
     // If we always overwrite with the stale local `messages`, live text disappears until refresh.
     if (hasStreamingUpdate) {
-      messages = [...state.activeMessages];
+      messages = [...state.liveView.messages];
     }
-    state.activeMessages = messages;
+    setMessages(messages);
   }
 }
 
@@ -681,7 +822,7 @@ function clearPendingReplyStatus() {
 }
 
 async function hydrateSession(session, { includeMessages = false, silent = false, forceRefresh = false } = {}) {
-  if (!session || session.kind !== "history" || !session.resumeSessionId) {
+  if (!session || session.kind === "live" || !session.resumeSessionId) {
     return null;
   }
 
@@ -714,6 +855,8 @@ async function hydrateSession(session, { includeMessages = false, silent = false
         conversation: createConversationState({
           threadId: String(session?.resumeSessionId || "")
         }),
+        threadSnapshot: null,
+        liveOverlay: null,
         session: null
       };
       sessionCache[key] = { ...(sessionCache[key] || {}), ...nextValue };
@@ -730,7 +873,18 @@ async function hydrateSession(session, { includeMessages = false, silent = false
     });
     const title = String(payload.session?.name || session.name || fallbackTitleForSession(session)).trim() || fallbackTitleForSession(session);
     const preview = String(payload.session?.inputPreview || session.inputPreview || fallbackPreviewForSession(session)).trim() || fallbackPreviewForSession(session);
-    const nextValue = { hydrated: true, title, preview, messages, turns, backgroundAgents, conversation, session: payload.session || null };
+    const nextValue = {
+      hydrated: true,
+      title,
+      preview,
+      messages,
+      turns,
+      backgroundAgents,
+      conversation,
+      threadSnapshot: payload.threadSnapshot || null,
+      liveOverlay: payload.liveOverlay || null,
+      session: payload.session || null
+    };
     sessionCache[key] = { ...(sessionCache[key] || {}), ...nextValue };
     return sessionCache[key];
   })();
@@ -772,27 +926,38 @@ function stopHistorySyncLoop() {
   }
 }
 
-function currentHistorySyncTarget() {
+function currentThreadSyncTarget() {
+  if (
+    !shouldSyncPersistedThread({
+      routeThreadId: routeThreadId.value,
+      threadMeta: state.threadView.meta,
+      liveSessionId: state.liveView.liveSessionId,
+      liveSessionMeta: state.liveView.sessionMeta,
+      hasAuthoritativeLiveData: Boolean(state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta)
+    })
+  ) {
+    return null;
+  }
   const routeTarget = routeHistoryTarget.value;
   if (routeTarget) {
     return {
-      id: `history:${routeTarget.provider}:${routeTarget.resumeSessionId}`,
-      kind: "history",
+      id: `thread:${routeTarget.provider}:${routeTarget.resumeSessionId}`,
+      kind: "thread",
       status: "saved",
       provider: routeTarget.provider,
       resumeSessionId: routeTarget.resumeSessionId,
-      name: state.activeSessionMeta?.name || "历史会话",
-      cwd: state.activeSessionMeta?.cwd || ""
+      name: state.threadView.meta?.name || "会话",
+      cwd: state.threadView.meta?.cwd || ""
     };
   }
-  if (state.activeSessionMeta?.kind === "history" && state.activeSessionMeta?.resumeSessionId) {
-    return state.activeSessionMeta;
+  if (state.threadView.meta?.resumeSessionId) {
+    return state.threadView.meta;
   }
   return null;
 }
 
-async function syncActiveHistorySession({ silent = true } = {}) {
-  const target = currentHistorySyncTarget();
+async function syncActiveThreadSession({ silent = true } = {}) {
+  const target = currentThreadSyncTarget();
   if (!target?.resumeSessionId) {
     return false;
   }
@@ -806,20 +971,17 @@ async function syncActiveHistorySession({ silent = true } = {}) {
     return false;
   }
 
-  const nextConversation = buildConversationStateFromPayload(hydrated.conversation || {}, {
-    sessionId: state.activeConversation.sessionId || "",
-    threadId: String(target.resumeSessionId || ""),
-    turns: hydrated.turns || [],
-    backgroundAgents: hydrated.backgroundAgents || []
-  });
-
-  const applied = setConversation(nextConversation, { force: false });
-  if (state.activeSessionMeta && target.resumeSessionId === state.activeSessionMeta.resumeSessionId) {
-    state.activeSessionMeta = {
-      ...state.activeSessionMeta,
-      displayTitle: hydrated.title || state.activeSessionMeta.displayTitle,
-      displayPreview: hydrated.preview || state.activeSessionMeta.displayPreview,
-      cwd: hydrated?.session?.cwd || state.activeSessionMeta.cwd || ""
+  const nextThreadSnapshot = hydrated.threadSnapshot || null;
+  const applied = JSON.stringify(state.threadView.persistedSnapshot || null) !== JSON.stringify(nextThreadSnapshot || null);
+  if (applied) {
+    setThreadSnapshot(nextThreadSnapshot);
+  }
+  if (state.threadView.meta && target.resumeSessionId === state.threadView.meta.resumeSessionId) {
+    state.threadView.meta = {
+      ...state.threadView.meta,
+      displayTitle: hydrated.title || state.threadView.meta.displayTitle,
+      displayPreview: hydrated.preview || state.threadView.meta.displayPreview,
+      cwd: hydrated?.session?.cwd || state.threadView.meta.cwd || ""
     };
   }
   return applied;
@@ -834,10 +996,10 @@ function startHistorySyncLoop() {
     if (!state.ready || !state.isAuthenticated || route.name !== "chat") {
       return;
     }
-    if (!currentHistorySyncTarget()) {
+    if (!currentThreadSyncTarget()) {
       return;
     }
-    syncActiveHistorySession({ silent: true }).catch(() => {});
+    syncActiveThreadSession({ silent: true }).catch(() => {});
   }, 4000);
 }
 
@@ -934,13 +1096,13 @@ async function handleLogin({ silent = false, auto = false } = {}) {
 
 function closeSocket() {
   clearSubmitFallbackTimer();
-  if (state.activeSocket) {
-    state.activeSocket.close();
-    state.activeSocket = null;
+  if (state.liveView.socket) {
+    state.liveView.socket.close();
+    state.liveView.socket = null;
   }
 }
 
-function waitForSocketOpen(socket, timeoutMs = 4000) {
+function waitForSocketOpen(socket, timeoutMs = 20000) {
   if (socket.readyState === WebSocket.OPEN) {
     return Promise.resolve();
   }
@@ -982,12 +1144,12 @@ function waitForSocketOpen(socket, timeoutMs = 4000) {
 function attachLiveSocket(sessionId) {
   closeSocket();
   finalizeAssistantStream();
-  state.activeLiveSessionId = sessionId;
-  state.activeStreamBuffer = "";
-  state.hasConversationSnapshot = false;
-  state.hasConversationDelta = false;
+  state.liveView.liveSessionId = sessionId;
+  state.liveView.streamBuffer = "";
+  state.liveView.hasConversationSnapshot = false;
+  state.liveView.hasConversationDelta = false;
   const socket = new WebSocket(resolveWsUrl(sessionId));
-  state.activeSocket = socket;
+  state.liveView.socket = socket;
 
   socket.addEventListener("message", (event) => {
     let payload;
@@ -998,61 +1160,76 @@ function attachLiveSocket(sessionId) {
     }
 
     if (payload.type === "conversation.snapshot") {
-      const applied = setConversation(buildConversationStateFromPayload(payload, state.activeConversation), {
-        fallbackMessages: collectConversationFallbackMessages(state.activeMessages),
+      const applied = setConversation(buildConversationStateFromPayload(payload, state.liveView.conversation), {
+        fallbackMessages: collectConversationFallbackMessages(state.liveView.messages),
         buffer: payload?.buffer || ""
       });
+      setLiveThreadSnapshot(payload?.threadSnapshot || null, payload?.liveOverlay || null);
       if (applied) {
-        state.hasConversationSnapshot = true;
+        state.liveView.hasConversationSnapshot = true;
       }
       return;
     }
 
     if (payload.type === "conversation.delta") {
       clearPendingReplyStatus();
-      const applied = applyConversationDeltaPayload(state.activeConversation, payload);
+      const applied = applyConversationDeltaPayload(state.liveView.conversation, payload);
       const updated = setConversation(applied.conversation, {
-        fallbackMessages: collectConversationFallbackMessages(state.activeMessages)
+        fallbackMessages: collectConversationFallbackMessages(state.liveView.messages)
       });
+      setLiveThreadSnapshot(
+        resolvePayloadValue(payload, "threadSnapshot", state.threadView.authoritativeSnapshot || state.threadView.persistedSnapshot),
+        resolvePayloadValue(payload, "liveOverlay", state.liveView.liveOverlay)
+      );
       if (updated) {
-        state.hasConversationSnapshot = true;
-        state.hasConversationDelta = true;
+        state.liveView.hasConversationSnapshot = true;
+        state.liveView.hasConversationDelta = true;
       }
       return;
     }
 
     if (payload.type === "snapshot") {
-      if (state.hasConversationSnapshot || state.hasConversationDelta) {
+      if (state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta) {
         return;
       }
-      const applied = setConversation(buildConversationStateFromPayload(payload, state.activeConversation), {
-        fallbackMessages: state.activeMessages,
+      const applied = setConversation(buildConversationStateFromPayload(payload, state.liveView.conversation), {
+        fallbackMessages: state.liveView.messages,
         buffer: payload?.buffer || ""
       });
+      setLiveThreadSnapshot(payload?.threadSnapshot || null, payload?.liveOverlay || null);
       if (applied) {
-        state.hasConversationSnapshot = true;
+        state.liveView.hasConversationSnapshot = true;
       }
       return;
     }
 
     if (payload.type === "conversation_snapshot") {
-      if (state.hasConversationSnapshot || state.hasConversationDelta) {
+      if (state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta) {
         return;
       }
-      const applied = setConversation(buildConversationStateFromPayload(payload, state.activeConversation), {
-        fallbackMessages: state.activeMessages
+      const applied = setConversation(buildConversationStateFromPayload(payload, state.liveView.conversation), {
+        fallbackMessages: state.liveView.messages
       });
+      setLiveThreadSnapshot(payload?.threadSnapshot || null, payload?.liveOverlay || null);
       if (applied) {
-        state.hasConversationSnapshot = true;
+        state.liveView.hasConversationSnapshot = true;
       }
       return;
     }
 
     if (payload.type === "session_updated" && payload.session) {
       const updated = decorateSession(payload.session);
-      state.activeSessionMeta = updated;
-      if (state.activeSessionId === updated.id) {
-        state.activeLiveSessionId = updated.id;
+      state.liveView.sessionMeta = updated;
+      if (state.liveView.sessionId === updated.id) {
+        state.liveView.liveSessionId = updated.id;
+      }
+      if (state.threadView.threadId && String(updated.resumeSessionId || "").trim() === state.threadView.threadId) {
+        state.threadView.meta = {
+          ...(state.threadView.meta || {}),
+          ...updated,
+          kind: "thread",
+          id: state.threadView.sessionId || `history:${updated.provider}:${updated.resumeSessionId}`
+        };
       }
       const index = state.sessions.findIndex((item) => item.id === updated.id);
       if (index >= 0) {
@@ -1064,40 +1241,40 @@ function attachLiveSocket(sessionId) {
     }
 
     if (payload.type === "data") {
-      if (state.hasConversationDelta) {
+      if (state.liveView.hasConversationDelta) {
         return;
       }
       if (payload.data && String(payload.data).trim()) {
         clearPendingReplyStatus();
       }
-      appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
+      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
       return;
     }
 
     if (payload.type === "message_part") {
-      if (state.hasConversationDelta) {
+      if (state.liveView.hasConversationDelta) {
         return;
       }
       if (payload?.part?.type === "text" && String(payload?.part?.text || "").trim()) {
         clearPendingReplyStatus();
       }
-      appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
+      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
       return;
     }
 
     if (payload.type === "event_msg") {
-      if (state.hasConversationDelta) {
+      if (state.liveView.hasConversationDelta) {
         return;
       }
-      appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
+      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
       return;
     }
 
     if (payload.type === "response_item") {
-      if (state.hasConversationDelta) {
+      if (state.liveView.hasConversationDelta) {
         return;
       }
-      appendNormalizedParts(normalizeServerPayload(payload, state.activeSessionId));
+      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
       return;
     }
 
@@ -1137,8 +1314,8 @@ function attachLiveSocket(sessionId) {
   });
 
   socket.addEventListener("close", () => {
-    if (state.activeSocket === socket) {
-      state.activeSocket = null;
+    if (state.liveView.socket === socket) {
+      state.liveView.socket = null;
     }
     finalizeAssistantStream();
     if (state.statusText === "已发送中断指令。") {
@@ -1163,22 +1340,37 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
   stopHistorySyncLoop();
   state.pendingSessionId = session.id;
   setStatus("正在连接会话…");
-  state.activeSessionId = session.id;
+  state.routeSessionId = session.id;
   const decorated = decorateSession(session);
-  state.activeSessionMeta = decorated;
-  bumpActiveSessionOpenToken();
-  if (!skipRoute && route.name !== "chat") {
+  state.liveView.sessionId = session.id;
+  state.liveView.sessionMeta = decorated;
+  if (session.resumeSessionId) {
+    clearAuthoritativeThreadSnapshot();
+    state.threadView.threadId = String(session.resumeSessionId || "").trim();
+    state.threadView.meta = {
+      ...decorated,
+      kind: "thread",
+      id: `history:${session.provider}:${session.resumeSessionId}`
+    };
+    state.threadView.sessionId = `history:${session.provider}:${session.resumeSessionId}`;
+  } else {
+    resetThreadView();
+    setThreadSnapshot(null);
+  }
+  state.liveView.openToken += 1;
+  if (!skipRoute && (route.name !== "chat" || String(route.params.sessionId || "").trim() !== session.id)) {
     await router.push({ name: "chat", params: { sessionId: session.id } });
   }
   composerDraft.value = "";
-  state.replayGuardActive = false;
-  state.replayGuardPrompt = "";
-  state.replayGuardUntil = 0;
+  state.liveView.replayGuardActive = false;
+  state.liveView.replayGuardPrompt = "";
+  state.liveView.replayGuardUntil = 0;
   // Refresh auth/config before WebSocket connect to avoid stale cookie + fresh process mismatch.
   await bootstrapWorkspace({ includeSessions: false });
-  let historyMessages = [];
   let historyTurns = [];
   let historyAgents = [];
+  let historyThreadSnapshot = null;
+  let historyLiveOverlay = null;
   let historyConversation = createConversationState({
     sessionId: session.id,
     threadId: String(session.resumeSessionId || "")
@@ -1187,13 +1379,12 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
     const hydrated = await hydrateSession(
       {
         ...session,
-        id: `history:${session.provider}:${session.resumeSessionId}`,
-        kind: "history",
+        id: `thread:${session.provider}:${session.resumeSessionId}`,
+        kind: "thread",
         status: "saved"
       },
       { includeMessages: true, silent: true, forceRefresh: true }
     );
-    historyMessages = hydrated?.messages || [];
     historyTurns = hydrated?.turns || [];
     historyAgents = hydrated?.backgroundAgents || [];
     historyConversation = buildConversationStateFromPayload(hydrated?.conversation || {}, {
@@ -1202,111 +1393,90 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
       turns: historyTurns,
       backgroundAgents: historyAgents
     });
+    historyThreadSnapshot = hydrated?.threadSnapshot || null;
+    historyLiveOverlay = hydrated?.liveOverlay || null;
     if (hydrated?.session) {
-      state.activeSessionMeta = {
-        ...state.activeSessionMeta,
-        displayTitle: hydrated.title || state.activeSessionMeta.displayTitle,
-        displayPreview: hydrated.preview || state.activeSessionMeta.displayPreview,
-        cwd: hydrated.session.cwd || state.activeSessionMeta.cwd || ""
+      state.liveView.sessionMeta = {
+        ...state.liveView.sessionMeta,
+        displayTitle: hydrated.title || state.liveView.sessionMeta.displayTitle,
+        displayPreview: hydrated.preview || state.liveView.sessionMeta.displayPreview,
+        cwd: hydrated.session.cwd || state.liveView.sessionMeta.cwd || ""
       };
     }
   }
   setConversation(historyConversation, {
     force: true
   });
+  setThreadSnapshot(historyThreadSnapshot);
+  setLiveOverlay(historyLiveOverlay);
   await attachLiveSocket(session.id);
   setStatus("");
   state.pendingSessionId = "";
 }
 
-async function openHistoricalSession(session, { skipRoute = false } = {}) {
-  closeSocket();
+async function openThreadSession(session, { skipRoute = false } = {}) {
   stopHistorySyncLoop();
-  finalizeAssistantStream();
   state.pendingSessionId = session.id;
   setStatus("正在加载会话…");
   const decorated = decorateSession(session);
   const hydrated = await hydrateSession(session, { includeMessages: true, forceRefresh: true });
-  const historyMessages = hydrated?.messages || [];
-  const historyTurns = hydrated?.turns || [];
-  const historyAgents = hydrated?.backgroundAgents || [];
-  let historyConversation = buildConversationStateFromPayload(hydrated?.conversation || {}, {
-    sessionId: "",
-    threadId: String(session.resumeSessionId || ""),
-    turns: historyTurns,
-    backgroundAgents: historyAgents
-  });
-  const reusableLive = state.sessions
-    .filter(
-      (item) =>
-        item.kind === "live" &&
-        item.status !== "exited" &&
-        String(item.provider || "").trim().toLowerCase() === String(session.provider || "").trim().toLowerCase() &&
-        String(item.resumeSessionId || "").trim() === String(session.resumeSessionId || "").trim()
-    )
-    .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
-  if (reusableLive?.id) {
-    try {
-      const livePayload = await requestConversationSnapshotBySessionId(reusableLive.id);
-      const liveConversation = buildConversationStateFromPayload(livePayload || {}, historyConversation);
-      if (
-        Number(liveConversation.version || 0) > Number(historyConversation.version || 0) ||
-        (liveConversation.turns?.length || 0) > (historyConversation.turns?.length || 0)
-      ) {
-        historyConversation = liveConversation;
-      }
-    } catch {
-      // Keep historical snapshot if live conversation lookup fails.
-    }
+  let historyThreadSnapshot = hydrated?.threadSnapshot || null;
+  const targetThreadId = String(session.resumeSessionId || "").trim();
+  const keepInteractiveState = targetThreadId && interactiveThreadId.value === targetThreadId;
+
+  if (!keepInteractiveState) {
+    closeSocket();
+    finalizeAssistantStream();
+    resetLiveView();
+    clearAuthoritativeThreadSnapshot();
   }
 
-  state.activeSessionId = session.id;
-  state.activeSessionMeta = {
+  state.routeSessionId = session.id;
+  state.threadView.sessionId = session.id;
+  state.threadView.threadId = targetThreadId;
+  state.threadView.meta = {
     ...decorated,
+    kind: "thread",
     cwd: hydrated?.session?.cwd || decorated.cwd || "",
     displayTitle: hydrated?.title || decorated.displayTitle,
     displayPreview: hydrated?.preview || decorated.displayPreview
   };
-  bumpActiveSessionOpenToken();
-  if (!skipRoute && route.name !== "chat") {
+  state.threadView.openToken += 1;
+  if (!skipRoute && (route.name !== "chat" || String(route.params.sessionId || "").trim() !== session.id)) {
     await router.push({ name: "chat", params: { sessionId: session.id } });
   }
   composerDraft.value = "";
-  state.replayGuardActive = false;
-  state.replayGuardPrompt = "";
-  state.replayGuardUntil = 0;
-  setConversation(historyConversation, {
-    force: true
-  });
-  state.activeLiveSessionId = "";
-  startHistorySyncLoop();
+  setThreadSnapshot(historyThreadSnapshot);
+  if (!keepInteractiveState) {
+    startHistorySyncLoop();
+    setLiveOverlay(null);
+  }
   setStatus("");
   state.pendingSessionId = "";
 }
 
 async function openSessionItem(session, { skipRoute = false } = {}) {
   try {
-    if (session.kind === "history") {
-      const historySession =
-        session.kind === "history"
-          ? session
-          : {
-              ...session,
-              id: `history:${session.provider}:${session.resumeSessionId}`,
-              kind: "history",
-              status: "saved"
-            };
-      await openHistoricalSession(historySession, { skipRoute });
+    if (session?.resumeSessionId) {
+      await openThreadSession(
+        {
+          ...decorateSession(session),
+          id: `history:${session.provider}:${session.resumeSessionId}`,
+          kind: "thread",
+          status: session.status || "saved"
+        },
+        { skipRoute }
+      );
       return;
     }
     await openLiveSession(session, { skipRoute });
   } catch (error) {
     if (session.kind === "live" && session.resumeSessionId) {
       try {
-        await openHistoricalSession({
+      await openThreadSession({
           ...session,
           id: `history:${session.provider}:${session.resumeSessionId}`,
-          kind: "history",
+          kind: "thread",
           status: "saved"
         }, { skipRoute });
         setStatus("已切换到该会话的历史记录。");
@@ -1353,20 +1523,43 @@ async function createSessionInGroup(group) {
 }
 
 async function ensureLiveSession() {
-  if (state.activeLiveSessionId && state.activeSocket && state.activeSocket.readyState === WebSocket.OPEN) {
-    return state.activeLiveSessionId;
+  if (state.liveView.liveSessionId && state.liveView.socket && state.liveView.socket.readyState === WebSocket.OPEN) {
+    return state.liveView.liveSessionId;
   }
-  if (!state.activeSessionMeta) {
+  if (!state.liveView.sessionMeta) {
+    const preferredThreadSnapshot = getPreferredThreadSnapshot();
+    const continuationSeed =
+      state.threadView.meta ||
+      (routeHistoryTarget.value
+        ? {
+            id: `history:${routeHistoryTarget.value.provider}:${routeHistoryTarget.value.resumeSessionId}`,
+            kind: "thread",
+            provider: routeHistoryTarget.value.provider,
+            providerLabel: "Codex",
+            resumeSessionId: routeHistoryTarget.value.resumeSessionId,
+            cwd: preferredThreadSnapshot?.metadata?.cwd || "",
+            displayTitle:
+              String(preferredThreadSnapshot?.metadata?.name || "").trim() || "会话",
+            displayPreview: String(preferredThreadSnapshot?.metadata?.preview || "").trim() || ""
+          }
+        : null);
+    if (continuationSeed?.resumeSessionId) {
+      state.liveView.sessionMeta = {
+        ...continuationSeed,
+        kind: "thread"
+      };
+    }
+  }
+  if (!state.liveView.sessionMeta) {
     throw new Error("当前没有可继续的会话");
   }
-
-  if (state.activeSessionMeta.kind === "live") {
-    await attachLiveSocket(state.activeSessionMeta.id);
-    return state.activeSessionMeta.id;
+  if (state.liveView.sessionMeta.kind === "live") {
+    await attachLiveSocket(state.liveView.sessionMeta.id);
+    return state.liveView.sessionMeta.id;
   }
 
-  const resumeSessionId = String(state.activeSessionMeta.resumeSessionId || "").trim();
-  const provider = String(state.activeSessionMeta.provider || "").trim().toLowerCase();
+  const resumeSessionId = String(state.liveView.sessionMeta.resumeSessionId || "").trim();
+  const provider = String(state.liveView.sessionMeta.provider || "").trim().toLowerCase();
   if (resumeSessionId && provider) {
     const reusable = state.sessions
       .filter(
@@ -1378,8 +1571,9 @@ async function ensureLiveSession() {
       )
       .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
     if (reusable) {
-      state.activeSessionMeta = decorateSession(reusable);
-      state.activeLiveSessionId = reusable.id;
+      state.liveView.sessionMeta = decorateSession(reusable);
+      state.liveView.liveSessionId = reusable.id;
+      stopHistorySyncLoop();
       await attachLiveSocket(reusable.id);
       return reusable.id;
     }
@@ -1388,29 +1582,31 @@ async function ensureLiveSession() {
   const resumed = await request("/api/sessions", {
     method: "POST",
     body: JSON.stringify({
-      provider: state.activeSessionMeta.provider,
-      cwd: state.activeSessionMeta.cwd,
-      name: state.activeSessionMeta.displayTitle || state.activeSessionMeta.name,
-      resumeSessionId: state.activeSessionMeta.resumeSessionId
+      provider: state.liveView.sessionMeta.provider,
+      cwd: state.liveView.sessionMeta.cwd,
+      name: state.liveView.sessionMeta.displayTitle || state.liveView.sessionMeta.name,
+      resumeSessionId: state.liveView.sessionMeta.resumeSessionId
     })
   });
 
-  state.activeSessionMeta = {
-    ...state.activeSessionMeta,
+  state.liveView.sessionMeta = {
+    ...state.liveView.sessionMeta,
     id: resumed.session.id,
     kind: "live",
     status: resumed.session.status,
     updatedAt: resumed.session.updatedAt
   };
-  state.activeLiveSessionId = resumed.session.id;
-  await refreshSessions();
+  state.liveView.sessionId = resumed.session.id;
+  state.liveView.liveSessionId = resumed.session.id;
+  stopHistorySyncLoop();
   await attachLiveSocket(resumed.session.id);
+  refreshSessions().catch(() => {});
   setStatus("正在恢复会话上下文…");
-  state.replayGuardActive = true;
-  state.replayGuardUntil = Date.now() + 20_000;
+  state.liveView.replayGuardActive = true;
+  state.liveView.replayGuardUntil = Date.now() + 20_000;
   await wait(1800);
   discardPendingAssistantStream();
-  state.activeStreamBuffer = "";
+  state.liveView.streamBuffer = "";
   return resumed.session.id;
 }
 
@@ -1429,17 +1625,26 @@ async function submitInput() {
   }
   state.lastSubmitText = submissionText;
   state.lastSubmitAt = now;
+  const optimisticUserMessage = createMessage("user", submissionText, new Date().toISOString(), {
+    source: "draft",
+    partType: "text",
+    payload: {}
+  });
 
   try {
     state.loading = true;
     setStatus("正在发送…");
+    stopHistorySyncLoop();
     if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
       throw new Error(
         `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。请返回列表后重新打开该会话。`
       );
     }
+    rebuildReplaySuppressionLines([...state.liveView.messages, optimisticUserMessage]);
+    setMessages([...state.liveView.messages, optimisticUserMessage]);
+    composerDraft.value = "";
     await ensureLiveSession();
-    if (!state.activeSocket || state.activeSocket.readyState !== WebSocket.OPEN) {
+    if (!state.liveView.socket || state.liveView.socket.readyState !== WebSocket.OPEN) {
       throw new Error("会话连接还没准备好，请重试一次");
     }
     if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
@@ -1448,19 +1653,22 @@ async function submitInput() {
       );
     }
     finalizeAssistantStream();
-    state.activeSocket.send(JSON.stringify({ type: "input", data: `${submissionText}\n` }));
+    state.liveView.socket.send(JSON.stringify({ type: "input", data: `${submissionText}\n` }));
     clearSubmitFallbackTimer();
-    if (state.replayGuardActive) {
-      state.replayGuardPrompt = submissionText;
+    if (state.liveView.replayGuardActive) {
+      state.liveView.replayGuardPrompt = submissionText;
     }
-    rebuildReplaySuppressionLines([...state.activeMessages, createMessage("user", submissionText, new Date().toISOString())]);
-    setMessages([
-      ...state.activeMessages,
-      createMessage("user", submissionText, new Date().toISOString(), { source: "draft", partType: "text", payload: {} })
-    ]);
-    composerDraft.value = "";
     setStatus("等待 Codex 回复…");
   } catch (error) {
+    if (String(composerDraft.value || "").trim() === "") {
+      composerDraft.value = submissionText;
+    }
+    setMessages(
+      state.liveView.messages.filter((message) => String(message.id || "") !== String(optimisticUserMessage.id || ""))
+    );
+    if (!state.liveView.liveSessionId) {
+      startHistorySyncLoop();
+    }
     setStatus(error.message || String(error));
   } finally {
     state.loading = false;
@@ -1469,13 +1677,13 @@ async function submitInput() {
 
 function interruptActiveSession() {
   clearSubmitFallbackTimer();
-  if (!state.activeSocket || state.activeSocket.readyState !== WebSocket.OPEN) {
+  if (!state.liveView.socket || state.liveView.socket.readyState !== WebSocket.OPEN) {
     setStatus("当前没有可中断的运行流程。");
     return;
   }
 
   try {
-    state.activeSocket.send(JSON.stringify({ type: "input", data: "\u001b" }));
+    state.liveView.socket.send(JSON.stringify({ type: "input", data: "\u001b" }));
     setStatus("已发送中断指令。");
   } catch (error) {
     setStatus(error.message || String(error));
@@ -1487,18 +1695,10 @@ async function backToList() {
   closeSocket();
   stopHistorySyncLoop();
   finalizeAssistantStream();
-  state.replayGuardActive = false;
-  state.replayGuardPrompt = "";
-  state.replayGuardUntil = 0;
-  state.activeSessionId = "";
-  state.activeLiveSessionId = "";
-  state.activeSessionMeta = null;
+  state.routeSessionId = "";
   composerDraft.value = "";
-  setMessages([]);
-  state.activeConversation = createConversationState();
-  state.hasConversationSnapshot = false;
-  state.hasConversationDelta = false;
-  setBackgroundAgents([]);
+  resetLiveView();
+  resetThreadView();
   if (route.name !== "sessions") {
     await router.push({ name: "sessions" });
   }
@@ -1562,23 +1762,27 @@ watch(
     return;
   }
 
-  if (syncingRouteOpen || state.activeSessionId === targetSessionId) {
+  const historyTarget = parseHistoryRouteSessionId(targetSessionId);
+
+  if (
+    syncingRouteOpen ||
+    (state.routeSessionId === targetSessionId &&
+      (!historyTarget || Boolean(state.threadView.meta) || Boolean(state.liveView.liveSessionId)))
+  ) {
     return;
   }
-
-  const historyTarget = parseHistoryRouteSessionId(targetSessionId);
   if (historyTarget) {
     syncingRouteOpen = true;
     try {
-      await openHistoricalSession(
+      await openThreadSession(
         {
           id: targetSessionId,
-          kind: "history",
+          kind: "thread",
           status: "saved",
           provider: historyTarget.provider,
           resumeSessionId: historyTarget.resumeSessionId,
-          name: "历史会话",
-          cwd: state.activeSessionMeta?.cwd || ""
+          name: "会话",
+          cwd: state.liveView.sessionMeta?.cwd || state.threadView.meta?.cwd || ""
         },
         { skipRoute: true }
       );
@@ -1606,6 +1810,14 @@ watch(
     return;
   }
 
+    if (session.resumeSessionId) {
+      const threadRouteId = `history:${session.provider}:${session.resumeSessionId}`;
+      if (targetSessionId !== threadRouteId) {
+        await router.replace({ name: "chat", params: { sessionId: threadRouteId } });
+        return;
+      }
+    }
+
     syncingRouteOpen = true;
     try {
       await openSessionItem(session, { skipRoute: true });
@@ -1622,25 +1834,23 @@ onMounted(async () => {
   };
   window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
   state.authExpiredHandler = handleAuthExpired;
-  try {
-    const savedToken = getSavedToken();
-    if (savedToken) {
-      state.accessToken = savedToken;
-      state.rememberToken = true;
-    }
-    await bootstrapWorkspace({ includeSessions: route.name !== "chat" });
-    state.isAuthenticated = true;
-  } catch {
-    state.isAuthenticated = false;
-    const savedToken = getSavedToken();
-    if (savedToken && !autoLoginTried) {
+  const next = await resolveInitialAuthBootstrap({
+    savedToken: getSavedToken(),
+    autoLoginTried,
+    requestAuthSession,
+    bootstrapWorkspace,
+    handleAutoLogin: async (token) => {
       autoLoginTried = true;
-      state.accessToken = savedToken;
+      state.accessToken = token;
       await handleLogin({ auto: true });
-    }
-  } finally {
-    state.ready = true;
-  }
+    },
+    routeName: String(route.name || "")
+  });
+  state.accessToken = next.accessToken;
+  state.rememberToken = next.rememberToken;
+  state.isAuthenticated = next.isAuthenticated;
+  autoLoginTried = next.autoLoginTried;
+  state.ready = next.ready;
 });
 
 onBeforeUnmount(() => {
@@ -1656,7 +1866,24 @@ if (typeof window !== 'undefined') {
   window.__codexWebDebug = {
     state,
     groupedSessions,
-    composerDraft
+    composerDraft,
+    computed: {
+      get routeName() {
+        return route.name;
+      },
+      get routeSessionId() {
+        return route.params.sessionId;
+      },
+      get routeHistoryTarget() {
+        return routeHistoryTarget.value;
+      },
+      get canSend() {
+        return canSend.value;
+      },
+      get canRenderChatView() {
+        return canRenderChatView.value;
+      }
+    }
   };
 }
 </script>
@@ -1686,7 +1913,7 @@ if (typeof window !== 'undefined') {
 
         <SessionListView
           :groups="groupedSessions"
-          :active-session-id="state.activeSessionId"
+          :active-session-id="state.routeSessionId"
           :pending-session-id="state.pendingSessionId"
           :format-relative-time="formatRelativeTime"
           @open="openSessionItem"
@@ -1697,17 +1924,17 @@ if (typeof window !== 'undefined') {
       </section>
 
       <ChatView
-        v-else-if="route.name === 'chat' && state.activeSessionMeta"
-        :session-key="state.activeSessionMeta?.resumeSessionId || state.activeSessionMeta?.id || ''"
-        :open-token="state.activeSessionOpenToken"
+        v-else-if="canRenderChatView"
+        :session-key="displayedSessionMeta?.resumeSessionId || displayedSessionMeta?.id || displayedThreadSnapshot?.threadId || ''"
+        :open-token="state.liveView.liveSessionId ? state.liveView.openToken : state.threadView.openToken || state.liveView.openToken"
         :title="activeSessionTitle"
         :thread-id="activeThreadId"
         :expected-thread-id="expectedThreadId"
         :thread-mismatch="threadMismatch"
         :workspace-name="activeWorkspaceName"
         :assistant-name="activeAssistantName"
-        :messages="state.activeMessages"
-        :background-agents="state.backgroundAgents"
+        :thread-snapshot="displayedThreadSnapshot"
+        :live-overlay="displayedLiveOverlay"
         v-model:draft="composerDraft"
         :can-send="canSend"
         :can-interrupt="canInterrupt"

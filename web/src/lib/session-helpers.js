@@ -447,8 +447,8 @@ export function fallbackTitleForSession(session) {
   if (!isLowSignalTitle(session?.inputPreview, session)) {
     return clampText(session.inputPreview, 44);
   }
-  if (session?.kind === "history") {
-    return "历史会话";
+  if (session?.kind === "history" || session?.kind === "thread") {
+    return "当前会话";
   }
   return clampText(session?.name || session?.providerLabel || "当前会话", 44) || "当前会话";
 }

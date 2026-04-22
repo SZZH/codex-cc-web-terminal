@@ -13,7 +13,11 @@ export function installResponseRuntime(runtime) {
     ctx.type = "application/json; charset=utf-8";
     ctx.body = `${JSON.stringify(payload)}\n`;
   };
-  runtime.unauthorized = (ctx) => {
-    runtime.json(ctx, 401, { error: "Unauthorized" });
+  runtime.unauthorized = (ctx, payload = {}) => {
+    runtime.json(ctx, 401, {
+      error: "Unauthorized",
+      authRequired: true,
+      ...payload
+    });
   };
 }

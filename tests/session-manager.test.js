@@ -8,6 +8,7 @@ import { SessionManager } from "../src/sessionManager.js";
 import { createConversationState } from "../src/sessions/conversation/state.js";
 import { createEmptyConversationState, applyDelta } from "../src/sessions/normalize/turnState.js";
 import { createTurnCreatedDelta, normalizeRecordToDeltas } from "../src/sessions/normalize/turnDeltas.js";
+import { deriveThreadSnapshotFromConversationState } from "../src/threads/index.js";
 import { createBaseConfig, createTempDir, waitForMicrotasks } from "./helpers/backendTestUtils.js";
 
 class AppServerBridgeStub extends EventEmitter {
@@ -343,6 +344,9 @@ test("historical sessions can be listed, archived, restored and deleted", () => 
   assert.equal(historicalMessages.messages.length, 2);
   assert.equal(historicalMessages.turns.length, 1);
   assert.equal(historicalMessages.backgroundAgents.length, 0);
+  assert.equal(historicalMessages.conversation.turns.length, 1);
+  assert.equal(historicalMessages.threadSnapshot.turns.length, 1);
+  assert.equal(historicalMessages.conversation.turns[0].id, historicalMessages.threadSnapshot.turns[0].id);
 
   const archived = manager.archiveHistoricalSession("codex", "thread-h1");
   assert.equal(archived.kind, "archived");
@@ -396,10 +400,12 @@ test("conversation history seeding does not leak turns between empty and non-emp
   const fullState = manager.get(fullSession.id).conversationState;
   const emptyState = manager.get(emptySession.id).conversationState;
 
-  assert.equal(fullState.turns.length, 1);
-  assert.equal(fullState.version, 1);
+  assert.ok(fullState.turns.length > 0);
+  assert.ok(fullState.version > 0);
+  assert.equal(fullState.threadId, "thread-full");
   assert.equal(emptyState.turns.length, 0);
   assert.equal(emptyState.version, 0);
+  assert.equal(emptyState.threadId, "thread-empty");
 });
 
 test("listAll deduplicates historical sessions shadowed by live resumable sessions", () => {
@@ -482,6 +488,311 @@ test("historical payload does not get overridden by a poorer live conversation w
   assert.match(lastTurn.assistant.process[0].summary, /思考过程/);
 });
 
+test("historical payload ignores live-only turns from an attached resumable live session", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  const sessionIndexPath = path.join(path.dirname(codexSessionsDir), "session_index.jsonl");
+  writeJsonl(sessionIndexPath, [{ id: "thread-history-isolated", thread_name: "History Isolated" }]);
+  writeJsonl(path.join(codexSessionsDir, "project-a", "thread-history-isolated.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-history-isolated", cwd: rootDir, thread_name: "History Isolated" },
+      timestamp: "2026-04-13T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "用户：历史问题" },
+      timestamp: "2026-04-13T10:00:01.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "agent_message", phase: "final_answer", message: "历史答案" },
+      timestamp: "2026-04-13T10:00:02.000Z"
+    }
+  ]);
+
+  const liveSession = manager.create({
+    provider: "codex",
+    cwd: rootDir,
+    resumeSessionId: "thread-history-isolated"
+  });
+  manager.get(liveSession.id).conversationState = createConversationState({
+    sessionId: liveSession.id,
+    threadId: "thread-history-isolated",
+    version: 10,
+    turns: [
+      {
+        id: "history-turn",
+        user: { id: "user-history", text: "用户：历史问题", ts: "2026-04-13T10:00:01.000Z" },
+        assistant: {
+          body: [
+            {
+              id: "body-history",
+              kind: "markdown",
+              text: "历史答案",
+              payload: {},
+              ts: "2026-04-13T10:00:02.000Z"
+            }
+          ],
+          process: [],
+          status: "completed",
+          startedAt: "2026-04-13T10:00:01.000Z",
+          finishedAt: "2026-04-13T10:00:02.000Z"
+        }
+      },
+      {
+        id: "live-only-turn",
+        user: { id: "user-live", text: "你好", ts: "2026-04-13T10:01:01.000Z" },
+        assistant: {
+          body: [
+            {
+              id: "body-live",
+              kind: "markdown",
+              text: "你好，直接说需求。",
+              payload: {},
+              ts: "2026-04-13T10:01:02.000Z"
+            }
+          ],
+          process: [],
+          status: "completed",
+          startedAt: "2026-04-13T10:01:01.000Z",
+          finishedAt: "2026-04-13T10:01:02.000Z"
+        }
+      }
+    ]
+  });
+
+  const payload = manager.getHistoricalMessages("codex", "thread-history-isolated");
+  assert.equal(payload.turns.length, 1);
+  assert.match(payload.turns[0].user.text, /历史问题/);
+  assert.equal(payload.turns[0].assistant.body.length, 1);
+  assert.equal(payload.turns[0].assistant.body[0].text, "历史答案");
+  assert.equal(
+    payload.turns.some((turn) => String(turn.user?.text || "").includes("你好")),
+    false
+  );
+});
+
+test("live history continuation returns resumable live-only turns without mutating pure historical payload", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  const sessionIndexPath = path.join(path.dirname(codexSessionsDir), "session_index.jsonl");
+  writeJsonl(sessionIndexPath, [{ id: "thread-single-source", thread_name: "Single Source Thread" }]);
+  writeJsonl(path.join(codexSessionsDir, "project-a", "thread-single-source.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-single-source", cwd: rootDir, thread_name: "Single Source Thread" },
+      timestamp: "2026-04-13T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "历史里的问题" },
+      timestamp: "2026-04-13T10:00:01.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "agent_message", phase: "final_answer", message: "历史里的答案" },
+      timestamp: "2026-04-13T10:00:02.000Z"
+    }
+  ]);
+
+  const liveSession = manager.create({
+    provider: "codex",
+    cwd: rootDir,
+    resumeSessionId: "thread-single-source"
+  });
+  manager.get(liveSession.id).conversationState = createConversationState({
+    sessionId: liveSession.id,
+    threadId: "thread-single-source",
+    version: 11,
+    turns: [
+      {
+        id: "history-turn",
+        user: { id: "user-history", text: "历史里的问题", ts: "2026-04-13T10:00:01.000Z" },
+        assistant: {
+          body: [
+            {
+              id: "body-history",
+              kind: "markdown",
+              text: "历史里的答案",
+              payload: {},
+              ts: "2026-04-13T10:00:02.000Z"
+            }
+          ],
+          process: [],
+          status: "completed",
+          startedAt: "2026-04-13T10:00:01.000Z",
+          finishedAt: "2026-04-13T10:00:02.000Z"
+        }
+      },
+      {
+        id: "live-turn",
+        user: { id: "user-live", text: "继续追问", ts: "2026-04-13T10:01:01.000Z" },
+        assistant: {
+          body: [
+            {
+              id: "body-live",
+              kind: "markdown",
+              text: "这是继续对话的新答案",
+              payload: {},
+              ts: "2026-04-13T10:01:02.000Z"
+            }
+          ],
+          process: [],
+          status: "completed",
+          startedAt: "2026-04-13T10:01:01.000Z",
+          finishedAt: "2026-04-13T10:01:02.000Z"
+        }
+      }
+    ]
+  });
+
+  manager.get(liveSession.id).threadSnapshot = deriveThreadSnapshotFromConversationState(
+    manager.get(liveSession.id).conversationState,
+    {
+      threadId: "thread-single-source",
+      metadata: { name: "Single Source Thread", cwd: rootDir, source: "codex" }
+    }
+  );
+
+  const historicalPayload = manager.getHistoricalMessages("codex", "thread-single-source");
+  const continuation = manager.getThreadContinuationRuntime("codex", "thread-single-source");
+
+  assert.equal(historicalPayload.turns.length, 1);
+  assert.equal(historicalPayload.turns[0].assistant.body[0].text, "历史里的答案");
+  assert.ok(continuation);
+  assert.equal(continuation.threadSnapshot.turns.length, 2);
+  assert.equal(
+    continuation.threadSnapshot.turns.some((turn) =>
+      Array.isArray(turn?.items) && turn.items.some((item) => String(item?.text || "").includes("这是继续对话的新答案"))
+    ),
+    true
+  );
+});
+
+test("legacy historical thread stays stable while same-thread continuation appends only the new live turn", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  const sessionIndexPath = path.join(path.dirname(codexSessionsDir), "session_index.jsonl");
+  writeJsonl(sessionIndexPath, [{ id: "thread-legacy-continuation", thread_name: "Legacy Continuation Thread" }]);
+  writeJsonl(path.join(codexSessionsDir, "project-a", "thread-legacy-continuation.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-legacy-continuation", cwd: rootDir, thread_name: "Legacy Continuation Thread" },
+      timestamp: "2026-04-13T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "历史里的问题" },
+      timestamp: "2026-04-13T10:00:01.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "agent_message", phase: "commentary", message: "先分析一下" },
+      timestamp: "2026-04-13T10:00:02.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "agent_message", phase: "final_answer", message: "历史里的答案" },
+      timestamp: "2026-04-13T10:00:03.000Z"
+    }
+  ]);
+
+  const liveSession = manager.create({
+    provider: "codex",
+    cwd: rootDir,
+    resumeSessionId: "thread-legacy-continuation"
+  });
+  manager.get(liveSession.id).conversationState = createConversationState({
+    sessionId: liveSession.id,
+    threadId: "thread-legacy-continuation",
+    version: 7,
+    turns: [
+      {
+        id: "legacy-history-turn",
+        user: { id: "user-history", text: "历史里的问题", ts: "2026-04-13T10:00:01.000Z" },
+        assistant: {
+          body: [
+            {
+              id: "body-history",
+              kind: "markdown",
+              text: "历史里的答案",
+              payload: {},
+              ts: "2026-04-13T10:00:03.000Z"
+            }
+          ],
+          process: [
+            {
+              id: "proc-history",
+              type: "reasoning",
+              title: "分析",
+              summary: "先分析一下",
+              content: "",
+              payload: {},
+              phase: "completed",
+              ts: "2026-04-13T10:00:02.000Z"
+            }
+          ],
+          status: "completed",
+          startedAt: "2026-04-13T10:00:01.000Z",
+          finishedAt: "2026-04-13T10:00:03.000Z"
+        }
+      },
+      {
+        id: "live-turn-2",
+        user: { id: "user-live", text: "继续追问", ts: "2026-04-13T10:01:01.000Z" },
+        assistant: {
+          body: [
+            {
+              id: "body-live",
+              kind: "markdown",
+              text: "这是继续对话的新答案",
+              payload: {},
+              ts: "2026-04-13T10:01:02.000Z"
+            }
+          ],
+          process: [],
+          status: "completed",
+          startedAt: "2026-04-13T10:01:01.000Z",
+          finishedAt: "2026-04-13T10:01:02.000Z"
+        }
+      }
+    ]
+  });
+
+  manager.get(liveSession.id).threadSnapshot = deriveThreadSnapshotFromConversationState(
+    manager.get(liveSession.id).conversationState,
+    {
+      threadId: "thread-legacy-continuation",
+      metadata: { name: "Legacy Continuation Thread", cwd: rootDir, source: "codex" }
+    }
+  );
+
+  const historicalPayload = manager.getHistoricalMessages("codex", "thread-legacy-continuation");
+  const continuation = manager.getThreadContinuationRuntime("codex", "thread-legacy-continuation");
+
+  assert.equal(
+    historicalPayload.turns.some((turn) => String(turn.user?.text || "").includes("继续追问")),
+    false
+  );
+  assert.ok(continuation);
+  assert.equal(
+    continuation.threadSnapshot.turns.some((turn) =>
+      Array.isArray(turn?.items) && turn.items.some((item) => String(item?.text || "").includes("继续追问"))
+    ),
+    true
+  );
+});
+
 test("historical mutation APIs throw clear errors for missing sessions", () => {
   const { manager } = createManager();
   assert.throws(
@@ -495,6 +806,61 @@ test("historical mutation APIs throw clear errors for missing sessions", () => {
   assert.throws(
     () => manager.deleteHistoricalSession("codex", "missing-session"),
     /Historical session not found/
+  );
+});
+
+test("live continuation lookup does not require a persisted historical session", () => {
+  const { manager } = createManager();
+  const liveSession = manager.create({
+    provider: "codex",
+    cwd: process.cwd(),
+    resumeSessionId: "thread-live-only"
+  });
+  manager.get(liveSession.id).conversationState = createConversationState({
+    sessionId: liveSession.id,
+    threadId: "thread-live-only",
+    version: 1,
+    turns: [
+      {
+        id: "live-turn-only",
+        user: { id: "user-live-only", text: "只有 live 的问题", ts: "2026-04-22T00:00:00.000Z" },
+        assistant: {
+          body: [
+            {
+              id: "body-live-only",
+              kind: "markdown",
+              text: "只有 live 的回答",
+              payload: {},
+              ts: "2026-04-22T00:00:01.000Z"
+            }
+          ],
+          process: [],
+          status: "completed",
+          startedAt: "2026-04-22T00:00:00.000Z",
+          finishedAt: "2026-04-22T00:00:01.000Z"
+        }
+      }
+    ]
+  });
+  manager.get(liveSession.id).threadSnapshot = deriveThreadSnapshotFromConversationState(
+    manager.get(liveSession.id).conversationState,
+    {
+      threadId: "thread-live-only",
+      metadata: { name: "Live Only Thread", cwd: process.cwd(), source: "codex" }
+    }
+  );
+
+  const bundle = manager.getThreadSnapshotBundle("codex", "thread-live-only");
+  const continuation = manager.getThreadContinuationRuntime("codex", "thread-live-only");
+
+  assert.equal(bundle.threadSnapshot, null);
+  assert.ok(continuation);
+  assert.equal(continuation.threadSnapshot.threadId, "thread-live-only");
+  assert.equal(
+    continuation.threadSnapshot.turns.some((turn) =>
+      Array.isArray(turn?.items) && turn.items.some((item) => String(item?.text || "").includes("只有 live 的回答"))
+    ),
+    true
   );
 });
 

@@ -427,4 +427,11 @@ test("websocket emits conversation snapshot on connect and conversation delta af
   assert.ok(deltaPayload.toVersion >= deltaPayload.fromVersion);
   assert.ok(Array.isArray(deltaPayload.deltas));
   assert.ok(deltaPayload.deltas.length > 0);
+  assert.equal(deltaPayload.threadSnapshot.threadId, "thread-h1");
+  assert.ok(deltaPayload.threadSnapshot.turns.length >= 2);
+  assert.ok(
+    deltaPayload.threadSnapshot.turns.some((turn) =>
+      Array.isArray(turn?.items) && turn.items.some((item) => item?.kind === "UserMessage" && item?.text === "follow up")
+    )
+  );
 });

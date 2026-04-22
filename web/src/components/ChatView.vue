@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js";
+import ThreadTurnTimeline from "./thread-item/ThreadTurnTimeline.vue";
 
 const BOTTOM_THRESHOLD = 84;
 const MAX_COMPOSER_HEIGHT = 160;
@@ -16,8 +17,8 @@ const props = defineProps({
   threadMismatch: { type: Boolean, default: false },
   workspaceName: { type: String, default: "" },
   assistantName: { type: String, default: "Codex" },
-  messages: { type: Array, default: () => [] },
-  backgroundAgents: { type: Array, default: () => [] },
+  threadSnapshot: { type: Object, default: null },
+  liveOverlay: { type: Object, default: null },
   draft: { type: String, default: "" },
   canSend: Boolean,
   canInterrupt: Boolean,
@@ -32,7 +33,6 @@ const viewportHeight = ref(0);
 const keyboardInset = ref(0);
 const isPinnedToBottom = ref(true);
 const isTouchDevice = ref(false);
-const expandedEventGroups = ref(new Set());
 const lightboxImage = ref(null);
 const lightboxScale = ref(1);
 const lightboxTranslateX = ref(0);
@@ -55,7 +55,9 @@ const chatShellStyle = computed(() => ({
 }));
 const isRunning = computed(() => Boolean(props.canInterrupt));
 const primaryActionLabel = computed(() => (isRunning.value ? "中断" : "发送"));
-const canPrimaryAction = computed(() => (isRunning.value ? !props.loading : props.canSend && !props.loading));
+const canPrimaryAction = computed(() => {
+  return isRunning.value ? !props.loading : props.canSend && !props.loading;
+});
 const lightboxImageStyle = computed(() => ({
   transform: `translate3d(${lightboxTranslateX.value}px, ${lightboxTranslateY.value}px, 0) scale(${lightboxScale.value})`
 }));
@@ -87,8 +89,6 @@ const PROCESS_PATTERNS = [
   /current changes/i,
   /\bworkdir\b/i
 ];
-
-const subagentPanelExpanded = ref(false);
 
 const LANGUAGE_ALIAS = {
   sh: "bash",
@@ -194,25 +194,6 @@ function isProcessLine(line) {
     return true;
   }
   return PROCESS_PATTERNS.some((pattern) => pattern.test(compact));
-}
-
-function splitMessageParts(message) {
-  const text = String(message?.text || "").trim();
-  if (!text || message?.role === "user") {
-    return { primary: text, process: "" };
-  }
-
-  const lines = text
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .filter((line) => String(line || "").trim().length > 0);
-
-  const processLines = lines.filter((line) => isProcessLine(line));
-  return {
-    // Keep full assistant text visible by default to avoid hiding real content.
-    primary: lines.join("\n").trim(),
-    process: processLines.join("\n").trim()
-  };
 }
 
 const md = new MarkdownIt({
@@ -338,228 +319,9 @@ function compactText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
-function mapEventTypeToZh(rawType, fallbackLabel = "事件") {
-  const key = String(rawType || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_/-]/g, "");
-  if (!key) {
-    return fallbackLabel;
-  }
-  if (key.includes("commandexecution")) {
-    return "命令执行";
-  }
-  if (key.includes("filechange")) {
-    return "文件变更";
-  }
-  if (key.includes("reasoning")) {
-    return "思考过程";
-  }
-  if (key.includes("agentmessage")) {
-    return "执行进度";
-  }
-  if (key.includes("subagent") || key.includes("collab")) {
-    return "子任务";
-  }
-  if (key.includes("reference") || key.includes("citation")) {
-    return "引用信息";
-  }
-  if (key.includes("toolcall") || key.includes("mcptool")) {
-    return "工具调用";
-  }
-  return fallbackLabel;
-}
-
-function mapStatusToZh(value) {
-  const key = String(value || "").trim().toLowerCase();
-  if (!key) {
-    return "";
-  }
-  if (["success", "succeeded", "done", "completed", "ok"].includes(key)) {
-    return "完成";
-  }
-  if (["running", "inprogress", "processing"].includes(key)) {
-    return "执行中";
-  }
-  if (["failed", "error", "aborted", "cancelled", "canceled"].includes(key)) {
-    return "失败";
-  }
-  return String(value || "").trim();
-}
-
-function isNoisySummary(value, rawType) {
-  const text = compactText(value).toLowerCase();
-  const type = compactText(rawType).toLowerCase();
-  if (!text) {
-    return true;
-  }
-  if (text === type) {
-    return true;
-  }
-  if (["commentary", "reasoning", "agentmessage", "commandexecution", "event", "tool"].includes(text)) {
-    return true;
-  }
-  return false;
-}
-
-function buildEventDetails(payload, rawType) {
-  const source = payload && typeof payload === "object" ? payload : {};
-  const nested = source.payload && typeof source.payload === "object" ? source.payload : {};
-  const fields = [
-    { label: "命令", value: nested.command || source.command },
-    { label: "工具", value: nested.toolName || nested.tool_name || source.toolName || source.tool_name },
-    { label: "路径", value: nested.path || source.path },
-    { label: "状态", value: mapStatusToZh(nested.status || source.status) }
-  ];
-  const details = fields
-    .map((item) => ({ ...item, value: compactText(item.value) }))
-    .filter((item) => Boolean(item.value));
-  if (details.length) {
-    return details;
-  }
-  const fallback = mapEventTypeToZh(rawType, "");
-  return fallback ? [{ label: "类型", value: fallback }] : [];
-}
-
-function buildEventCompactText(summary, details, fallbackType) {
-  const cleanSummary = compactText(summary);
-  if (cleanSummary) {
-    return cleanSummary;
-  }
-  if (Array.isArray(details) && details.length > 0) {
-    const first = details[0];
-    if (first?.label && first?.value) {
-      return `${first.label}：${first.value}`;
-    }
-  }
-  return fallbackType || "事件";
-}
-
-function formatDurationLabel(ms) {
-  const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes <= 0) {
-    return `${seconds}s`;
-  }
-  return `${minutes}m ${seconds}s`;
-}
-
-const renderedMessages = computed(() =>
-  props.messages.map((message) => {
-    const parts = splitMessageParts(message);
-    const partType = String(message?.partType || "").trim();
-    const payload = message?.payload || {};
-    const imageUrl = String(payload?.url || "").trim();
-    const imageAlt = String(payload?.alt || "").trim() || "image";
-    const structuredPart = new Set(["tool", "subagent", "reference", "event"]);
-    const renderKind = partType === "image" && imageUrl ? "image" : structuredPart.has(partType) ? "event" : "markdown";
-    const eventLabelMap = {
-      tool: "工具调用",
-      subagent: "子任务",
-      reference: "引用",
-      event: "事件"
-    };
-    const eventLabel = eventLabelMap[partType] || "事件";
-    const eventRawType = String(payload?.rawType || message?.rawType || "").trim();
-    const eventTypeText = mapEventTypeToZh(eventRawType, eventLabel);
-    const baseSummary = compactText(payload?.summary || parts.primary || message.text || "");
-    const eventSummary = isNoisySummary(baseSummary, eventRawType) ? "" : baseSummary;
-    const eventDetails = buildEventDetails(payload, eventRawType);
-    const eventCompactText = buildEventCompactText(eventSummary, eventDetails, eventTypeText);
-    return {
-      ...message,
-      renderKind,
-      imageUrl,
-      imageAlt,
-      eventLabel: eventTypeText,
-      eventSummary,
-      eventDetails,
-      eventCompactText,
-      displayText: parts.primary || "",
-      renderedHtml: renderMarkdownToHtml(parts.primary || message.text || ""),
-      fileMentions: message.role === "assistant" && renderKind === "markdown" ? extractFileMentions(message.text) : [],
-      processText: parts.process || "",
-      hasProcessDetails: Boolean(parts.process),
-      processSummary: parts.primary ? "查看过程详情" : "查看运行过程"
-    };
-  })
+const hasThreadSnapshot = computed(
+  () => props.threadSnapshot && Array.isArray(props.threadSnapshot.turns)
 );
-
-const normalizedBackgroundAgents = computed(() =>
-  (props.backgroundAgents || []).map((agent, index) => ({
-    id: String(agent?.agentId || agent?.agentPath || agent?.nickname || `agent-${index}`),
-    name: String(agent?.nickname || agent?.agentPath || agent?.agentId || `Agent ${index + 1}`),
-    status: String(agent?.status || "running").trim() || "running"
-  }))
-);
-
-const hasAssistantBody = computed(() =>
-  renderedMessages.value.some(
-    (message) => message.role === "assistant" && message.renderKind === "markdown" && compactText(message.displayText)
-  )
-);
-const shouldCollapseCompletedGroups = computed(() => hasAssistantBody.value);
-function isEventGroupExpanded(toggleId) {
-  return expandedEventGroups.value.has(toggleId);
-}
-
-function toggleEventGroup(toggleId) {
-  const next = new Set(expandedEventGroups.value);
-  if (next.has(toggleId)) {
-    next.delete(toggleId);
-  } else {
-    next.add(toggleId);
-  }
-  expandedEventGroups.value = next;
-}
-
-const visibleMessages = computed(() => {
-  if (!shouldCollapseCompletedGroups.value) {
-    return renderedMessages.value;
-  }
-
-  const output = [];
-  let pendingEventGroup = [];
-  const flushPending = () => {
-    if (!pendingEventGroup.length) {
-      return;
-    }
-    const toggleId = `event-toggle-${pendingEventGroup[0].id}`;
-    if (pendingEventGroup.length === 1) {
-      output.push(...pendingEventGroup);
-      pendingEventGroup = [];
-      return;
-    }
-    const timestamps = pendingEventGroup
-      .map((message) => Date.parse(String(message.ts || message.timestamp || "")))
-      .filter((value) => Number.isFinite(value));
-    const durationLabel =
-      timestamps.length >= 2 ? formatDurationLabel(Math.max(...timestamps) - Math.min(...timestamps)) : "";
-    output.push({
-      id: toggleId,
-      toggleId,
-      renderKind: "event-toggle",
-      count: pendingEventGroup.length,
-      durationLabel
-    });
-    if (isEventGroupExpanded(toggleId)) {
-      output.push(...pendingEventGroup);
-    }
-    pendingEventGroup = [];
-  };
-
-  for (const message of renderedMessages.value) {
-    if (message.role === "assistant" && message.renderKind === "event") {
-      pendingEventGroup.push(message);
-      continue;
-    }
-    flushPending();
-    output.push(message);
-  }
-  flushPending();
-  return output;
-});
 const visibleThreadId = computed(() => String(props.threadId || props.expectedThreadId || "").trim());
 const threadHint = computed(() => {
   if (!visibleThreadId.value) {
@@ -805,8 +567,14 @@ function handleWindowKeydown(event) {
 }
 
 watch(
-  () => props.messages.map((message) => `${message.id}:${message.text?.length || 0}`).join("|"),
+  () =>
+    hasThreadSnapshot.value
+      ? `${props.threadSnapshot?.version || 0}:${props.threadSnapshot?.turns?.length || 0}:${props.liveOverlay?.id || props.liveOverlay?.turnId || ""}:${props.liveOverlay?.text?.length || 0}`
+      : "",
   () => {
+    if (!hasThreadSnapshot.value) {
+      return;
+    }
     scrollToBottom(false);
   },
   { flush: "post" }
@@ -816,7 +584,6 @@ watch(
   () => `${props.sessionKey}::${props.openToken}`,
   () => {
     isPinnedToBottom.value = true;
-    expandedEventGroups.value = new Set();
     scrollToBottom(true);
   },
   { flush: "post", immediate: true }
@@ -869,81 +636,14 @@ onBeforeUnmount(() => {
 
     <main class="chat-screen">
       <section ref="messageListEl" class="message-stream" @scroll="handleStreamScroll">
-        <article v-for="message in visibleMessages" :key="message.id" class="message-item" :class="message.role">
-          <button
-            v-if="message.renderKind === 'event-toggle'"
-            type="button"
-            class="event-collapsed-toggle"
-            @click="toggleEventGroup(message.toggleId)"
-          >
-            {{ isEventGroupExpanded(message.toggleId) ? "收起执行过程" : "查看执行过程" }}
-            <span class="event-collapsed-meta">
-              （{{ message.count }} 条<span v-if="message.durationLabel">，{{ message.durationLabel }}</span>）
-            </span>
-          </button>
-
-          <div v-if="message.renderKind === 'image'" class="message-bubble image-bubble">
-            <img
-              class="message-image"
-              :src="message.imageUrl"
-              :alt="message.imageAlt"
-              loading="lazy"
-              decoding="async"
-              @click="openLightboxImage(message.imageUrl, message.imageAlt)"
-            />
-          </div>
-
-          <div v-else-if="message.renderKind === 'event'" class="message-bubble event-bubble">
-            <p class="event-compact">{{ message.eventCompactText }}</p>
-            <dl v-if="message.eventDetails.length" class="event-details">
-              <template v-for="detail in message.eventDetails" :key="`${message.id}-${detail.label}`">
-                <dt>{{ detail.label }}</dt>
-                <dd>{{ detail.value }}</dd>
-              </template>
-            </dl>
-            <p
-              v-if="message.eventSummary && message.eventSummary !== message.eventCompactText"
-              class="event-summary"
-            >
-              {{ message.eventSummary }}
-            </p>
-          </div>
-
-          <div v-else-if="message.displayText || message.role === 'user'" class="message-bubble">
-            <div class="message-text markdown-body" v-html="message.renderedHtml" @click="handleMarkdownBodyClick"></div>
-          </div>
-
-          <section v-if="message.fileMentions?.length" class="change-scope-card">
-            <p class="change-scope-title">{{ message.fileMentions.length }} 个文件已修改</p>
-            <div class="change-scope-list">
-              <div
-                v-for="file in message.fileMentions"
-                :key="`${message.id}-${file.path}`"
-                class="change-scope-item"
-              >
-                {{ file.label }}
-              </div>
-            </div>
-          </section>
-
-        </article>
-
+        <ThreadTurnTimeline
+          :snapshot="threadSnapshot"
+          :live-overlay="liveOverlay"
+          :assistant-name="assistantName"
+        />
       </section>
 
       <p v-if="statusText" class="chat-status">{{ statusText }}</p>
-
-      <section v-if="normalizedBackgroundAgents.length" class="subagent-panel">
-        <button type="button" class="subagent-panel-toggle" @click="subagentPanelExpanded = !subagentPanelExpanded">
-          <span>{{ normalizedBackgroundAgents.length }} background agents</span>
-          <span class="subagent-panel-chevron" :class="{ expanded: subagentPanelExpanded }">›</span>
-        </button>
-        <div v-if="subagentPanelExpanded" class="subagent-panel-list">
-          <article v-for="agent in normalizedBackgroundAgents" :key="agent.id" class="subagent-panel-item">
-            <span class="subagent-panel-name">{{ agent.name }}</span>
-            <span class="subagent-panel-status" :data-status="agent.status">{{ agent.status }}</span>
-          </article>
-        </div>
-      </section>
 
       <form class="composer" @submit.prevent="emit('submit')">
         <textarea
