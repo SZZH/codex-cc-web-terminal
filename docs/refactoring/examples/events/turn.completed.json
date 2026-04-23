@@ -1,0 +1,14 @@
+{
+  "id": "evt-thread-refactor-001-0008",
+  "seq": 8,
+  "provider": "codex",
+  "providerThreadId": "provider-thread-refactor-001",
+  "providerTurnId": "provider-turn-refactor-001",
+  "threadId": "thread-refactor-001",
+  "turnId": "turn-refactor-001",
+  "ts": "2026-04-22T10:00:07.000Z",
+  "kind": "turn.completed",
+  "payload": {
+    "status": "completed"
+  }
+}

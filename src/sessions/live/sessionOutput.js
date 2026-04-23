@@ -22,7 +22,7 @@ export function broadcast(session, payload) {
   }
 }
 
-export function attachClient(manager, id, ws) {
+export function attachClient(manager, id, ws, { skipInitialSnapshot = false } = {}) {
   const session = manager.get(id);
   if (!session) {
     throw new Error(`Session not found: ${id}`);
@@ -30,9 +30,11 @@ export function attachClient(manager, id, ws) {
 
   manager.seedConversationStateFromHistory(session);
   session.clients.add(ws);
-  const snapshotPayload = manager.getConversationSnapshot(id) || buildConversationSnapshotPayload(session, manager.serialize(session));
-  ws.send(JSON.stringify(snapshotPayload));
-  ws.send(JSON.stringify(buildLegacySnapshotPayload(session, snapshotPayload.session || manager.serialize(session))));
+  if (!skipInitialSnapshot) {
+    const snapshotPayload = manager.getConversationSnapshot(id) || buildConversationSnapshotPayload(session, manager.serialize(session));
+    ws.send(JSON.stringify(snapshotPayload));
+    ws.send(JSON.stringify(buildLegacySnapshotPayload(session, snapshotPayload.session || manager.serialize(session))));
+  }
 
   ws.on("close", () => {
     session.clients.delete(ws);

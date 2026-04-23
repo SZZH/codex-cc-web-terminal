@@ -37,16 +37,40 @@ import {
 import {
   createRawRecord,
   canonicalizeRawRecord,
-  reduceCanonicalEvents,
-  getActiveTurnLiveOverlay,
   createCanonicalizerState,
   deriveConversationStateFromThreadSnapshot,
   deriveThreadSnapshotFromConversationState
 } from "./threads/index.js";
+import { createCanonicalEventFromLegacy } from "./canonical/index.js";
+import { createLegacyThreadProjection } from "./projector/index.js";
 
 function normalizeName(value, fallback) {
   const text = String(value || "").trim();
   return text || fallback;
+}
+
+function buildThreadProjection(session) {
+  const projection = createLegacyThreadProjection({
+    threadId: String(session?.resumeSessionId || session?.threadSnapshot?.threadId || session?.id || ""),
+    snapshot: session?.threadSnapshot || null
+  });
+  session.threadProjection = projection;
+  return projection;
+}
+
+function getThreadProjection(session) {
+  if (session?.threadProjection) {
+    return session.threadProjection;
+  }
+  return buildThreadProjection(session);
+}
+
+function syncProjectedThreadState(session, { previousSnapshot = null } = {}) {
+  const projection = getThreadProjection(session);
+  const projected = projection.getLegacyState(previousSnapshot || session.threadSnapshot || null);
+  session.threadSnapshot = projected.threadSnapshot;
+  session.liveOverlay = projected.liveOverlay;
+  return projected;
 }
 
 export class SessionManager {
@@ -165,6 +189,83 @@ export class SessionManager {
     return candidates.length ? this.serialize(candidates[0]) : null;
   }
 
+  findLiveSessionByThreadId(threadId, { providerId = "" } = {}) {
+    const targetThreadId = String(threadId || "").trim();
+    if (!targetThreadId) {
+      return null;
+    }
+    const normalizedProviderId = String(providerId || "").trim();
+    const provider = normalizedProviderId ? this.getProvider(normalizedProviderId) : null;
+    const candidates = [...this.sessions.values()]
+      .filter((session) => {
+        if (session.status === "exited") {
+          return false;
+        }
+        if (provider && session.provider !== provider.id) {
+          return false;
+        }
+        return String(session.resumeSessionId || session.threadSnapshot?.threadId || "").trim() === targetThreadId;
+      })
+      .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")));
+    return candidates[0] || null;
+  }
+
+  resolveProviderForThread(threadId, preferredProviderId = "") {
+    const targetThreadId = String(threadId || "").trim();
+    if (!targetThreadId) {
+      return this.getProvider(preferredProviderId || "codex");
+    }
+
+    const liveProviderId = this.findLiveSessionByThreadId(targetThreadId, { providerId: preferredProviderId })?.provider;
+    if (liveProviderId) {
+      return this.getProvider(liveProviderId);
+    }
+
+    const orderedProviders = preferredProviderId
+      ? [
+          this.getProvider(preferredProviderId),
+          ...[...this.providers.values()].filter((provider) => provider.id !== this.getProvider(preferredProviderId).id)
+        ]
+      : [...this.providers.values()];
+
+    for (const provider of orderedProviders) {
+      try {
+        const historical = this.getHistoricalSession(provider.id, targetThreadId, { archived: null });
+        if (historical) {
+          return provider;
+        }
+      } catch {
+        // Ignore missing historical threads while probing providers.
+      }
+    }
+
+    return this.getProvider(preferredProviderId || "codex");
+  }
+
+  ensureLiveSessionForThread(threadId, { providerId = "", cwd = "", model = "", name = "" } = {}) {
+    const targetThreadId = String(threadId || "").trim();
+    if (!targetThreadId) {
+      throw new Error("threadId is required");
+    }
+
+    const resolvedProvider = this.resolveProviderForThread(targetThreadId, providerId);
+    const existing =
+      this.findLiveSessionByThreadId(targetThreadId, { providerId: resolvedProvider.id }) ||
+      this.findLiveSessionByThreadId(targetThreadId);
+    if (existing) {
+      return existing;
+    }
+
+    const created = this.create({
+      provider: resolvedProvider.id,
+      cwd,
+      model,
+      name,
+      resumeSessionId: targetThreadId
+    });
+    return this.get(created.id);
+  }
+
   create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "" } = {}) {
     const resolvedProvider = this.getProvider(provider);
     const id = crypto.randomUUID();
@@ -178,7 +279,15 @@ export class SessionManager {
     });
 
     if (resolvedProvider.id === "codex") {
-      const preferAppServer = Boolean(this.config.codexAppServerEnabled && this.appServerBridge);
+      // App-server bridge does not yet provide a reliable resumed-thread turn lifecycle
+      // (notifications can stall after userMessage without a terminal turn event), so
+      // thread continuation must stay on the stable json_exec runner until the adapter
+      // contract is completed end-to-end.
+      const preferAppServer = Boolean(
+        this.config.codexAppServerEnabled &&
+          this.appServerBridge &&
+          !String(resumeSessionId || "").trim()
+      );
       const session = {
         id,
         provider: resolvedProvider.id,
@@ -219,6 +328,7 @@ export class SessionManager {
         threadSnapshot: null,
         liveOverlay: null,
         threadCanonicalizerState: createCanonicalizerState(),
+        threadProjection: null,
         currentTurnId: "",
         sessionType: "main",
         parentThreadId: "",
@@ -276,6 +386,7 @@ export class SessionManager {
       threadSnapshot: null,
       liveOverlay: null,
       threadCanonicalizerState: createCanonicalizerState(),
+      threadProjection: null,
       currentTurnId: "",
       queuedTurnIds: [],
       sessionType: "main",
@@ -301,8 +412,8 @@ export class SessionManager {
     broadcast(session, payload);
   }
 
-  attachClient(id, ws) {
-    attachClient(this, id, ws);
+  attachClient(id, ws, options) {
+    attachClient(this, id, ws, options);
   }
 
   ensureConversationState(session, { status = "" } = {}) {
@@ -379,10 +490,12 @@ export class SessionManager {
     }
     const current = this.ensureThreadSnapshot(session);
     if ((current?.turns || []).length > 0) {
-      session.liveOverlay = getActiveTurnLiveOverlay(current);
+      buildThreadProjection(session);
+      syncProjectedThreadState(session, { previousSnapshot: current });
       return;
     }
     if (!session.resumeSessionId) {
+      buildThreadProjection(session);
       session.liveOverlay = null;
       return;
     }
@@ -401,10 +514,13 @@ export class SessionManager {
             source: session.provider || historical.threadSnapshot.metadata?.source || ""
           }
         };
-        session.liveOverlay = getActiveTurnLiveOverlay(session.threadSnapshot);
+        buildThreadProjection(session);
+        syncProjectedThreadState(session, { previousSnapshot: session.threadSnapshot });
       }
     } catch {
-      session.liveOverlay = getActiveTurnLiveOverlay(this.ensureThreadSnapshot(session));
+      const ensured = this.ensureThreadSnapshot(session);
+      buildThreadProjection(session);
+      syncProjectedThreadState(session, { previousSnapshot: ensured });
     }
   }
 
@@ -428,8 +544,18 @@ export class SessionManager {
     if (!events.length) {
       return null;
     }
-    session.threadSnapshot = reduceCanonicalEvents(events, { snapshot });
-    session.liveOverlay = getActiveTurnLiveOverlay(session.threadSnapshot);
+    const projection = getThreadProjection(session);
+    for (const event of events) {
+      const canonicalEvent = createCanonicalEventFromLegacy(event, {
+        provider: session.provider,
+        providerThreadId: String(session.resumeSessionId || snapshot.threadId || session.id || "")
+      });
+      if (!canonicalEvent) {
+        continue;
+      }
+      projection.projector.applyEvent(canonicalEvent);
+    }
+    syncProjectedThreadState(session, { previousSnapshot: snapshot });
     this.syncConversationStateFromThreadSnapshot(session);
     return session.threadSnapshot;
   }
@@ -597,7 +723,11 @@ export class SessionManager {
         }
         if (incomingSnapshot) {
           live.threadSnapshot = incomingSnapshot;
-          live.liveOverlay = historical.liveOverlay || getActiveTurnLiveOverlay(incomingSnapshot);
+          buildThreadProjection(live);
+          syncProjectedThreadState(live, { previousSnapshot: incomingSnapshot });
+          if (!live.liveOverlay && historical.liveOverlay) {
+            live.liveOverlay = historical.liveOverlay;
+          }
         }
         this.syncConversationStateFromThreadSnapshot(live);
         live.updatedAt = nowIso();
@@ -687,12 +817,12 @@ export class SessionManager {
       session.updatedAt = nowIso();
     }
     if (session.runnerMode === "json_exec" || session.runnerMode === "app_server") {
-      this.enqueueJsonExecInput(session, text);
-      return;
+      return this.enqueueJsonExecInput(session, text);
     }
 
     session.shell.write(text);
     session.updatedAt = nowIso();
+    return "";
   }
 
   resize(id, cols, rows) {
@@ -776,6 +906,7 @@ export class SessionManager {
   serialize(session) {
     return {
       id: session.id,
+      threadId: session.resumeSessionId || session.threadSnapshot?.threadId || session.id,
       provider: session.provider,
       providerLabel: session.providerLabel,
       cliLabel: session.cliLabel,
@@ -805,6 +936,8 @@ export class SessionManager {
     }
     this.ensureConversationState(session);
     this.ensureThreadSnapshot(session);
+    buildThreadProjection(session);
+    syncProjectedThreadState(session, { previousSnapshot: session.threadSnapshot });
     return buildConversationSnapshotPayload(session, this.serialize(session));
   }
 
@@ -855,6 +988,7 @@ export class SessionManager {
     }
     const currentSnapshot = this.ensureThreadSnapshot(liveSession);
     const currentConversation = this.ensureConversationState(liveSession);
+    buildThreadProjection(liveSession);
     const mergedSnapshot =
       (currentSnapshot?.turns?.length || 0) >= (currentConversation?.turns?.length || 0)
         ? currentSnapshot
@@ -863,11 +997,13 @@ export class SessionManager {
             metadata: currentSnapshot?.metadata || baseSnapshot?.metadata || {},
             baseSnapshot: baseSnapshot || currentSnapshot || null
           });
+    liveSession.threadSnapshot = mergedSnapshot;
+    syncProjectedThreadState(liveSession, { previousSnapshot: mergedSnapshot });
     return {
       session: this.serialize(liveSession),
       conversation: currentConversation,
       threadSnapshot: mergedSnapshot,
-      liveOverlay: liveSession.liveOverlay || getActiveTurnLiveOverlay(mergedSnapshot)
+      liveOverlay: liveSession.liveOverlay || null
     };
   }
 

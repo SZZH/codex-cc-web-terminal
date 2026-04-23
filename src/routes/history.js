@@ -42,9 +42,41 @@ export async function handleHistoryRoute(ctx, runtime) {
 
     const bundle = getThreadBundle(provider, resumeSessionId);
     if (historicalPayload) {
+      const authoritativeSession = bundle.continuation
+        ? bundle.continuation.session || historicalPayload.session || bundle.session || null
+        : historicalPayload.session || bundle.session || null;
+      const authoritativeSnapshot = bundle.continuation
+        ? bundle.continuation.threadSnapshot || historicalPayload?.threadSnapshot || bundle.threadSnapshot || null
+        : historicalPayload?.threadSnapshot || bundle.threadSnapshot || null;
+      const authoritativeConversation = bundle.continuation
+        ? bundle.continuation.conversation || historicalPayload?.conversation || bundle.conversation || null
+        : historicalPayload?.conversation || bundle.conversation || null;
+      const authoritativeTurns = bundle.continuation
+        ? authoritativeConversation?.turns || historicalPayload?.turns || []
+        : historicalPayload?.turns || authoritativeConversation?.turns || [];
+      const authoritativeBackgroundAgents = bundle.continuation
+        ? authoritativeConversation?.backgroundAgents || historicalPayload?.backgroundAgents || []
+        : historicalPayload?.backgroundAgents || authoritativeConversation?.backgroundAgents || [];
       return {
         ...historicalPayload,
-        threadSnapshot: bundle.threadSnapshot || historicalPayload?.threadSnapshot || null,
+        session: authoritativeSession,
+        turns: authoritativeTurns,
+        backgroundAgents: authoritativeBackgroundAgents,
+        conversation: authoritativeConversation,
+        conversationSnapshot:
+          historicalPayload?.conversationSnapshot ||
+          (authoritativeConversation
+            ? {
+                type: "conversation.snapshot",
+                session: authoritativeSession,
+                sessionId: authoritativeConversation.sessionId || authoritativeSession?.id || "",
+                threadId: authoritativeConversation.threadId || resumeSessionId,
+                conversation: authoritativeConversation,
+                turns: authoritativeConversation.turns || [],
+                backgroundAgents: authoritativeConversation.backgroundAgents || []
+              }
+            : null),
+        threadSnapshot: authoritativeSnapshot,
         continuation: bundle.continuation || null,
         thread: bundle.thread,
         liveOverlay: historicalPayload?.liveOverlay || bundle.liveOverlay || null

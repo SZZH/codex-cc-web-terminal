@@ -165,6 +165,58 @@ function mergeThreadTurns(existingTurn = {}, incomingTurn = {}) {
   };
 }
 
+export function mergeAuthoritativeThreadSnapshotPatch({
+  persistedSnapshot = null,
+  authoritativeSnapshot = null,
+  incomingSnapshot = null
+} = {}) {
+  if (!incomingSnapshot || typeof incomingSnapshot !== "object") {
+    return clonePlain(authoritativeSnapshot) || clonePlain(persistedSnapshot) || null;
+  }
+
+  const baseSnapshot =
+    clonePlain(authoritativeSnapshot) ||
+    clonePlain(persistedSnapshot) || {
+      threadId: String(incomingSnapshot.threadId || "").trim(),
+      metadata: {},
+      turns: [],
+      version: 0,
+      updatedAt: ""
+    };
+
+  const nextTurns = [...(Array.isArray(baseSnapshot.turns) ? baseSnapshot.turns : [])];
+  for (const incomingTurn of Array.isArray(incomingSnapshot.turns) ? incomingSnapshot.turns : []) {
+    const turnId = String(incomingTurn?.id || "").trim();
+    if (!turnId) {
+      continue;
+    }
+    const existingIndex = nextTurns.findIndex((turn) => String(turn?.id || "").trim() === turnId);
+    if (existingIndex >= 0) {
+      nextTurns[existingIndex] = mergeThreadTurns(nextTurns[existingIndex], incomingTurn);
+      continue;
+    }
+    const equivalentIndex = nextTurns.findIndex((turn) => areEquivalentTurns(turn, incomingTurn));
+    if (equivalentIndex >= 0) {
+      nextTurns[equivalentIndex] = mergeThreadTurns(nextTurns[equivalentIndex], incomingTurn);
+      continue;
+    }
+    nextTurns.push(incomingTurn);
+  }
+
+  return {
+    ...baseSnapshot,
+    ...incomingSnapshot,
+    threadId: String(incomingSnapshot.threadId || baseSnapshot.threadId || "").trim(),
+    metadata: {
+      ...(baseSnapshot.metadata || {}),
+      ...(incomingSnapshot.metadata || {})
+    },
+    turns: nextTurns,
+    version: Math.max(Number(baseSnapshot.version || 0), Number(incomingSnapshot.version || 0)),
+    updatedAt: String(incomingSnapshot.updatedAt || baseSnapshot.updatedAt || "")
+  };
+}
+
 function buildRuntimeDraftTurnFromMessages(messages = [], { threadId = "", liveSessionMeta = null } = {}) {
   const tail = Array.isArray(messages) ? messages : [];
   if (!tail.length) {
@@ -341,10 +393,14 @@ export function buildDisplayedThreadSnapshot({
   runtimeMessages = [],
   threadId = "",
   liveSessionMeta = null,
-  threadMeta = null
+  threadMeta = null,
+  preferAuthoritativeSnapshot = false,
+  includeLiveConversation = true,
+  includeRuntimeDraft = true
 } = {}) {
   const resolvedThreadId = String(threadId || liveSessionMeta?.resumeSessionId || threadMeta?.resumeSessionId || "").trim();
   const resolvedMeta = threadMeta || liveSessionMeta || null;
+  const hasAuthoritativeSnapshot = Boolean(authoritativeSnapshot && typeof authoritativeSnapshot === "object");
   let snapshot =
     clonePlain(authoritativeSnapshot) ||
     clonePlain(persistedSnapshot) ||
@@ -363,13 +419,15 @@ export function buildDisplayedThreadSnapshot({
         }
       : null);
 
-  if (liveConversation && Array.isArray(liveConversation.turns) && liveConversation.turns.length) {
+  const canMergeLiveConversation =
+    includeLiveConversation && (!preferAuthoritativeSnapshot || !hasAuthoritativeSnapshot);
+  if (canMergeLiveConversation && liveConversation && Array.isArray(liveConversation.turns) && liveConversation.turns.length) {
     snapshot = mergeLiveConversationIntoSnapshot(snapshot, liveConversation, liveSessionMeta || { resumeSessionId: resolvedThreadId }, {
       preserveExistingTurns: Boolean(authoritativeSnapshot)
     });
   }
 
-  if (runtimeMessages && runtimeMessages.length) {
+  if (includeRuntimeDraft && runtimeMessages && runtimeMessages.length) {
     snapshot = appendRuntimeDraftTurn(snapshot, runtimeMessages, {
       threadId: resolvedThreadId,
       liveSessionMeta: liveSessionMeta || { resumeSessionId: resolvedThreadId }
@@ -377,6 +435,28 @@ export function buildDisplayedThreadSnapshot({
   }
 
   return snapshot;
+}
+
+export function buildAuthoritativeThreadSnapshot({
+  persistedSnapshot = null,
+  authoritativeSnapshot = null,
+  liveConversation = null,
+  threadId = "",
+  liveSessionMeta = null,
+  threadMeta = null
+} = {}) {
+  return buildDisplayedThreadSnapshot({
+    persistedSnapshot,
+    authoritativeSnapshot,
+    liveConversation,
+    runtimeMessages: [],
+    threadId,
+    liveSessionMeta,
+    threadMeta,
+    preferAuthoritativeSnapshot: false,
+    includeLiveConversation: true,
+    includeRuntimeDraft: false
+  });
 }
 
 export function shouldSyncPersistedThread({

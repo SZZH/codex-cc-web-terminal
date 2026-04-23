@@ -20,6 +20,9 @@ function firstTextContent(content = []) {
     if (part?.type === "output_text" || part?.type === "input_text") {
       return part.text ?? "";
     }
+    if (part?.type === "text") {
+      return part.text ?? "";
+    }
   }
   return "";
 }
@@ -551,7 +554,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
   if (type === "item.completed") {
     const item = record.raw?.item ?? {};
     const itemType = normalizeString(item.type);
-    const text = firstTextContent(item.content);
+    const text = item.text ?? item.message ?? firstTextContent(item.content);
 
     if (itemType === "usermessage") {
       return [

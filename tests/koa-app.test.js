@@ -348,6 +348,332 @@ test("session create reuses existing live session for same provider+resume id", 
   assert.equal(sessionManager.calls.create.length, 0);
 });
 
+test("session input-stream route returns typed sse events and applies input to the session manager", async (t) => {
+  const writes = [];
+  const liveSession = {
+    id: "session-stream-1",
+    provider: "codex",
+    providerLabel: "Codex",
+    cliLabel: "Codex CLI",
+    name: "Session Stream",
+    cwd: process.cwd(),
+    kind: "live",
+    status: "running",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    exitCode: null,
+    autoNamed: false,
+    inputPreview: "",
+    resumeSessionId: "thread-stream-1",
+    model: "gpt-5",
+    titleSource: "user_provided",
+    sessionType: "main",
+    parentThreadId: "",
+    agentRole: "",
+    agentNickname: "",
+    clients: new Set()
+  };
+
+  const sessionManager = createSessionManagerStub();
+  sessionManager.get = (id) => (id === liveSession.id ? liveSession : null);
+  sessionManager.ensureLiveSessionForThread = (threadId) => {
+    assert.equal(threadId, liveSession.resumeSessionId);
+    return liveSession;
+  };
+  sessionManager.getConversationSnapshot = () => ({
+    type: "conversation.snapshot",
+    sessionId: liveSession.id,
+    threadId: liveSession.resumeSessionId,
+    conversation: {
+      sessionId: liveSession.id,
+      threadId: liveSession.resumeSessionId,
+      version: 1,
+      status: "idle",
+      turns: []
+    },
+    threadSnapshot: {
+      threadId: liveSession.resumeSessionId,
+      turns: []
+    },
+    liveOverlay: null
+  });
+  sessionManager.attachClient = (id, client) => {
+    if (id !== liveSession.id) {
+      throw new Error("Session not found");
+    }
+    liveSession.clients.add(client);
+    client.send(
+      JSON.stringify({
+        type: "conversation.snapshot",
+        sessionId: liveSession.id,
+        threadId: liveSession.resumeSessionId,
+        conversation: {
+          sessionId: liveSession.id,
+          threadId: liveSession.resumeSessionId,
+          version: 1,
+          status: "idle",
+          turns: []
+        },
+        threadSnapshot: {
+          threadId: liveSession.resumeSessionId,
+          turns: []
+        },
+        liveOverlay: null
+      })
+    );
+    client.on("close", () => {
+      liveSession.clients.delete(client);
+    });
+  };
+  sessionManager.write = (id, data) => {
+    writes.push({ id, data });
+    for (const client of liveSession.clients) {
+      client.send(JSON.stringify({ type: "message_part", part: { type: "text", text: "流式回复" }, phase: "streaming" }));
+      client.send(
+        JSON.stringify({
+          type: "conversation.snapshot",
+          sessionId: liveSession.id,
+          threadId: liveSession.resumeSessionId,
+          conversation: {
+            sessionId: liveSession.id,
+            threadId: liveSession.resumeSessionId,
+            version: 2,
+            status: "completed",
+            turns: [
+              {
+                id: "turn-1",
+                user: { id: "u1", text: "你好", ts: new Date().toISOString() },
+                assistant: {
+                  status: "completed",
+                  body: [{ id: "b1", kind: "markdown", text: "流式回复", payload: {}, ts: new Date().toISOString() }],
+                  process: [],
+                  startedAt: new Date().toISOString(),
+                  finishedAt: new Date().toISOString()
+                }
+              }
+            ]
+          },
+          threadSnapshot: {
+            threadId: liveSession.resumeSessionId,
+            turns: [{ id: "turn-1", items: [{ id: "u1", kind: "UserMessage", text: "你好" }, { id: "a1", kind: "AgentMessage", text: "流式回复" }] }]
+          },
+          liveOverlay: null
+        })
+      );
+    }
+  };
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const controller = new AbortController();
+  const response = await fetch(`${server.baseUrl}/api/sessions/${liveSession.id}/input-stream`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "content-type": "application/json",
+      accept: "text/event-stream"
+    },
+    body: JSON.stringify({ type: "input", data: "你好\n" }),
+    signal: controller.signal
+  });
+
+  assert.equal(response.status, 200);
+  assert.match(String(response.headers.get("content-type") || ""), /text\/event-stream/);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const events = [];
+
+  while (events.length < 3) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split(/\n\n/);
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const lines = chunk.split(/\r?\n/).filter(Boolean);
+      const eventLine = lines.find((line) => line.startsWith("event:"));
+      const dataLine = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+      if (!dataLine) {
+        continue;
+      }
+      events.push({
+        event: eventLine ? eventLine.slice(6).trim() : "",
+        payload: JSON.parse(dataLine)
+      });
+      if (events.length >= 3) {
+        break;
+      }
+    }
+  }
+  controller.abort();
+
+  assert.deepEqual(writes, [{ id: liveSession.id, data: "你好\n" }]);
+  assert.ok(events.some((event) => event.event === "thread.snapshot"));
+  assert.ok(events.some((event) => event.event === "thread.overlay"));
+});
+
+test("thread input-stream route can resume or create a live session from thread id", async (t) => {
+  const writes = [];
+  const liveSession = {
+    id: "session-thread-stream-1",
+    provider: "codex",
+    providerLabel: "Codex",
+    cliLabel: "Codex CLI",
+    name: "Thread Stream",
+    cwd: process.cwd(),
+    kind: "live",
+    status: "running",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    exitCode: null,
+    autoNamed: false,
+    inputPreview: "",
+    resumeSessionId: "thread-stream-1",
+    model: "gpt-5",
+    titleSource: "user_provided",
+    sessionType: "main",
+    parentThreadId: "",
+    agentRole: "",
+    agentNickname: "",
+    clients: new Set(),
+    currentTurnId: "turn-1"
+  };
+
+  const sessionManager = createSessionManagerStub();
+  sessionManager.findRunningLiveSessionByResume = () => ({ id: liveSession.id });
+  sessionManager.ensureLiveSessionForThread = () => liveSession;
+  sessionManager.get = (id) => (id === liveSession.id ? liveSession : null);
+  sessionManager.attachClient = (id, client) => {
+    if (id !== liveSession.id) {
+      throw new Error("Session not found");
+    }
+    liveSession.clients.add(client);
+    client.send(
+      JSON.stringify({
+        type: "conversation.snapshot",
+        sessionId: liveSession.id,
+        threadId: liveSession.resumeSessionId,
+        conversation: {
+          sessionId: liveSession.id,
+          threadId: liveSession.resumeSessionId,
+          version: 1,
+          status: "running",
+          turns: []
+        },
+        threadSnapshot: {
+          threadId: liveSession.resumeSessionId,
+          turns: []
+        },
+        liveOverlay: null
+      })
+    );
+    client.on("close", () => {
+      liveSession.clients.delete(client);
+    });
+  };
+  sessionManager.write = (id, data) => {
+    writes.push({ id, data });
+    for (const client of liveSession.clients) {
+      client.send(JSON.stringify({ type: "message_part", part: { type: "text", text: "线程流式回复" }, phase: "streaming" }));
+      client.send(
+        JSON.stringify({
+          type: "conversation.snapshot",
+          sessionId: liveSession.id,
+          threadId: liveSession.resumeSessionId,
+          conversation: {
+            sessionId: liveSession.id,
+            threadId: liveSession.resumeSessionId,
+            version: 2,
+            status: "completed",
+            turns: [
+              {
+                id: "turn-1",
+                user: { id: "u1", text: "继续这个 thread", ts: new Date().toISOString() },
+                assistant: {
+                  status: "completed",
+                  body: [{ id: "b1", kind: "markdown", text: "线程流式回复", payload: {}, ts: new Date().toISOString() }],
+                  process: [],
+                  startedAt: new Date().toISOString(),
+                  finishedAt: new Date().toISOString()
+                }
+              }
+            ]
+          },
+          threadSnapshot: {
+            threadId: liveSession.resumeSessionId,
+            turns: [{ id: "turn-1", items: [{ id: "u1", kind: "UserMessage", text: "继续这个 thread" }, { id: "a1", kind: "AgentMessage", text: "线程流式回复" }] }]
+          },
+          liveOverlay: null
+        })
+      );
+    }
+  };
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const controller = new AbortController();
+  const response = await fetch(`${server.baseUrl}/api/threads/codex/thread-stream-1/input-stream`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "content-type": "application/json",
+      accept: "text/event-stream"
+    },
+    body: JSON.stringify({ type: "input", data: "继续这个 thread\n" }),
+    signal: controller.signal
+  });
+
+  assert.equal(response.status, 200);
+  assert.match(String(response.headers.get("content-type") || ""), /text\/event-stream/);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const events = [];
+
+  while (events.length < 2) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split(/\n\n/);
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const lines = chunk.split(/\r?\n/).filter(Boolean);
+      const eventLine = lines.find((line) => line.startsWith("event:"));
+      const dataLine = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+      if (!dataLine) {
+        continue;
+      }
+      events.push({
+        event: eventLine ? eventLine.slice(6).trim() : "",
+        payload: JSON.parse(dataLine)
+      });
+      if (events.length >= 2) {
+        break;
+      }
+    }
+  }
+  controller.abort();
+
+  assert.deepEqual(writes, [{ id: liveSession.id, data: "继续这个 thread\n" }]);
+  assert.ok(events.some((event) => event.event === "thread.snapshot"));
+  assert.ok(events.some((event) => event.event === "thread.overlay"));
+});
+
 test("fs and history routes return manager-backed payloads", async (t) => {
   const sessionManager = createSessionManagerStub();
   const server = await startTestServer({ sessionManager });
@@ -716,6 +1042,155 @@ test("history messages route falls back to live continuation when historical ses
   assert.equal(payload.turns.length, 1);
   assert.equal(payload.turns[0].assistant.body[0].text, "只有 live 的回答");
   assert.equal(payload.messages.length, 0);
+});
+
+test("history messages route prefers live continuation over stale persisted snapshot when both exist", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  sessionManager.getThreadSnapshotBundle = (provider, resumeSessionId) => ({
+    session: {
+      id: `history:${provider}:${resumeSessionId}`,
+      kind: "history",
+      provider,
+      resumeSessionId
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        {
+          id: "turn-stale",
+          items: [
+            { id: "u-stale", kind: "UserMessage", text: "旧问题" },
+            { id: "a-stale", kind: "AgentMessage", text: "旧回答" }
+          ]
+        }
+      ]
+    },
+    conversation: {
+      sessionId: `history:${provider}:${resumeSessionId}`,
+      threadId: resumeSessionId,
+      version: 10,
+      status: "completed",
+      turns: [
+        {
+          id: "turn-stale",
+          user: { id: "u-stale", text: "旧问题", ts: new Date().toISOString() },
+          assistant: {
+            body: [{ id: "body-stale", kind: "markdown", text: "旧回答", payload: {}, ts: new Date().toISOString() }],
+            process: [],
+            status: "completed",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString()
+          }
+        }
+      ],
+      backgroundAgents: []
+    },
+    liveOverlay: null,
+    conversationSnapshot: null
+  });
+  sessionManager.getHistoricalMessages = (provider, resumeSessionId) => ({
+    session: {
+      id: `history:${provider}:${resumeSessionId}`,
+      kind: "history",
+      provider,
+      resumeSessionId
+    },
+    messages: [],
+    turns: [],
+    backgroundAgents: [],
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        {
+          id: "turn-stale",
+          items: [
+            { id: "u-stale", kind: "UserMessage", text: "旧问题" },
+            { id: "a-stale", kind: "AgentMessage", text: "旧回答" }
+          ]
+        }
+      ]
+    },
+    liveOverlay: null,
+    conversation: {
+      sessionId: `history:${provider}:${resumeSessionId}`,
+      threadId: resumeSessionId,
+      version: 10,
+      status: "completed",
+      turns: [
+        {
+          id: "turn-stale",
+          user: { id: "u-stale", text: "旧问题", ts: new Date().toISOString() },
+          assistant: {
+            body: [{ id: "body-stale", kind: "markdown", text: "旧回答", payload: {}, ts: new Date().toISOString() }],
+            process: [],
+            status: "completed",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString()
+          }
+        }
+      ],
+      backgroundAgents: []
+    },
+    conversationSnapshot: null
+  });
+  sessionManager.getThreadContinuationRuntime = (provider, resumeSessionId) => ({
+    session: {
+      id: "session-live-fresh",
+      kind: "live",
+      provider,
+      resumeSessionId
+    },
+    conversation: {
+      sessionId: "session-live-fresh",
+      threadId: resumeSessionId,
+      version: 11,
+      status: "completed",
+      turns: [
+        {
+          id: "turn-fresh",
+          user: { id: "u-fresh", text: "新问题", ts: new Date().toISOString() },
+          assistant: {
+            body: [{ id: "body-fresh", kind: "markdown", text: "新回答", payload: {}, ts: new Date().toISOString() }],
+            process: [],
+            status: "completed",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString()
+          }
+        }
+      ],
+      backgroundAgents: []
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        {
+          id: "turn-fresh",
+          items: [
+            { id: "u-fresh", kind: "UserMessage", text: "新问题" },
+            { id: "a-fresh", kind: "AgentMessage", text: "新回答" }
+          ]
+        }
+      ]
+    },
+    liveOverlay: null
+  });
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/history-messages?provider=codex&resumeSessionId=thread-1`, {
+    headers: { cookie: cookies }
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.session.id, "session-live-fresh");
+  assert.equal(payload.threadSnapshot.turns[0].id, "turn-fresh");
+  assert.equal(payload.threadSnapshot.turns[0].items[1].text, "新回答");
+  assert.equal(payload.conversation.turns[0].assistant.body[0].text, "新回答");
 });
 
 test("invalid input payloads return 400 for json-backed routes", async (t) => {

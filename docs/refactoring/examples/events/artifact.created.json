@@ -1,0 +1,22 @@
+{
+  "id": "evt-thread-refactor-001-0004",
+  "seq": 4,
+  "provider": "codex",
+  "providerThreadId": "provider-thread-refactor-001",
+  "providerTurnId": "provider-turn-refactor-001",
+  "threadId": "thread-refactor-001",
+  "turnId": "turn-refactor-001",
+  "ts": "2026-04-22T10:00:03.000Z",
+  "kind": "artifact.created",
+  "payload": {
+    "artifactId": "artifact-refactor-001",
+    "artifactKind": "file",
+    "label": "canonical-samples-manifest.json",
+    "url": "file:///artifacts/canonical-samples-manifest.json",
+    "metadata": {
+      "contentType": "application/json",
+      "bytes": 812,
+      "source": "docs/refactoring/examples"
+    }
+  }
+}

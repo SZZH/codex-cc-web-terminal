@@ -474,6 +474,51 @@ test("display state keeps authoritative current turn stable when runtime draft s
   assert.equal(snapshot.turns.filter((turn) => turn.id === "runtime-draft:thread-1").length, 0);
 });
 
+test("display state keeps a completed authoritative turn immutable when stale same-turn continuation data arrives", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    authoritativeSnapshot: {
+      threadId: "thread-immutable",
+      metadata: { name: "会话" },
+      turns: [
+        {
+          id: "turn-immutable-1",
+          status: "completed",
+          startedAt: "2026-04-22T00:00:00.000Z",
+          completedAt: "2026-04-22T00:00:05.000Z",
+          items: [
+            { id: "u1", kind: "UserMessage", text: "历史问题" },
+            { id: "a1", kind: "AgentMessage", text: "已经提交的最终答案" }
+          ]
+        }
+      ],
+      version: 4,
+      updatedAt: "2026-04-22T00:00:05.000Z"
+    },
+    liveConversation: {
+      turns: [
+        {
+          id: "turn-immutable-1",
+          user: { text: "历史问题", ts: "2026-04-22T00:00:00.000Z" },
+          assistant: {
+            status: "running",
+            body: [{ text: "不应该覆盖最终答案的晚到实时文本" }]
+          }
+        }
+      ]
+    },
+    threadId: "thread-immutable",
+    liveSessionMeta: { resumeSessionId: "thread-immutable" },
+    threadMeta: { resumeSessionId: "thread-immutable" }
+  });
+
+  assert.equal(snapshot.turns.length, 1);
+  assert.equal(snapshot.turns[0].status, "completed");
+  assert.deepEqual(
+    snapshot.turns[0].items.map((item) => item.text),
+    ["历史问题", "已经提交的最终答案"]
+  );
+});
+
 test("display state deduplicates same historical turn when live conversation carries a different legacy turn id", () => {
   const snapshot = buildDisplayedThreadSnapshot({
     authoritativeSnapshot: {

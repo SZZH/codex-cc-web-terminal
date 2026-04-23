@@ -5,7 +5,15 @@ import { useRoute, useRouter } from "vue-router";
 import ChatView from "./components/ChatView.vue";
 import LoginView from "./components/LoginView.vue";
 import SessionListView from "./components/SessionListView.vue";
-import { AUTH_EXPIRED_EVENT, request, requestAuthSession, requestHistoryMessages, requestSessionById } from "./lib/api.js";
+import {
+  AUTH_EXPIRED_EVENT,
+  request,
+  requestAuthSession,
+  requestHistoryMessages,
+  requestSessionById,
+  requestSessionInputStream,
+  requestThreadInputStream
+} from "./lib/api.js";
 import {
   applyConversationDeltaPayload,
   buildTimelineMessages,
@@ -17,7 +25,12 @@ import {
 } from "./lib/conversation-timeline.js";
 import { normalizeServerPayload } from "./lib/normalize-events.js";
 import { resolveInitialAuthBootstrap } from "./lib/auth-bootstrap.js";
-import { buildDisplayedThreadSnapshot, shouldSyncPersistedThread } from "./lib/thread-display-state.js";
+import {
+  buildAuthoritativeThreadSnapshot,
+  buildDisplayedThreadSnapshot,
+  mergeAuthoritativeThreadSnapshotPatch,
+  shouldSyncPersistedThread
+} from "./lib/thread-display-state.js";
 import {
   PREVIEW_FALLBACK,
   compactLine,
@@ -82,6 +95,9 @@ const state = reactive({
     hasConversationDelta: false,
     backgroundAgents: [],
     socket: null,
+    activeInputStream: false,
+    interruptInFlight: false,
+    muteSocketLifecycleStatus: false,
     streamBuffer: "",
     openToken: 0,
     replayGuardActive: false,
@@ -123,6 +139,9 @@ function resetLiveView() {
   state.liveView.hasConversationDelta = false;
   state.liveView.backgroundAgents = [];
   state.liveView.socket = null;
+  state.liveView.activeInputStream = false;
+  state.liveView.interruptInFlight = false;
+  state.liveView.muteSocketLifecycleStatus = false;
   state.liveView.streamBuffer = "";
   state.liveView.replayGuardActive = false;
   state.liveView.replayGuardPrompt = "";
@@ -241,6 +260,9 @@ const displayedSessionMeta = computed(() => {
   return null;
 });
 const displayedThreadSnapshot = computed(() => {
+  const preferAuthoritativeSnapshot = Boolean(
+    state.threadView.authoritativeSnapshot || state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta
+  );
   return buildDisplayedThreadSnapshot({
     persistedSnapshot: state.threadView.persistedSnapshot,
     authoritativeSnapshot: state.threadView.authoritativeSnapshot,
@@ -248,7 +270,10 @@ const displayedThreadSnapshot = computed(() => {
     runtimeMessages: state.liveView.messages,
     threadId: activeThreadId.value,
     liveSessionMeta: state.liveView.sessionMeta,
-    threadMeta: state.threadView.meta
+    threadMeta: state.threadView.meta,
+    preferAuthoritativeSnapshot,
+    includeLiveConversation: !preferAuthoritativeSnapshot,
+    includeRuntimeDraft: true
   });
 });
 const displayedLiveOverlay = computed(() => {
@@ -288,12 +313,11 @@ const canRenderChatView = computed(() => {
   return Boolean(displayedSessionMeta.value || displayedThreadSnapshot.value);
 });
 const canInterrupt = computed(() => {
-  const socketReady =
-    Boolean(state.liveView.liveSessionId) &&
-    Boolean(state.liveView.socket) &&
-    state.liveView.socket.readyState === WebSocket.OPEN;
-  if (!socketReady) {
+  if (!state.liveView.liveSessionId) {
     return false;
+  }
+  if (state.liveView.activeInputStream || state.liveView.interruptInFlight) {
+    return true;
   }
   if (state.loading) {
     return true;
@@ -426,13 +450,50 @@ function setLiveOverlay(liveOverlay = null) {
   state.liveView.liveOverlay = liveOverlay && typeof liveOverlay === "object" ? liveOverlay : null;
 }
 
-function setLiveThreadSnapshot(snapshot = null, liveOverlay = null) {
-  state.threadView.authoritativeSnapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
+function setLiveThreadSnapshot(snapshot = null, liveOverlay = null, { partial = false } = {}) {
+  state.threadView.authoritativeSnapshot =
+    snapshot && typeof snapshot === "object"
+      ? partial
+        ? mergeAuthoritativeThreadSnapshotPatch({
+            persistedSnapshot: state.threadView.persistedSnapshot,
+            authoritativeSnapshot: state.threadView.authoritativeSnapshot,
+            incomingSnapshot: snapshot
+          })
+        : snapshot
+      : null;
   state.threadView.threadId = String(
-    snapshot?.threadId || state.threadView.threadId || state.threadView.persistedSnapshot?.threadId || ""
+    state.threadView.authoritativeSnapshot?.threadId ||
+      snapshot?.threadId ||
+      state.threadView.threadId ||
+      state.threadView.persistedSnapshot?.threadId ||
+      ""
   ).trim();
   setLiveOverlay(liveOverlay);
   syncThreadViewFromInteraction();
+}
+
+function resolveAuthoritativeLiveThreadSnapshot({ threadSnapshot = null, conversation = null, fallbackThreadId = "" } = {}) {
+  if (threadSnapshot && typeof threadSnapshot === "object") {
+    return threadSnapshot;
+  }
+  if (!conversation || typeof conversation !== "object") {
+    return state.threadView.authoritativeSnapshot || state.threadView.persistedSnapshot || null;
+  }
+  return buildAuthoritativeThreadSnapshot({
+    persistedSnapshot: state.threadView.persistedSnapshot,
+    authoritativeSnapshot: state.threadView.authoritativeSnapshot,
+    liveConversation: conversation,
+    threadId:
+      String(
+        fallbackThreadId ||
+          conversation?.threadId ||
+          state.liveView.sessionMeta?.resumeSessionId ||
+          state.threadView.threadId ||
+          ""
+      ).trim(),
+    liveSessionMeta: state.liveView.sessionMeta,
+    threadMeta: state.threadView.meta
+  });
 }
 
 function payloadOwnsKey(payload, key) {
@@ -470,13 +531,23 @@ function shouldApplyIncomingConversation(nextConversation, { force = false } = {
 
   const currentVersion = Number(current.version || 0);
   const incomingVersion = Number(incoming.version || 0);
+  const contentComparison = compareConversationContent(incoming, current);
   if (incomingVersion < currentVersion) {
+    return false;
+  }
+  if (
+    incomingVersion > currentVersion &&
+    contentComparison < 0 &&
+    String(incoming.threadId || "") === String(current.threadId || "") &&
+    String(incoming.activeTurnId || "") &&
+    String(incoming.activeTurnId || "") === String(current.activeTurnId || "")
+  ) {
     return false;
   }
   if (incomingVersion === currentVersion && incoming.turns.length < current.turns.length) {
     return false;
   }
-  if (incomingVersion === currentVersion && compareConversationContent(incoming, current) < 0) {
+  if (incomingVersion === currentVersion && contentComparison < 0) {
     return false;
   }
   return true;
@@ -496,6 +567,79 @@ function setConversation(conversation, { fallbackMessages = [], buffer = "", for
   setMessages(nextMessages);
   syncThreadViewFromInteraction();
   return true;
+}
+
+function mergeConversationTurns(existingTurns = [], incomingTurns = []) {
+  const collectAssistantText = (assistant = null) =>
+    (Array.isArray(assistant?.body) ? assistant.body : [])
+      .map((part) => String(part?.text || "").trim())
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+
+  const mergeAssistant = (existingAssistant = null, incomingAssistant = null) => {
+    if (!existingAssistant) {
+      return incomingAssistant || null;
+    }
+    if (!incomingAssistant) {
+      return existingAssistant;
+    }
+
+    const existingText = collectAssistantText(existingAssistant);
+    const incomingText = collectAssistantText(incomingAssistant);
+    const keepExistingBody = existingText.length > incomingText.length;
+
+    return {
+      ...existingAssistant,
+      ...incomingAssistant,
+      body: keepExistingBody
+        ? existingAssistant.body || []
+        : incomingAssistant.body || existingAssistant.body || [],
+      process:
+        Array.isArray(incomingAssistant.process) && incomingAssistant.process.length
+          ? incomingAssistant.process
+          : existingAssistant.process || [],
+      status:
+        String(incomingAssistant.status || "").trim().toLowerCase() === "completed" ||
+        String(existingAssistant.status || "").trim().toLowerCase() !== "completed"
+          ? incomingAssistant.status || existingAssistant.status || ""
+          : existingAssistant.status || incomingAssistant.status || "",
+      startedAt: existingAssistant.startedAt || incomingAssistant.startedAt || "",
+      finishedAt: incomingAssistant.finishedAt || existingAssistant.finishedAt || ""
+    };
+  };
+
+  const nextTurns = Array.isArray(existingTurns) ? [...existingTurns] : [];
+  for (const incomingTurn of Array.isArray(incomingTurns) ? incomingTurns : []) {
+    const turnId = String(incomingTurn?.id || "").trim();
+    if (!turnId) {
+      continue;
+    }
+    const existingIndex = nextTurns.findIndex((turn) => String(turn?.id || "").trim() === turnId);
+    if (existingIndex >= 0) {
+      nextTurns[existingIndex] = {
+        ...nextTurns[existingIndex],
+        ...incomingTurn,
+        user: incomingTurn?.user || nextTurns[existingIndex]?.user || null,
+        assistant: mergeAssistant(nextTurns[existingIndex]?.assistant || null, incomingTurn?.assistant || null)
+      };
+      continue;
+    }
+    nextTurns.push(incomingTurn);
+  }
+  return nextTurns;
+}
+
+function mergeConversationPatch(currentConversation, patchConversation) {
+  const current = createConversationState(currentConversation);
+  const patch = createConversationState(patchConversation);
+  return createConversationState({
+    ...current,
+    ...patch,
+    turns: mergeConversationTurns(current.turns, patch.turns),
+    backgroundAgents: patch.backgroundAgents?.length ? patch.backgroundAgents : current.backgroundAgents,
+    activeTurnId: String(patch.activeTurnId || current.activeTurnId || "")
+  });
 }
 function buildSubmissionText(text) {
   const fragments = [];
@@ -821,6 +965,18 @@ function clearPendingReplyStatus() {
   }
 }
 
+function isTerminalTurnStatus(status = "") {
+  const normalized = String(status || "").trim().toLowerCase();
+  return normalized === "completed" || normalized === "failed" || normalized === "aborted" || normalized === "interrupted";
+}
+
+function settleAuthoritativeInputState() {
+  state.liveView.activeInputStream = false;
+  state.liveView.interruptInFlight = false;
+  state.loading = false;
+  clearPendingReplyStatus();
+}
+
 async function hydrateSession(session, { includeMessages = false, silent = false, forceRefresh = false } = {}) {
   if (!session || session.kind === "live" || !session.resumeSessionId) {
     return null;
@@ -1094,12 +1250,15 @@ async function handleLogin({ silent = false, auto = false } = {}) {
   }
 }
 
-function closeSocket() {
+function closeSocket({ silent = false } = {}) {
   clearSubmitFallbackTimer();
   if (state.liveView.socket) {
+    state.liveView.muteSocketLifecycleStatus = Boolean(silent);
     state.liveView.socket.close();
     state.liveView.socket = null;
+    return;
   }
+  state.liveView.muteSocketLifecycleStatus = false;
 }
 
 function waitForSocketOpen(socket, timeoutMs = 20000) {
@@ -1141,13 +1300,296 @@ function waitForSocketOpen(socket, timeoutMs = 20000) {
   });
 }
 
+function handleLivePayload(payload) {
+  if (payload.type === "thread.snapshot") {
+    stopHistorySyncLoop();
+    const conversationPatch = buildConversationStateFromPayload(
+      {
+        conversation: payload?.conversation || {},
+        sessionId: payload?.sessionId || "",
+        threadId: payload?.threadId || "",
+        threadSnapshot: payload?.snapshot || null,
+        liveOverlay: payload?.liveOverlay || null,
+        timestamp: payload?.timestamp || ""
+      },
+      state.liveView.conversation
+    );
+    const nextConversation = payload?.partial
+      ? mergeConversationPatch(state.liveView.conversation, conversationPatch)
+      : conversationPatch;
+    const applied = setConversation(nextConversation, {
+      fallbackMessages: collectConversationFallbackMessages(state.liveView.messages)
+    });
+    setLiveThreadSnapshot(
+      resolveAuthoritativeLiveThreadSnapshot({
+        threadSnapshot: payload?.snapshot || null,
+        conversation: nextConversation,
+        fallbackThreadId: payload?.threadId || activeThreadId.value
+      }),
+      payload?.liveOverlay || null,
+      { partial: Boolean(payload?.partial) }
+    );
+    if (applied || payload?.snapshot || payload?.liveOverlay) {
+      state.liveView.hasConversationSnapshot = true;
+      state.liveView.hasConversationDelta = true;
+    }
+    const trackedTurnId = String(payload?.turnId || nextConversation?.activeTurnId || "").trim();
+    const authoritativeTurn =
+      (Array.isArray(nextConversation?.turns) ? nextConversation.turns : []).find(
+        (turn) => String(turn?.id || "").trim() === trackedTurnId
+      ) || null;
+    const authoritativeAssistantStatus = String(authoritativeTurn?.assistant?.status || "").trim().toLowerCase();
+    if (isTerminalTurnStatus(payload?.status) || isTerminalTurnStatus(authoritativeAssistantStatus)) {
+      settleAuthoritativeInputState();
+    }
+    return;
+  }
+
+  if (payload.type === "thread.overlay") {
+    stopHistorySyncLoop();
+    setLiveOverlay(payload);
+    state.liveView.hasConversationSnapshot = true;
+    state.liveView.hasConversationDelta = true;
+    const parts = Array.isArray(payload.parts) ? payload.parts : [];
+    const normalizedParts = parts
+      .map((part) => {
+        if (String(part?.type || "").trim().toLowerCase() !== "text") {
+          return null;
+        }
+        return {
+          role: payload?.role === "user" ? "user" : "assistant",
+          partType: "markdown",
+          payload: {
+            text: String(part?.text || "")
+          },
+          ts: payload?.timestamp || new Date().toISOString(),
+          phase: payload?.phase || "streaming",
+          source: "message_part",
+          rawType: "message_part"
+        };
+      })
+      .filter(Boolean);
+    appendNormalizedParts(normalizedParts);
+    return;
+  }
+
+  if (payload.type === "session.updated") {
+    const updatedPayload = {
+      type: "session_updated",
+      session: payload.session || null
+    };
+    handleLivePayload(updatedPayload);
+    return;
+  }
+
+  if (payload.type === "transport.error") {
+    const errorText = String(payload.error || "会话发生未知错误。").trim();
+    clearPendingReplyStatus();
+    appendNormalizedParts([
+      {
+        role: "system",
+        partType: "text",
+        payload: { text: errorText },
+        ts: new Date().toISOString(),
+        phase: "final",
+        source: "transport.error",
+        rawType: "error"
+      }
+    ]);
+    setStatus(errorText);
+    return;
+  }
+
+  if (payload.type === "conversation.snapshot") {
+    const nextConversation = buildConversationStateFromPayload(payload, state.liveView.conversation);
+    const applied = setConversation(nextConversation, {
+      fallbackMessages: collectConversationFallbackMessages(state.liveView.messages),
+      buffer: payload?.buffer || ""
+    });
+    setLiveThreadSnapshot(
+      resolveAuthoritativeLiveThreadSnapshot({
+        threadSnapshot: payload?.threadSnapshot || null,
+        conversation: nextConversation,
+        fallbackThreadId: payload?.threadId || activeThreadId.value
+      }),
+      payload?.liveOverlay || null
+    );
+    if (applied) {
+      state.liveView.hasConversationSnapshot = true;
+    }
+    return;
+  }
+
+  if (payload.type === "conversation.delta") {
+    clearPendingReplyStatus();
+    const applied = applyConversationDeltaPayload(state.liveView.conversation, payload);
+    const updated = setConversation(applied.conversation, {
+      fallbackMessages: collectConversationFallbackMessages(state.liveView.messages)
+    });
+    setLiveThreadSnapshot(
+      resolveAuthoritativeLiveThreadSnapshot({
+        threadSnapshot: resolvePayloadValue(payload, "threadSnapshot", null),
+        conversation: applied.conversation,
+        fallbackThreadId: payload?.threadId || activeThreadId.value
+      }),
+      resolvePayloadValue(payload, "liveOverlay", state.liveView.liveOverlay)
+    );
+    if (updated) {
+      state.liveView.hasConversationSnapshot = true;
+      state.liveView.hasConversationDelta = true;
+    }
+    return;
+  }
+
+  if (payload.type === "snapshot") {
+    if (state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta) {
+      return;
+    }
+    const nextConversation = buildConversationStateFromPayload(payload, state.liveView.conversation);
+    const applied = setConversation(nextConversation, {
+      fallbackMessages: state.liveView.messages,
+      buffer: payload?.buffer || ""
+    });
+    setLiveThreadSnapshot(
+      resolveAuthoritativeLiveThreadSnapshot({
+        threadSnapshot: payload?.threadSnapshot || null,
+        conversation: nextConversation,
+        fallbackThreadId: payload?.threadId || activeThreadId.value
+      }),
+      payload?.liveOverlay || null
+    );
+    if (applied) {
+      state.liveView.hasConversationSnapshot = true;
+    }
+    return;
+  }
+
+  if (payload.type === "conversation_snapshot") {
+    if (state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta) {
+      return;
+    }
+    const nextConversation = buildConversationStateFromPayload(payload, state.liveView.conversation);
+    const applied = setConversation(nextConversation, {
+      fallbackMessages: state.liveView.messages
+    });
+    setLiveThreadSnapshot(
+      resolveAuthoritativeLiveThreadSnapshot({
+        threadSnapshot: payload?.threadSnapshot || null,
+        conversation: nextConversation,
+        fallbackThreadId: payload?.threadId || activeThreadId.value
+      }),
+      payload?.liveOverlay || null
+    );
+    if (applied) {
+      state.liveView.hasConversationSnapshot = true;
+    }
+    return;
+  }
+
+  if (payload.type === "session_updated" && payload.session) {
+    const updated = decorateSession(payload.session);
+    state.liveView.sessionMeta = updated;
+    if (state.liveView.sessionId === updated.id) {
+      state.liveView.liveSessionId = updated.id;
+    }
+    if (state.threadView.threadId && String(updated.resumeSessionId || "").trim() === state.threadView.threadId) {
+      state.threadView.meta = {
+        ...(state.threadView.meta || {}),
+        ...updated,
+        kind: "thread",
+        id: state.threadView.sessionId || `history:${updated.provider}:${updated.resumeSessionId}`
+      };
+    }
+    const index = state.sessions.findIndex((item) => item.id === updated.id);
+    if (index >= 0) {
+      const next = [...state.sessions];
+      next[index] = updated;
+      state.sessions = next;
+    }
+    return;
+  }
+
+  if (payload.type === "data") {
+    if (state.liveView.hasConversationDelta) {
+      return;
+    }
+    if (payload.data && String(payload.data).trim()) {
+      clearPendingReplyStatus();
+    }
+    appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
+    return;
+  }
+
+  if (payload.type === "message_part") {
+    if (state.liveView.hasConversationDelta) {
+      return;
+    }
+    if (payload?.part?.type === "text" && String(payload?.part?.text || "").trim()) {
+      clearPendingReplyStatus();
+    }
+    appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
+    return;
+  }
+
+  if (payload.type === "event_msg") {
+    if (state.liveView.hasConversationDelta) {
+      return;
+    }
+    appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
+    return;
+  }
+
+  if (payload.type === "response_item") {
+    if (state.liveView.hasConversationDelta) {
+      return;
+    }
+    appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
+    return;
+  }
+
+  if (payload.type === "error") {
+    const errorText = String(payload.error || "会话发生未知错误。").trim();
+    clearPendingReplyStatus();
+    appendNormalizedParts([
+      {
+        role: "system",
+        partType: "text",
+        payload: { text: errorText },
+        ts: new Date().toISOString(),
+        phase: "final",
+        source: "ws_error",
+        rawType: "error"
+      }
+    ]);
+    setStatus(errorText);
+    return;
+  }
+
+  if (payload.type === "exit") {
+    finalizeAssistantStream();
+    const exitCode = Number(payload.exitCode ?? 0);
+    if (state.statusText === "已发送中断指令。") {
+      setStatus("当前流程已中断。");
+      return;
+    }
+    if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
+      setStatus(exitCode === 0 ? "本轮回复已结束。" : `Codex 会话异常退出（${exitCode}），请重试一次。`);
+      return;
+    }
+    if (exitCode !== 0) {
+      setStatus(`Codex 会话异常退出（${exitCode}），请重试一次。`);
+    }
+  }
+}
+
 function attachLiveSocket(sessionId) {
-  closeSocket();
+  closeSocket({ silent: true });
   finalizeAssistantStream();
   state.liveView.liveSessionId = sessionId;
   state.liveView.streamBuffer = "";
   state.liveView.hasConversationSnapshot = false;
   state.liveView.hasConversationDelta = false;
+  state.liveView.muteSocketLifecycleStatus = false;
   const socket = new WebSocket(resolveWsUrl(sessionId));
   state.liveView.socket = socket;
 
@@ -1158,166 +1600,19 @@ function attachLiveSocket(sessionId) {
     } catch {
       return;
     }
-
-    if (payload.type === "conversation.snapshot") {
-      const applied = setConversation(buildConversationStateFromPayload(payload, state.liveView.conversation), {
-        fallbackMessages: collectConversationFallbackMessages(state.liveView.messages),
-        buffer: payload?.buffer || ""
-      });
-      setLiveThreadSnapshot(payload?.threadSnapshot || null, payload?.liveOverlay || null);
-      if (applied) {
-        state.liveView.hasConversationSnapshot = true;
-      }
-      return;
-    }
-
-    if (payload.type === "conversation.delta") {
-      clearPendingReplyStatus();
-      const applied = applyConversationDeltaPayload(state.liveView.conversation, payload);
-      const updated = setConversation(applied.conversation, {
-        fallbackMessages: collectConversationFallbackMessages(state.liveView.messages)
-      });
-      setLiveThreadSnapshot(
-        resolvePayloadValue(payload, "threadSnapshot", state.threadView.authoritativeSnapshot || state.threadView.persistedSnapshot),
-        resolvePayloadValue(payload, "liveOverlay", state.liveView.liveOverlay)
-      );
-      if (updated) {
-        state.liveView.hasConversationSnapshot = true;
-        state.liveView.hasConversationDelta = true;
-      }
-      return;
-    }
-
-    if (payload.type === "snapshot") {
-      if (state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta) {
-        return;
-      }
-      const applied = setConversation(buildConversationStateFromPayload(payload, state.liveView.conversation), {
-        fallbackMessages: state.liveView.messages,
-        buffer: payload?.buffer || ""
-      });
-      setLiveThreadSnapshot(payload?.threadSnapshot || null, payload?.liveOverlay || null);
-      if (applied) {
-        state.liveView.hasConversationSnapshot = true;
-      }
-      return;
-    }
-
-    if (payload.type === "conversation_snapshot") {
-      if (state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta) {
-        return;
-      }
-      const applied = setConversation(buildConversationStateFromPayload(payload, state.liveView.conversation), {
-        fallbackMessages: state.liveView.messages
-      });
-      setLiveThreadSnapshot(payload?.threadSnapshot || null, payload?.liveOverlay || null);
-      if (applied) {
-        state.liveView.hasConversationSnapshot = true;
-      }
-      return;
-    }
-
-    if (payload.type === "session_updated" && payload.session) {
-      const updated = decorateSession(payload.session);
-      state.liveView.sessionMeta = updated;
-      if (state.liveView.sessionId === updated.id) {
-        state.liveView.liveSessionId = updated.id;
-      }
-      if (state.threadView.threadId && String(updated.resumeSessionId || "").trim() === state.threadView.threadId) {
-        state.threadView.meta = {
-          ...(state.threadView.meta || {}),
-          ...updated,
-          kind: "thread",
-          id: state.threadView.sessionId || `history:${updated.provider}:${updated.resumeSessionId}`
-        };
-      }
-      const index = state.sessions.findIndex((item) => item.id === updated.id);
-      if (index >= 0) {
-        const next = [...state.sessions];
-        next[index] = updated;
-        state.sessions = next;
-      }
-      return;
-    }
-
-    if (payload.type === "data") {
-      if (state.liveView.hasConversationDelta) {
-        return;
-      }
-      if (payload.data && String(payload.data).trim()) {
-        clearPendingReplyStatus();
-      }
-      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
-      return;
-    }
-
-    if (payload.type === "message_part") {
-      if (state.liveView.hasConversationDelta) {
-        return;
-      }
-      if (payload?.part?.type === "text" && String(payload?.part?.text || "").trim()) {
-        clearPendingReplyStatus();
-      }
-      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
-      return;
-    }
-
-    if (payload.type === "event_msg") {
-      if (state.liveView.hasConversationDelta) {
-        return;
-      }
-      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
-      return;
-    }
-
-    if (payload.type === "response_item") {
-      if (state.liveView.hasConversationDelta) {
-        return;
-      }
-      appendNormalizedParts(normalizeServerPayload(payload, state.liveView.sessionId));
-      return;
-    }
-
-    if (payload.type === "error") {
-      const errorText = String(payload.error || "会话发生未知错误。").trim();
-      clearPendingReplyStatus();
-      appendNormalizedParts([
-        {
-          role: "system",
-          partType: "text",
-          payload: { text: errorText },
-          ts: new Date().toISOString(),
-          phase: "final",
-          source: "ws_error",
-          rawType: "error"
-        }
-      ]);
-      setStatus(errorText);
-      return;
-    }
-
-    if (payload.type === "exit") {
-      finalizeAssistantStream();
-      const exitCode = Number(payload.exitCode ?? 0);
-      if (state.statusText === "已发送中断指令。") {
-        setStatus("当前流程已中断。");
-        return;
-      }
-      if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
-        setStatus(exitCode === 0 ? "本轮回复已结束。" : `Codex 会话异常退出（${exitCode}），请重试一次。`);
-        return;
-      }
-      if (exitCode !== 0) {
-        setStatus(`Codex 会话异常退出（${exitCode}），请重试一次。`);
-      }
-    }
+    handleLivePayload(payload);
   });
 
   socket.addEventListener("close", () => {
+    const silentClose = state.liveView.muteSocketLifecycleStatus;
+    state.liveView.muteSocketLifecycleStatus = false;
     if (state.liveView.socket === socket) {
       state.liveView.socket = null;
     }
     finalizeAssistantStream();
+    if (silentClose) {
+      return;
+    }
     if (state.statusText === "已发送中断指令。") {
       setStatus("当前流程已中断。");
       return;
@@ -1328,6 +1623,9 @@ function attachLiveSocket(sessionId) {
   });
 
   socket.addEventListener("error", () => {
+    if (state.liveView.muteSocketLifecycleStatus) {
+      return;
+    }
     if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
       setStatus("会话连接失败，请重试一次。");
     }
@@ -1523,7 +1821,7 @@ async function createSessionInGroup(group) {
 }
 
 async function ensureLiveSession() {
-  if (state.liveView.liveSessionId && state.liveView.socket && state.liveView.socket.readyState === WebSocket.OPEN) {
+  if (state.liveView.liveSessionId) {
     return state.liveView.liveSessionId;
   }
   if (!state.liveView.sessionMeta) {
@@ -1554,7 +1852,8 @@ async function ensureLiveSession() {
     throw new Error("当前没有可继续的会话");
   }
   if (state.liveView.sessionMeta.kind === "live") {
-    await attachLiveSocket(state.liveView.sessionMeta.id);
+    state.liveView.sessionId = state.liveView.sessionMeta.id;
+    state.liveView.liveSessionId = state.liveView.sessionMeta.id;
     return state.liveView.sessionMeta.id;
   }
 
@@ -1572,9 +1871,9 @@ async function ensureLiveSession() {
       .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
     if (reusable) {
       state.liveView.sessionMeta = decorateSession(reusable);
+      state.liveView.sessionId = reusable.id;
       state.liveView.liveSessionId = reusable.id;
       stopHistorySyncLoop();
-      await attachLiveSocket(reusable.id);
       return reusable.id;
     }
   }
@@ -1599,7 +1898,6 @@ async function ensureLiveSession() {
   state.liveView.sessionId = resumed.session.id;
   state.liveView.liveSessionId = resumed.session.id;
   stopHistorySyncLoop();
-  await attachLiveSocket(resumed.session.id);
   refreshSessions().catch(() => {});
   setStatus("正在恢复会话上下文…");
   state.liveView.replayGuardActive = true;
@@ -1635,6 +1933,7 @@ async function submitInput() {
     state.loading = true;
     setStatus("正在发送…");
     stopHistorySyncLoop();
+    closeSocket({ silent: true });
     if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
       throw new Error(
         `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。请返回列表后重新打开该会话。`
@@ -1643,22 +1942,67 @@ async function submitInput() {
     rebuildReplaySuppressionLines([...state.liveView.messages, optimisticUserMessage]);
     setMessages([...state.liveView.messages, optimisticUserMessage]);
     composerDraft.value = "";
-    await ensureLiveSession();
-    if (!state.liveView.socket || state.liveView.socket.readyState !== WebSocket.OPEN) {
-      throw new Error("会话连接还没准备好，请重试一次");
-    }
+    const liveSessionId = await ensureLiveSession();
+    const targetThreadId = String(
+      expectedThreadId.value ||
+        activeThreadId.value ||
+        state.liveView.sessionMeta?.resumeSessionId ||
+        state.threadView.threadId ||
+        ""
+    ).trim();
+    const targetProvider = String(
+      state.liveView.sessionMeta?.provider ||
+        state.threadView.meta?.provider ||
+        routeHistoryTarget.value?.provider ||
+        "codex"
+    ).trim().toLowerCase() || "codex";
     if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
       throw new Error(
         `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。已取消发送，避免写入错误会话。`
       );
     }
     finalizeAssistantStream();
-    state.liveView.socket.send(JSON.stringify({ type: "input", data: `${submissionText}\n` }));
     clearSubmitFallbackTimer();
     if (state.liveView.replayGuardActive) {
       state.liveView.replayGuardPrompt = submissionText;
     }
     setStatus("等待 Codex 回复…");
+    state.liveView.activeInputStream = true;
+    if (targetThreadId) {
+      await requestThreadInputStream(
+        targetProvider,
+        targetThreadId,
+        {
+          type: "input",
+          data: `${submissionText}\n`
+        },
+        {
+          onPayload(payload) {
+            handleLivePayload(payload);
+          }
+        }
+      );
+    } else {
+      await requestSessionInputStream(
+        liveSessionId,
+        {
+          type: "input",
+          data: `${submissionText}\n`
+        },
+        {
+          onPayload(payload) {
+            handleLivePayload(payload);
+          }
+        }
+      );
+    }
+    const finalPayload = await requestConversationSnapshotBySessionId(liveSessionId);
+    if (finalPayload) {
+      handleLivePayload(finalPayload);
+    }
+    if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
+      setStatus("");
+    }
   } catch (error) {
     if (String(composerDraft.value || "").trim() === "") {
       composerDraft.value = submissionText;
@@ -1671,22 +2015,65 @@ async function submitInput() {
     }
     setStatus(error.message || String(error));
   } finally {
+    state.liveView.activeInputStream = false;
     state.loading = false;
   }
 }
 
-function interruptActiveSession() {
+async function interruptActiveSession() {
   clearSubmitFallbackTimer();
-  if (!state.liveView.socket || state.liveView.socket.readyState !== WebSocket.OPEN) {
+  const liveSessionId = String(state.liveView.liveSessionId || "").trim();
+  const targetThreadId = String(
+    expectedThreadId.value ||
+      activeThreadId.value ||
+      state.liveView.sessionMeta?.resumeSessionId ||
+      state.threadView.threadId ||
+      ""
+  ).trim();
+  const targetProvider = String(
+    state.liveView.sessionMeta?.provider ||
+      state.threadView.meta?.provider ||
+      routeHistoryTarget.value?.provider ||
+      "codex"
+  ).trim().toLowerCase() || "codex";
+  if (!liveSessionId) {
     setStatus("当前没有可中断的运行流程。");
+    return;
+  }
+  if (state.liveView.interruptInFlight) {
     return;
   }
 
   try {
-    state.liveView.socket.send(JSON.stringify({ type: "input", data: "\u001b" }));
+    state.liveView.interruptInFlight = true;
+    closeSocket({ silent: true });
     setStatus("已发送中断指令。");
+    if (targetThreadId) {
+      await requestThreadInputStream(
+        targetProvider,
+        targetThreadId,
+        { type: "interrupt", reason: "user_interrupt" },
+        {
+          onPayload(payload) {
+            handleLivePayload(payload);
+          }
+        }
+      );
+    } else {
+      await requestSessionInputStream(
+        liveSessionId,
+        { type: "interrupt", reason: "user_interrupt" },
+        {
+          onPayload(payload) {
+            handleLivePayload(payload);
+          }
+        }
+      );
+    }
   } catch (error) {
     setStatus(error.message || String(error));
+  } finally {
+    state.liveView.interruptInFlight = false;
   }
 }
 

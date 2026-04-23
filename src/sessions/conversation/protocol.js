@@ -8,8 +8,24 @@ function normalizeBuffer(value) {
   return String(value || "");
 }
 
+function deriveConversation(session) {
+  if (session?.threadSnapshot) {
+    return deriveConversationStateFromThreadSnapshot(session.threadSnapshot, {
+      sessionId: String(session?.id || ""),
+      threadId: String(session?.resumeSessionId || session?.threadSnapshot?.threadId || ""),
+      status: session?.conversationState?.status || "idle"
+    });
+  }
+
+  return createConversationState({
+    ...(session?.conversationState || {}),
+    sessionId: String(session?.id || session?.conversationState?.sessionId || ""),
+    threadId: String(session?.resumeSessionId || session?.conversationState?.threadId || "")
+  });
+}
+
 function buildContinuationRuntime(session, sessionView = null, conversation = null) {
-  const normalizedConversation = createConversationState(conversation || session?.conversationState || {});
+  const normalizedConversation = createConversationState(conversation || deriveConversation(session));
   return {
     threadId: String(session?.resumeSessionId || normalizedConversation?.threadId || ""),
     sessionId: String(session?.id || normalizedConversation?.sessionId || ""),
@@ -20,18 +36,132 @@ function buildContinuationRuntime(session, sessionView = null, conversation = nu
   };
 }
 
+function resolveThreadRuntime(session, payload = {}) {
+  const conversation = payload?.conversation || deriveConversation(session);
+  const threadSnapshot = payload?.threadSnapshot || payload?.thread?.snapshot || session?.threadSnapshot || null;
+  const continuation =
+    payload?.continuation ||
+    payload?.thread?.continuation ||
+    buildContinuationRuntime(session, payload?.session || undefined, conversation);
+  const threadId = String(
+    payload?.threadId ||
+      continuation?.threadId ||
+      threadSnapshot?.threadId ||
+      session?.resumeSessionId ||
+      conversation?.threadId ||
+      ""
+  );
+  const sessionId = String(
+    payload?.sessionId || continuation?.sessionId || session?.id || conversation?.sessionId || ""
+  );
+
+  return {
+    threadId,
+    sessionId,
+    threadSnapshot,
+    continuation,
+    conversation
+  };
+}
+
+function pickTurnById(turns, turnId) {
+  const targetTurnId = String(turnId || "").trim();
+  if (!targetTurnId || !Array.isArray(turns)) {
+    return [];
+  }
+  return turns.filter((turn) => String(turn?.id || "").trim() === targetTurnId);
+}
+
+function buildSlimConversation(conversation, turnId) {
+  const normalizedConversation = createConversationState(conversation || {});
+  const turns = pickTurnById(normalizedConversation.turns, turnId);
+  const normalizedActiveTurnId = String(normalizedConversation.activeTurnId || "").trim();
+  return {
+    sessionId: String(normalizedConversation.sessionId || ""),
+    threadId: String(normalizedConversation.threadId || ""),
+    version: Number(normalizedConversation.version || 0),
+    status: String(normalizedConversation.status || "idle"),
+    updatedAt: String(normalizedConversation.updatedAt || ""),
+    backgroundAgents: Array.isArray(normalizedConversation.backgroundAgents)
+      ? normalizedConversation.backgroundAgents
+      : [],
+    turns,
+    activeTurnId: normalizedActiveTurnId && normalizedActiveTurnId === String(turnId || "").trim() ? normalizedActiveTurnId : ""
+  };
+}
+
+function buildSlimThreadSnapshot(snapshot, turnId) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return null;
+  }
+  const normalizedActiveTurnId = String(snapshot.activeTurnId || "").trim();
+  return {
+    threadId: String(snapshot.threadId || ""),
+    version: Number(snapshot.version || 0),
+    updatedAt: String(snapshot.updatedAt || ""),
+    activeTurnId: normalizedActiveTurnId && normalizedActiveTurnId === String(turnId || "").trim() ? normalizedActiveTurnId : "",
+    metadata: snapshot.metadata && typeof snapshot.metadata === "object" ? { ...snapshot.metadata } : {},
+    backgroundAgents: Array.isArray(snapshot.backgroundAgents) ? snapshot.backgroundAgents : [],
+    turns: pickTurnById(snapshot.turns, turnId),
+  };
+}
+
+export function buildThreadTransportSnapshot(session, payload = {}, { trackedTurnId = "" } = {}) {
+  const runtime = resolveThreadRuntime(session, payload);
+  const targetTurnId = String(
+    trackedTurnId || runtime.threadSnapshot?.activeTurnId || runtime.conversation?.activeTurnId || ""
+  ).trim();
+  const slimSnapshot = buildSlimThreadSnapshot(runtime.threadSnapshot, targetTurnId);
+  const slimConversation = buildSlimConversation(runtime.conversation, targetTurnId);
+  return {
+    type: "thread.snapshot",
+    threadId: runtime.threadId,
+    sessionId: runtime.sessionId,
+    status: String(
+      runtime.conversation?.status ||
+        payload?.conversationStatus ||
+        runtime.continuation?.status ||
+        session?.status ||
+        "idle"
+    ),
+    version: Number(
+      runtime.threadSnapshot?.version ||
+        runtime.conversation?.version ||
+        payload?.toVersion ||
+        payload?.version ||
+        0
+    ),
+    timestamp: payload?.timestamp || nowIso(),
+    partial: true,
+    turnId: targetTurnId,
+    snapshot: slimSnapshot,
+    conversation: slimConversation,
+    liveOverlay: payload?.liveOverlay || session?.liveOverlay || null
+  };
+}
+
+export function buildThreadTransportOverlay(session, payload = {}, { trackedTurnId = "" } = {}) {
+  const runtime = resolveThreadRuntime(session, payload);
+  const part = payload?.part && typeof payload.part === "object" ? { ...payload.part } : null;
+  if (!part) {
+    return null;
+  }
+
+  return {
+    threadId: runtime.threadId,
+    sessionId: runtime.sessionId,
+    turnId: String(
+      payload?.turnId || trackedTurnId || runtime.threadSnapshot?.activeTurnId || runtime.conversation?.activeTurnId || ""
+    ),
+    role: String(payload?.role || "assistant"),
+    phase: String(payload?.phase || "streaming"),
+    timestamp: payload?.timestamp || nowIso(),
+    parts: [part]
+  };
+}
+
 export function buildConversationSnapshotPayload(session, sessionView = null) {
-  const conversation = session?.threadSnapshot
-    ? deriveConversationStateFromThreadSnapshot(session.threadSnapshot, {
-        sessionId: String(session?.id || ""),
-        threadId: String(session?.resumeSessionId || session?.threadSnapshot?.threadId || ""),
-        status: session?.conversationState?.status || "idle"
-      })
-    : createConversationState({
-        ...(session?.conversationState || {}),
-        sessionId: String(session?.id || session?.conversationState?.sessionId || ""),
-        threadId: String(session?.resumeSessionId || session?.conversationState?.threadId || "")
-      });
+  const conversation = deriveConversation(session);
 
   return {
     type: "conversation.snapshot",
@@ -59,17 +189,7 @@ export function buildConversationDeltaPayload(session, appliedDeltas = []) {
   if (!normalizedApplied.length) {
     return null;
   }
-  const conversation = session?.threadSnapshot
-    ? deriveConversationStateFromThreadSnapshot(session.threadSnapshot, {
-        sessionId: String(session?.id || ""),
-        threadId: String(session?.resumeSessionId || session?.threadSnapshot?.threadId || ""),
-        status: session?.conversationState?.status || "idle"
-      })
-    : createConversationState({
-        ...(session?.conversationState || {}),
-        sessionId: String(session?.id || session?.conversationState?.sessionId || ""),
-        threadId: String(session?.resumeSessionId || session?.conversationState?.threadId || "")
-      });
+  const conversation = deriveConversation(session);
   return {
     type: "conversation.delta",
     protocolVersion: CONVERSATION_PROTOCOL_VERSION,
@@ -96,17 +216,7 @@ export function buildConversationDeltaPayload(session, appliedDeltas = []) {
 }
 
 export function buildLegacySnapshotPayload(session, sessionView = null) {
-  const conversation = session?.threadSnapshot
-    ? deriveConversationStateFromThreadSnapshot(session.threadSnapshot, {
-        sessionId: String(session?.id || ""),
-        threadId: String(session?.resumeSessionId || session?.threadSnapshot?.threadId || ""),
-        status: session?.conversationState?.status || "idle"
-      })
-    : createConversationState({
-        ...(session?.conversationState || {}),
-        sessionId: String(session?.id || session?.conversationState?.sessionId || ""),
-        threadId: String(session?.resumeSessionId || session?.conversationState?.threadId || "")
-      });
+  const conversation = deriveConversation(session);
   return {
     type: "snapshot",
     protocolVersion: CONVERSATION_PROTOCOL_VERSION,
@@ -128,17 +238,7 @@ export function buildLegacySnapshotPayload(session, sessionView = null) {
 }
 
 export function buildLegacyConversationSnapshotPayload(session, { fromVersion = null, toVersion = null } = {}) {
-  const conversation = session?.threadSnapshot
-    ? deriveConversationStateFromThreadSnapshot(session.threadSnapshot, {
-        sessionId: String(session?.id || ""),
-        threadId: String(session?.resumeSessionId || session?.threadSnapshot?.threadId || ""),
-        status: session?.conversationState?.status || "idle"
-      })
-    : createConversationState({
-        ...(session?.conversationState || {}),
-        sessionId: String(session?.id || session?.conversationState?.sessionId || ""),
-        threadId: String(session?.resumeSessionId || session?.conversationState?.threadId || "")
-      });
+  const conversation = deriveConversation(session);
   const normalizedToVersion = Number.isFinite(Number(toVersion)) ? Number(toVersion) : conversation.version;
   const normalizedFromVersion = Number.isFinite(Number(fromVersion))
     ? Number(fromVersion)

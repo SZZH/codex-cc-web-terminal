@@ -1,0 +1,15 @@
+{
+  "id": "evt-thread-refactor-001-0006",
+  "seq": 6,
+  "provider": "codex",
+  "providerThreadId": "provider-thread-refactor-001",
+  "providerTurnId": "provider-turn-refactor-001",
+  "threadId": "thread-refactor-001",
+  "turnId": "turn-refactor-001",
+  "ts": "2026-04-22T10:00:05.000Z",
+  "kind": "message.completed",
+  "payload": {
+    "text": "我先给你整理一组最小但完整的契约样本，覆盖事件、snapshot 和 live overlay，方便开发与 QA 直接对照。",
+    "role": "assistant"
+  }
+}

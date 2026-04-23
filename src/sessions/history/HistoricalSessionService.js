@@ -59,6 +59,8 @@ export class HistoricalSessionService {
     this.archivedSessionsPath = path.join(this.config.dataDir, "archived-sessions.json");
     this.codexSessionIndexPath = path.join(path.dirname(this.config.codexSessionsDir), "session_index.jsonl");
     this.codexSessionIndexCache = { mtimeMs: -1, size: -1, byId: new Map() };
+    this.providerEntriesCache = new Map();
+    this.historicalMessagesCache = new Map();
     this.customNames = new Map(
       Object.entries(readJsonFile(this.customNamesPath, {}))
         .map(([key, value]) => [normalizeCustomNameKey(key), value])
@@ -142,6 +144,21 @@ export class HistoricalSessionService {
   }
 
   scanHistoricalSessionsForProvider(provider) {
+    const providerCacheKey = String(provider?.id || "").trim();
+    try {
+      const dirStat = fs.statSync(provider.sessionsDir);
+      const cached = this.providerEntriesCache.get(providerCacheKey);
+      if (
+        cached &&
+        cached.mtimeMs === dirStat.mtimeMs &&
+        cached.sessionsDir === provider.sessionsDir
+      ) {
+        return cached.entries;
+      }
+    } catch {
+      // Ignore cache lookup failures and rescan below.
+    }
+
     const files = walkJsonlFiles(provider.sessionsDir);
     const entries = [];
 
@@ -187,6 +204,16 @@ export class HistoricalSessionService {
       } catch {
         // Ignore malformed or unreadable session files.
       }
+    }
+    try {
+      const dirStat = fs.statSync(provider.sessionsDir);
+      this.providerEntriesCache.set(providerCacheKey, {
+        sessionsDir: provider.sessionsDir,
+        mtimeMs: dirStat.mtimeMs,
+        entries
+      });
+    } catch {
+      // Ignore cache population failures.
     }
     return entries;
   }
@@ -338,7 +365,23 @@ export class HistoricalSessionService {
     }
 
     const entry = entries.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0];
-    return this.buildHistoricalTruthBundle(provider, entry);
+    const cacheKey = `${provider.id}:${targetId}`;
+    const cached = this.historicalMessagesCache.get(cacheKey);
+    if (
+      cached &&
+      cached.filePath === entry.filePath &&
+      cached.mtimeMs === entry.stat.mtimeMs
+    ) {
+      return cached.payload;
+    }
+
+    const payload = this.buildHistoricalTruthBundle(provider, entry);
+    this.historicalMessagesCache.set(cacheKey, {
+      filePath: entry.filePath,
+      mtimeMs: entry.stat.mtimeMs,
+      payload
+    });
+    return payload;
   }
 
   saveCustomNames() {

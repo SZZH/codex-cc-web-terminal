@@ -130,3 +130,154 @@ export async function requestAuthSession(attempt = 0) {
 
   return response.json();
 }
+
+function parseSseEventBlocks(buffer) {
+  const blocks = buffer.split(/\n\n/);
+  return {
+    complete: blocks.slice(0, -1),
+    remainder: blocks.at(-1) || ""
+  };
+}
+
+function parseSseEvent(block) {
+  const event = {
+    event: "",
+    data: ""
+  };
+
+  for (const rawLine of String(block || "").split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      event.event = line.slice("event:".length).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      event.data += `${line.slice("data:".length).trimStart()}\n`;
+    }
+  }
+
+  event.data = event.data.trimEnd();
+  return event;
+}
+
+export async function requestSessionInputStream(sessionId, body, { onPayload, signal } = {}) {
+  const id = String(sessionId || "").trim();
+  if (!id) {
+    throw new Error("Session id is required");
+  }
+
+  const response = await fetch(`/api/sessions/${encodeURIComponent(id)}/input-stream`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream"
+    },
+    body: JSON.stringify(body || {}),
+    signal
+  });
+
+  if (response.status === 401) {
+    notifyAuthExpired();
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(payload.error || response.statusText);
+  }
+  if (!response.body) {
+    throw new Error("Streaming response body is unavailable");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const { complete, remainder } = parseSseEventBlocks(buffer);
+    buffer = remainder;
+
+    for (const block of complete) {
+      const event = parseSseEvent(block);
+      if (!event.data) {
+        continue;
+      }
+      let payload = null;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        payload = { type: event.event || "message", raw: event.data };
+      }
+      if (typeof onPayload === "function") {
+        onPayload(payload, event.event || payload?.type || "");
+      }
+    }
+  }
+}
+
+export async function requestThreadInputStream(provider, threadId, body, { onPayload, signal } = {}) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    throw new Error("Thread id is required");
+  }
+
+  const response = await fetch(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/input-stream`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream"
+    },
+    body: JSON.stringify(body || {}),
+    signal
+  });
+
+  if (response.status === 401) {
+    notifyAuthExpired();
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(payload.error || response.statusText);
+  }
+  if (!response.body) {
+    throw new Error("Streaming response body is unavailable");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const { complete, remainder } = parseSseEventBlocks(buffer);
+    buffer = remainder;
+
+    for (const block of complete) {
+      const event = parseSseEvent(block);
+      if (!event.data) {
+        continue;
+      }
+      let payload = null;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        payload = { type: event.event || "message", raw: event.data };
+      }
+      if (typeof onPayload === "function") {
+        onPayload(payload, event.event || payload?.type || "");
+      }
+    }
+  }
+}

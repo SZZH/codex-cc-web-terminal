@@ -79,7 +79,7 @@ function summarizeNotification(msg) {
 export function enqueueRunnerInput(manager, session, data) {
   const text = String(data || "");
   if (!text) {
-    return;
+    return "";
   }
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const lines = normalized
@@ -87,7 +87,7 @@ export function enqueueRunnerInput(manager, session, data) {
     .map((line) => line.trim())
     .filter(Boolean);
   if (!lines.length) {
-    return;
+    return "";
   }
 
   const queueLimit = Math.max(1, Number(manager.config.maxQueuedInputs) || 200);
@@ -95,18 +95,22 @@ export function enqueueRunnerInput(manager, session, data) {
     throw new Error(`当前会话待处理消息过多（上限 ${queueLimit}），请稍后重试。`);
   }
 
+  let lastTurnId = "";
   for (const line of lines) {
     session.queuedInputs.push(line);
     if (session.provider === "codex") {
       const turnId = manager.createConversationTurn(session, line, nowIso());
       session.queuedTurnIds.push(turnId);
+      lastTurnId = turnId;
     }
   }
   session.updatedAt = nowIso();
   if (session.runnerMode === "app_server") {
-    return startAppServerTurn(manager, session);
+    startAppServerTurn(manager, session);
+    return lastTurnId;
   }
-  return startJsonExecRun(manager, session);
+  startJsonExecRun(manager, session);
+  return lastTurnId;
 }
 
 export async function startAppServerTurn(manager, session) {
