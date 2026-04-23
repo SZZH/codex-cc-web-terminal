@@ -31,7 +31,14 @@
 .turn-process-segment {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 22px;
+  border: 1px solid rgba(214, 203, 193, 0.78);
+  background:
+    linear-gradient(180deg, rgba(250, 246, 242, 0.94), rgba(244, 238, 232, 0.88)),
+    rgba(247, 243, 239, 0.82);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.58);
 }
 
 .turn-process-toggle {
@@ -39,13 +46,11 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  width: fit-content;
-  max-width: 100%;
-  padding: 10px 14px;
-  border-radius: 16px;
-  border: 1px solid rgba(210, 199, 189, 0.9);
-  background: rgba(248, 242, 236, 0.78);
-  color: #5c5046;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #594c42;
   font-size: 13px;
   line-height: 1.4;
   text-align: left;
@@ -73,9 +78,9 @@
   max-height: min(42vh, 28rem);
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding-right: 4px;
-  padding-top: 10px;
-  padding-bottom: 10px;
+  padding-right: 2px;
+  padding-top: 4px;
+  padding-bottom: 2px;
 }
 
 .turn-process-fade {
@@ -88,15 +93,15 @@
 }
 
 .turn-process-fade-top {
-  top: -10px;
+  top: -4px;
   margin-bottom: -22px;
-  background: linear-gradient(180deg, rgba(247, 243, 239, 0.98), rgba(247, 243, 239, 0));
+  background: linear-gradient(180deg, rgba(248, 244, 240, 0.98), rgba(248, 244, 240, 0));
 }
 
 .turn-process-fade-bottom {
-  bottom: -10px;
+  bottom: -2px;
   margin-top: -22px;
-  background: linear-gradient(0deg, rgba(247, 243, 239, 0.98), rgba(247, 243, 239, 0));
+  background: linear-gradient(0deg, rgba(248, 244, 240, 0.98), rgba(248, 244, 240, 0));
 }
 
 .thread-item-card {
@@ -124,7 +129,13 @@
 
 .thread-item-process {
   align-self: flex-start;
-  background: rgba(247, 243, 239, 0.82);
+  width: 100%;
+  max-width: 100%;
+  border-radius: 16px;
+  border-color: rgba(218, 209, 200, 0.96);
+  background:
+    linear-gradient(180deg, rgba(255, 253, 250, 0.96), rgba(247, 241, 235, 0.94)),
+    rgba(247, 243, 239, 0.9);
 }
 
 .thread-item-card.is-live-overlay {

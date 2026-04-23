@@ -272,7 +272,7 @@ const displayedThreadSnapshot = computed(() => {
     liveSessionMeta: state.liveView.sessionMeta,
     threadMeta: state.threadView.meta,
     preferAuthoritativeSnapshot,
-    includeLiveConversation: !preferAuthoritativeSnapshot,
+    includeLiveConversation: false,
     includeRuntimeDraft: true
   });
 });

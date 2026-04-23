@@ -129,6 +129,7 @@ function humanizeStatus(value) {
 }
 
 function joinTextParts(parts = []) {
+  const seen = new Set();
   return asArray(parts)
     .map((part) => {
       if (typeof part === "string") {
@@ -142,6 +143,14 @@ function joinTextParts(parts = []) {
       return "";
     })
     .filter(Boolean)
+    .filter((part) => {
+      const key = compactText(part);
+      if (!key || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
     .join("\n\n");
 }
 
@@ -204,7 +213,6 @@ function buildBody(kind, item = {}, payload = {}) {
   if (kind === "reasoning") {
     return joinTextParts([
       item.text,
-      item.summary,
       payload.content,
       payload.text,
       payload.details,
@@ -217,7 +225,6 @@ function buildBody(kind, item = {}, payload = {}) {
   }
   return joinTextParts([
     item.text,
-    item.summary !== item.text ? item.summary : "",
     payload.output,
     payload.result,
     payload.text,
@@ -256,7 +263,8 @@ export function normalizeThreadItem(item = {}, options = {}) {
     label: DISPLAY_LABELS[kind] || DISPLAY_LABELS.unknown,
     status,
     statusLabel: humanizeStatus(status),
-    summary,
+    title: DISPLAY_LABELS[kind] || DISPLAY_LABELS.unknown,
+    summary: compactText(summary) === compactText(body) ? "" : summary,
     body,
     details: [],
     timestamp: firstDefined(item.timestamp, item.ts, payload?.timestamp, payload?.ts, ""),

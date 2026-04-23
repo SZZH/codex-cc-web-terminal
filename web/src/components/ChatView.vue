@@ -1060,54 +1060,60 @@ onBeforeUnmount(() => {
   position: relative;
   padding-top: 28px;
   overflow: hidden;
+  border-radius: 16px;
+  border: 1px solid rgba(81, 88, 106, 0.9);
+  background:
+    radial-gradient(circle at top right, rgba(118, 129, 160, 0.12), transparent 28%),
+    linear-gradient(180deg, rgba(33, 37, 48, 0.98), rgba(22, 25, 34, 0.98));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 12px 30px rgba(26, 24, 32, 0.18);
 }
 
 .markdown-body :deep(pre.code-block .code-lang) {
   position: absolute;
   top: 8px;
   right: 10px;
-  padding: 1px 7px;
+  padding: 2px 8px;
   border-radius: 999px;
   font-size: 10px;
   line-height: 1.3;
   text-transform: lowercase;
   letter-spacing: 0.01em;
-  border: 1px solid rgba(170, 160, 149, 0.42);
-  background: rgba(255, 255, 255, 0.76);
-  color: #7a6a5c;
+  border: 1px solid rgba(111, 124, 156, 0.42);
+  background: rgba(255, 255, 255, 0.08);
+  color: #d5ddf5;
 }
 
 .markdown-body :deep(pre.code-block .code-scroll) {
   display: block;
   overflow-x: auto;
   overflow-y: hidden;
+  padding: 0 14px 14px;
 }
 
 .markdown-body :deep(pre.code-block.family-sql) {
-  border-color: rgba(164, 131, 92, 0.55);
-  background: linear-gradient(180deg, rgba(253, 246, 236, 0.92), rgba(246, 238, 226, 0.94));
+  border-color: rgba(151, 126, 88, 0.82);
 }
 
 .markdown-body :deep(pre.code-block.family-shell) {
-  border-color: rgba(109, 138, 105, 0.58);
-  background: linear-gradient(180deg, rgba(237, 247, 239, 0.9), rgba(229, 241, 233, 0.94));
+  border-color: rgba(102, 136, 102, 0.84);
 }
 
 .markdown-body :deep(pre.code-block.family-config) {
-  border-color: rgba(103, 124, 168, 0.56);
-  background: linear-gradient(180deg, rgba(239, 244, 253, 0.92), rgba(231, 238, 250, 0.95));
+  border-color: rgba(97, 121, 171, 0.84);
 }
 
 .markdown-body :deep(pre.code-block .hljs) {
   display: block;
   min-width: max-content;
-  color: #2f2a27;
+  color: #e8ecf8;
   background: transparent;
 }
 
 .markdown-body :deep(.hljs-comment),
 .markdown-body :deep(.hljs-quote) {
-  color: #8a7e73;
+  color: #8d96ad;
   font-style: italic;
 }
 
@@ -1116,7 +1122,7 @@ onBeforeUnmount(() => {
 .markdown-body :deep(.hljs-literal),
 .markdown-body :deep(.hljs-built_in),
 .markdown-body :deep(.hljs-type) {
-  color: #a34f18;
+  color: #f0b776;
   font-weight: 600;
 }
 
@@ -1127,7 +1133,7 @@ onBeforeUnmount(() => {
 .markdown-body :deep(.hljs-attribute),
 .markdown-body :deep(.hljs-symbol),
 .markdown-body :deep(.hljs-bullet) {
-  color: #1f7a43;
+  color: #86d7aa;
 }
 
 .markdown-body :deep(.hljs-number),
@@ -1135,7 +1141,7 @@ onBeforeUnmount(() => {
 .markdown-body :deep(.hljs-variable),
 .markdown-body :deep(.hljs-template-variable),
 .markdown-body :deep(.hljs-params) {
-  color: #4d5ea8;
+  color: #8fb0ff;
 }
 
 .markdown-body :deep(blockquote) {
