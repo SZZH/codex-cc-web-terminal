@@ -169,6 +169,19 @@ export function buildConversationStateFromHistory(historyPayload, options = {}) 
 }
 
 function mapThreadTurnItemToBodyBlock(item = {}) {
+  if (item.kind === THREAD_ITEM_KIND.IMAGE_VIEW) {
+    const url = String(item.payload?.url || "").trim();
+    if (!url) {
+      return null;
+    }
+    return {
+      id: String(item.id || ""),
+      kind: "image",
+      text: "",
+      payload: item.payload || {},
+      ts: item.updatedAt || item.createdAt || nowIso()
+    };
+  }
   if (item.kind !== THREAD_ITEM_KIND.AGENT_MESSAGE && item.kind !== THREAD_ITEM_KIND.PLAN) {
     return null;
   }
@@ -228,13 +241,17 @@ export function buildConversationStateFromThreadSnapshot(snapshot = {}, options 
         const items = Array.isArray(turn?.items) ? turn.items : [];
         const userItem = items.find((item) => item?.kind === THREAD_ITEM_KIND.USER_MESSAGE);
         const userText = String(userItem?.text || "").trim();
+        const userPayload = userItem?.payload && typeof userItem.payload === "object" ? userItem.payload : {};
         return {
           id: String(turn?.id || ""),
-          user: userText
+          user: userText || Array.isArray(userPayload.content) && userPayload.content.length
             ? {
                 id: String(userItem?.id || `${turn?.id || "turn"}-user`),
                 text: userText,
-                ts: turn?.startedAt || userItem?.updatedAt || userItem?.createdAt || nowIso()
+                ts: turn?.startedAt || userItem?.updatedAt || userItem?.createdAt || nowIso(),
+                content: Array.isArray(userPayload.content) ? JSON.parse(JSON.stringify(userPayload.content)) : [],
+                images: Array.isArray(userPayload.images) ? JSON.parse(JSON.stringify(userPayload.images)) : [],
+                local_images: Array.isArray(userPayload.local_images) ? JSON.parse(JSON.stringify(userPayload.local_images)) : []
               }
             : null,
           assistant: {

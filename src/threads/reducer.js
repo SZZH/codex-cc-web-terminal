@@ -209,7 +209,9 @@ function appendUserMessage(turn, event) {
       text,
       summary: text,
       payload: {
-        content: clone(event.payload?.content ?? [])
+        content: clone(event.payload?.content ?? []),
+        images: clone(event.payload?.images ?? []),
+        local_images: clone(event.payload?.local_images ?? [])
       }
     })
   );
@@ -312,6 +314,24 @@ function appendPlan(turn, event) {
   );
 }
 
+function upsertAssistantImages(turn, event) {
+  const parts = Array.isArray(event.payload?.parts) ? event.payload.parts : [];
+  const imageParts = parts.filter((part) => String(part?.type || "") === "image" && String(part?.url || "").trim());
+  for (let index = 0; index < imageParts.length; index += 1) {
+    const image = imageParts[index];
+    const stableId = `${turn.id}:assistant-image:${index}`;
+    upsertTurnItem(turn, THREAD_ITEM_KIND.IMAGE_VIEW, stableId, {
+      createdAt: turnTimestamp(event),
+      updatedAt: turnTimestamp(event),
+      summary: String(image.alt || "image").trim() || "image",
+      payload: {
+        url: String(image.url || "").trim(),
+        alt: String(image.alt || "image").trim() || "image"
+      }
+    });
+  }
+}
+
 function upsertToolLifecycle(turn, event, kind, phase) {
   const callId = event.payload?.callId ?? `${turn.id}:${event.seq}`;
   const base = {
@@ -403,6 +423,7 @@ export function applyCanonicalEvent(snapshotInput, event) {
 
     case "agent_message_recorded":
       turn = ensureTurn(snapshot, turnId, event);
+      upsertAssistantImages(turn, event);
       updateAssistantLiveFromSource(
         turn,
         event.payload?.text ?? "",

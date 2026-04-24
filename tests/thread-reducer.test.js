@@ -7,12 +7,14 @@ import {
   TURN_STATUS,
   applyCanonicalEvent,
   createCanonicalEvent,
+  createCanonicalizerState,
   createRawRecord,
   canonicalizeRawRecord,
   getActiveTurnLiveOverlay,
   projectTurnSegments,
   reduceCanonicalEvents
 } from "../src/threads/index.js";
+import { segmentTurnItems } from "../web/src/lib/thread-view-model.js";
 
 function event(input) {
   return createCanonicalEvent({
@@ -259,6 +261,127 @@ test("raw records canonicalize into canonical events for assistant content and c
   assert.equal(assistantEvents[0].payload.text, "主正文");
   assert.equal(commandEvents[0].eventType, "command_execution_started");
   assert.equal(commandEvents[0].payload.callId, "cmd-1");
+});
+
+test("assistant message payload can materialize image items alongside committed text", () => {
+  const snapshot = reduceCanonicalEvents([
+    event({ seq: 1, turnId: "turn-1", eventType: "turn_started" }),
+    event({
+      seq: 2,
+      turnId: "turn-1",
+      eventType: "agent_message_recorded",
+      payload: {
+        text: "图已经生成好了",
+        parts: [{ type: "image", url: "/api/local-file-image?path=%2Ftmp%2Fdemo.png", alt: "结果图" }],
+        source: "primary_output_text"
+      }
+    }),
+    event({ seq: 3, turnId: "turn-1", eventType: "turn_completed" })
+  ]);
+
+  const turn = snapshot.turns[0];
+  const imageItems = turn.items.filter((item) => item.kind === THREAD_ITEM_KIND.IMAGE_VIEW);
+  const agentItems = turn.items.filter((item) => item.kind === THREAD_ITEM_KIND.AGENT_MESSAGE);
+
+  assert.equal(imageItems.length, 1);
+  assert.equal(imageItems[0].payload.url, "/api/local-file-image?path=%2Ftmp%2Fdemo.png");
+  assert.equal(imageItems[0].payload.alt, "结果图");
+  assert.equal(agentItems.length, 1);
+  assert.equal(agentItems[0].text, "图已经生成好了");
+});
+
+test("image view items are treated as primary content segments instead of process segments", () => {
+  const segments = segmentTurnItems([
+    {
+      id: "img-1",
+      kind: "ImageView",
+      payload: { url: "/api/local-file-image?path=%2Ftmp%2Fdemo.png", alt: "结果图" }
+    },
+    {
+      id: "msg-1",
+      kind: "AgentMessage",
+      text: "图已经生成好了"
+    }
+  ]);
+
+  assert.deepEqual(segments.map((segment) => segment.kind), ["primary"]);
+  assert.deepEqual(segments[0].items.map((item) => item.kind), ["imageview", "agentmessage"]);
+});
+
+test("raw assistant response content preserves image parts during canonicalization", () => {
+  const assistantMessageRecord = createRawRecord({
+    id: "raw-image-1",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    recordType: "response_item",
+    raw: {
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: "图已经生成好了" },
+          { type: "output_image", image_url: "/api/local-file-image?path=%2Ftmp%2Fdemo.png", alt: "结果图" }
+        ]
+      }
+    },
+    seq: 1,
+    recordTs: "2026-04-21T00:00:00.000Z"
+  });
+
+  const assistantEvents = canonicalizeRawRecord(assistantMessageRecord);
+
+  assert.equal(assistantEvents[0].eventType, "agent_message_recorded");
+  assert.equal(assistantEvents[0].payload.text, "图已经生成好了");
+  assert.deepEqual(assistantEvents[0].payload.parts, [
+    { type: "text", text: "图已经生成好了" },
+    { type: "image", url: "/api/local-file-image?path=%2Ftmp%2Fdemo.png", alt: "结果图" }
+  ]);
+});
+
+test("image_generation_end raw records produce image generation and image view events", () => {
+  const state = createCanonicalizerState();
+  canonicalizeRawRecord(
+    createRawRecord({
+      id: "raw-session-meta",
+      threadId: "thread-1",
+      seq: 1,
+      recordTs: "2026-04-21T00:00:00.000Z",
+      recordType: "session_meta",
+      raw: {
+        payload: {
+          id: "session-imagegen-1"
+        }
+      }
+    }),
+    state
+  );
+
+  const events = canonicalizeRawRecord(
+    createRawRecord({
+      id: "raw-imagegen-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      seq: 2,
+      recordTs: "2026-04-21T00:00:02.000Z",
+      recordType: "event_msg",
+      raw: {
+        payload: {
+          type: "image_generation_end",
+          turn_id: "turn-1",
+          call_id: "ig_demo_123",
+          status: "completed",
+          revised_prompt: "dreamy skyline"
+        }
+      }
+    }),
+    state
+  );
+
+  assert.deepEqual(
+    events.map((item) => item.eventType),
+    ["image_generation_completed", "image_view_recorded"]
+  );
+  assert.match(events[1].payload.url, /session-imagegen-1\/ig_demo_123\.png$/);
 });
 
 test("applyCanonicalEvent can incrementally build a snapshot with stable versions", () => {

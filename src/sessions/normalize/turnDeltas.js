@@ -76,6 +76,43 @@ function compactText(value) {
   return String(value || "").trim();
 }
 
+function cloneContent(value) {
+  return JSON.parse(JSON.stringify(Array.isArray(value) ? value : []));
+}
+
+function normalizeMessageContentParts(content = []) {
+  const parts = [];
+  for (const item of Array.isArray(content) ? content : []) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const type = normalizeSymbolToken(item.type);
+    if (!type) {
+      continue;
+    }
+    if (type === "outputtext" || type === "inputtext" || type === "text") {
+      const text = compactText(item.text || item.value);
+      if (!text) {
+        continue;
+      }
+      parts.push({ type: "text", text });
+      continue;
+    }
+    const url = compactText(item.image_url || item.url || item.path);
+    if (!url) {
+      continue;
+    }
+    if (["outputimage", "image", "localimage", "inputimage"].includes(type)) {
+      parts.push({
+        type: "image",
+        url,
+        alt: compactText(item.alt || item.name) || "image"
+      });
+    }
+  }
+  return parts;
+}
+
 function buildBackgroundAgentDelta({ agentId, agentPath = "", nickname = "", role = "", status = "running", ts = nowIso(), relatedTurnIds = [] } = {}) {
   const stableId = compactText(agentId || agentPath || nickname);
   if (!stableId) {
@@ -96,15 +133,25 @@ function buildBackgroundAgentDelta({ agentId, agentPath = "", nickname = "", rol
   };
 }
 
-export function createTurnCreatedDelta(turnId, userText, timestamp = nowIso()) {
+export function createTurnCreatedDelta(turnId, userTextOrInput, timestamp = nowIso(), extra = {}) {
+  const input =
+    userTextOrInput && typeof userTextOrInput === "object"
+      ? userTextOrInput
+      : {
+          text: userTextOrInput,
+          ...extra
+        };
   return {
     kind: "turn_created",
     turnId: String(turnId),
     timestamp: resolveTimestamp(timestamp),
     user: {
-      id: ensureId("user"),
-      text: compactText(userText),
-      ts: resolveTimestamp(timestamp)
+      id: String(input.id || ensureId("user")),
+      text: compactText(input.text),
+      ts: resolveTimestamp(input.ts || timestamp),
+      content: Array.isArray(input.content) ? cloneContent(input.content) : [],
+      images: Array.isArray(input.images) ? cloneContent(input.images) : [],
+      local_images: Array.isArray(input.local_images) ? cloneContent(input.local_images) : []
     }
   };
 }
@@ -328,11 +375,15 @@ function normalizeResponseItemRecord(record, turnId) {
   const type = normalizeSymbolToken(payload.type);
   const ts = record?.timestamp || payload?.timestamp || nowIso();
   if (type === "message" && normalizeSymbolToken(payload.role) === "assistant") {
-    const text = Array.isArray(payload.content)
-      ? payload.content.map((item) => compactText(item?.text || item?.value)).filter(Boolean).join("\n")
+    const content = cloneContent(payload.content);
+    const renderableParts = normalizeMessageContentParts(content);
+    const text = Array.isArray(content)
+      ? content.map((item) => compactText(item?.text || item?.value)).filter(Boolean).join("\n")
       : compactText(payload.text || payload.message);
     if (!text) {
-      return [];
+      if (renderableParts.length === 0) {
+        return [];
+      }
     }
     const phase = normalizeSymbolToken(payload.phase);
     if (phase === "commentary") {
@@ -346,7 +397,36 @@ function normalizeResponseItemRecord(record, turnId) {
         phase: "commentary"
       })];
     }
-    return [createBodyDelta(turnId, { text, ts, payload: { phase: "completed" }, mergeMode: "paragraph" })];
+    const deltas = [];
+    for (const part of renderableParts) {
+      if (part.type !== "image") {
+        continue;
+      }
+      deltas.push(
+        createBodyDelta(turnId, {
+          kind: "image",
+          ts,
+          payload: {
+            url: part.url,
+            alt: part.alt,
+            phase: "completed",
+            content
+          },
+          mergeMode: "paragraph"
+        })
+      );
+    }
+    if (text) {
+      deltas.push(
+        createBodyDelta(turnId, {
+          text,
+          ts,
+          payload: { phase: "completed", content },
+          mergeMode: "paragraph"
+        })
+      );
+    }
+    return deltas;
   }
   if (type === "reasoning") {
     const text = Array.isArray(payload.summary)

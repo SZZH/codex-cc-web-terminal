@@ -1,3 +1,6 @@
+import os from "node:os";
+import path from "node:path";
+
 import { createCanonicalEvent } from "./types.js";
 
 const COLLAB_FUNCTIONS = new Set(["spawn_agent", "wait_agent", "send_input", "close_agent"]);
@@ -7,7 +10,8 @@ export function createCanonicalizerState() {
   return {
     bootstrapCompleted: false,
     activeTurnId: "",
-    callKinds: new Map()
+    callKinds: new Map(),
+    sessionId: ""
   };
 }
 
@@ -25,6 +29,107 @@ function firstTextContent(content = []) {
     }
   }
   return "";
+}
+
+function cloneContent(value) {
+  return JSON.parse(JSON.stringify(Array.isArray(value) ? value : []));
+}
+
+function extractRenderableAssistantParts(content = []) {
+  const parts = [];
+  for (const part of asArray(content)) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    const type = normalizeString(part.type);
+    if (!type) {
+      continue;
+    }
+    if (type === "outputtext" || type === "inputtext" || type === "text") {
+      const text = String(part.text ?? part.value ?? "").trim();
+      if (!text) {
+        continue;
+      }
+      parts.push({ type: "text", text });
+      continue;
+    }
+
+    const url = String(part.image_url ?? part.url ?? part.path ?? "").trim();
+    if (!url) {
+      continue;
+    }
+    if (["outputimage", "image", "localimage", "inputimage"].includes(type)) {
+      parts.push({
+        type: "image",
+        url,
+        alt: String(part.alt ?? part.name ?? "image").trim() || "image"
+      });
+    }
+  }
+  return parts;
+}
+
+function extractCanonicalUserRequest(value) {
+  const text = String(value || "");
+  if (!text) {
+    return "";
+  }
+
+  const markers = ["My request for Codex:", "User request:"];
+  for (const marker of markers) {
+    const index = text.lastIndexOf(marker);
+    if (index >= 0) {
+      return text.slice(index + marker.length).trim();
+    }
+  }
+
+  return text.trim();
+}
+
+function buildCanonicalUserContent(payload = {}) {
+  if (Array.isArray(payload.content) && payload.content.length) {
+    return JSON.parse(JSON.stringify(payload.content));
+  }
+
+  const parts = [];
+  const text = extractCanonicalUserRequest(payload.text ?? payload.message ?? "");
+  if (text) {
+    parts.push({ type: "input_text", text });
+  }
+
+  for (const image of asArray(payload.images)) {
+    const imageUrl = String(image?.image_url || image?.url || "").trim();
+    if (!imageUrl) {
+      continue;
+    }
+    parts.push({
+      type: "input_image",
+      image_url: imageUrl,
+      alt: String(image?.alt || image?.name || "image").trim() || "image"
+    });
+  }
+
+  for (const image of asArray(payload.local_images)) {
+    const imagePath = String(image?.path || image?.url || "").trim();
+    if (!imagePath) {
+      continue;
+    }
+    parts.push({
+      type: "local_image",
+      path: imagePath,
+      name: String(image?.name || image?.alt || "image").trim() || "image"
+    });
+  }
+
+  for (const textElement of asArray(payload.text_elements)) {
+    const elementText = extractCanonicalUserRequest(textElement?.text ?? textElement?.value ?? "");
+    if (!elementText || parts.some((part) => part?.type === "input_text" && part.text === elementText)) {
+      continue;
+    }
+    parts.push({ type: "input_text", text: elementText });
+  }
+
+  return parts;
 }
 
 function classifyFunctionKind(name = "") {
@@ -199,12 +304,22 @@ function makeEvent(record, state, input) {
   });
 }
 
+function buildGeneratedImagePath(state, callId) {
+  const sessionId = String(state?.sessionId || "").trim();
+  const imageId = String(callId || "").trim();
+  if (!sessionId || !imageId) {
+    return "";
+  }
+  return path.join(os.homedir(), ".codex", "generated_images", sessionId, `${imageId}.png`);
+}
+
 export function canonicalizeRawRecord(record, state = createCanonicalizerState()) {
   const type = record.recordType;
   const subtype = record.recordSubtype;
   const payload = record.raw?.payload ?? {};
 
   if (type === "session_meta") {
+    state.sessionId = String(payload.id || state.sessionId || "").trim();
     return [
       makeEvent(record, state, {
         eventType: "thread_metadata_initialized",
@@ -242,7 +357,8 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
       state.bootstrapCompleted = true;
       const turnId = String(payload.turn_id || payload.turnId || record.turnId || state.activeTurnId || `turn:${record.seq}`);
       state.activeTurnId = turnId;
-      const text = payload.text ?? payload.message ?? firstTextContent(payload.content);
+      const content = buildCanonicalUserContent(payload);
+      const text = extractCanonicalUserRequest(payload.text ?? payload.message ?? firstTextContent(content));
       return [
         makeEvent(record, state, {
           turnId,
@@ -252,7 +368,12 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
         makeEvent(record, state, {
           turnId,
           eventType: "user_message_recorded",
-          payload: { text, content: payload.content ?? [] }
+          payload: {
+            text,
+            content,
+            images: Array.isArray(payload.images) ? JSON.parse(JSON.stringify(payload.images)) : [],
+            local_images: Array.isArray(payload.local_images) ? JSON.parse(JSON.stringify(payload.local_images)) : []
+          }
         })
       ];
     }
@@ -402,21 +523,63 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
         })
       ];
     }
+
+    if (subtype === "image_generation_end") {
+      const callId = String(payload.call_id || payload.id || "").trim();
+      const imagePath = buildGeneratedImagePath(state, callId);
+      const events = [];
+      if (callId) {
+        events.push(
+          makeEvent(record, state, {
+            turnId: String(payload.turn_id || payload.turnId || record.turnId || state.activeTurnId || ""),
+            eventType: "image_generation_completed",
+            payload: {
+              callId,
+              status: payload.status || "completed",
+              summary: String(payload.revised_prompt || payload.prompt || "").trim()
+            }
+          })
+        );
+      }
+      if (imagePath) {
+        events.push(
+          makeEvent(record, state, {
+            turnId: String(payload.turn_id || payload.turnId || record.turnId || state.activeTurnId || ""),
+            eventType: "image_view_recorded",
+            payload: {
+              url: imagePath,
+              alt: "generated image",
+              summary: String(payload.revised_prompt || payload.prompt || "generated image").trim()
+            }
+          })
+        );
+      }
+      return events;
+    }
   }
 
   if (type === "response_item") {
     if (subtype === "message") {
       const role = payload.role ?? record.raw?.role ?? "assistant";
-      const text = firstTextContent(payload.content);
+      const content = cloneContent(payload.content);
+      const renderableParts = extractRenderableAssistantParts(content);
+      const text = firstTextContent(content);
       const phase = payload.phase ?? null;
       if (role === "assistant" && normalizeString(phase) === "commentary") {
         return [];
       }
-      if (role === "assistant" && text) {
+      if (role === "assistant" && (text || renderableParts.length > 0)) {
         return [
           makeEvent(record, state, {
             eventType: "agent_message_recorded",
-            payload: { text, source: "primary_output_text", role, phase }
+            payload: {
+              text,
+              content,
+              parts: renderableParts,
+              source: "primary_output_text",
+              role,
+              phase
+            }
           })
         ];
       }
@@ -554,7 +717,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
   if (type === "item.completed") {
     const item = record.raw?.item ?? {};
     const itemType = normalizeString(item.type);
-    const text = item.text ?? item.message ?? firstTextContent(item.content);
+    const text = extractCanonicalUserRequest(item.text ?? item.message ?? firstTextContent(item.content));
 
     if (itemType === "usermessage") {
       return [

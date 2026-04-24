@@ -1,3 +1,5 @@
+import { isRenderableImageUrl, normalizeImageUrl } from "./image-url.js";
+
 function asArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -31,7 +33,7 @@ function normalizeKind(value) {
 }
 
 const USER_KINDS = new Set(["usermessage"]);
-const PRIMARY_KINDS = new Set(["agentmessage", "plan"]);
+const PRIMARY_KINDS = new Set(["agentmessage", "plan", "imageview"]);
 const PROCESS_KINDS = new Set([
   "hookprompt",
   "reasoning",
@@ -41,7 +43,6 @@ const PROCESS_KINDS = new Set([
   "dynamictoolcall",
   "collabagenttoolcall",
   "websearch",
-  "imageview",
   "imagegeneration",
   "enteredreviewmode",
   "exitedreviewmode",
@@ -206,7 +207,103 @@ function extractSummary(kind, item = {}, payload = {}) {
   return DISPLAY_LABELS[kind] || DISPLAY_LABELS.unknown;
 }
 
+function extractImageUrl(item = {}, payload = {}) {
+  return String(
+    firstDefined(
+      payload.url,
+      payload.image_url,
+      payload.path,
+      item.url,
+      item.image_url,
+      item.path
+    )
+  ).trim();
+}
+
+function collectNestedImageParts(content, bucket) {
+  for (const part of asArray(content)) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    const kind = normalizeKind(part.type);
+    const url = String(firstDefined(part.url, part.image_url, part.path)).trim();
+    if ((kind === "inputimage" || kind === "image" || kind === "outputimage" || kind === "localimage") && isRenderableImageUrl(url)) {
+      bucket.push({
+        url,
+        alt: String(firstDefined(part.alt, part.name, "image")).trim() || "image"
+      });
+    }
+    if (Array.isArray(part.content)) {
+      collectNestedImageParts(part.content, bucket);
+    }
+  }
+}
+
+function extractImageItems(item = {}, payload = {}) {
+  const images = [];
+  const pushImage = (url, alt = "image") => {
+    const resolved = normalizeImageUrl(url);
+    if (!isRenderableImageUrl(resolved)) {
+      return;
+    }
+    images.push({
+      url: resolved,
+      alt: String(alt || "image").trim() || "image"
+    });
+  };
+
+  const directUrl = extractImageUrl(item, payload);
+  if (directUrl) {
+    pushImage(directUrl, extractImageAlt(item, payload));
+  }
+
+  for (const image of asArray(payload.images)) {
+    if (typeof image === "string") {
+      pushImage(image);
+    } else if (image && typeof image === "object") {
+      pushImage(image.url || image.image_url || image.path, image.alt || image.name);
+    }
+  }
+
+  for (const image of asArray(payload.local_images)) {
+    if (typeof image === "string") {
+      pushImage(image);
+    } else if (image && typeof image === "object") {
+      pushImage(image.path || image.url || image.image_url, image.alt || image.name);
+    }
+  }
+
+  collectNestedImageParts(payload.content, images);
+  if (payload.message?.role === "user") {
+    collectNestedImageParts(payload.message?.content, images);
+  }
+
+  const seen = new Set();
+  return images.filter((image) => {
+    if (!image.url || seen.has(image.url)) {
+      return false;
+    }
+    seen.add(image.url);
+    return true;
+  });
+}
+
+function extractImageAlt(item = {}, payload = {}) {
+  return String(
+    firstDefined(
+      payload.alt,
+      payload.name,
+      item.alt,
+      item.name,
+      DISPLAY_LABELS[inferThreadItemKind(item)] || "image"
+    )
+  ).trim();
+}
+
 function buildBody(kind, item = {}, payload = {}) {
+  if (kind === "imageview" || kind === "imagegeneration") {
+    return "";
+  }
   if (kind === "agentmessage" || kind === "usermessage" || kind === "plan") {
     return extractMessageText(item, payload);
   }
@@ -254,6 +351,9 @@ export function normalizeThreadItem(item = {}, options = {}) {
   const category = getThreadItemCategory(item);
   const body = buildBody(kind, item, payload);
   const summary = extractSummary(kind, item, payload);
+  const imageItems = extractImageItems(item, payload);
+  const imageUrl = imageItems[0]?.url || "";
+  const imageAlt = imageItems[0]?.alt || extractImageAlt(item, payload);
 
   return {
     id: String(firstDefined(item.id, payload?.id, `${kind}-${Math.random().toString(36).slice(2, 10)}`)),
@@ -266,6 +366,9 @@ export function normalizeThreadItem(item = {}, options = {}) {
     title: DISPLAY_LABELS[kind] || DISPLAY_LABELS.unknown,
     summary: compactText(summary) === compactText(body) ? "" : summary,
     body,
+    imageUrl,
+    imageAlt,
+    imageItems,
     details: [],
     timestamp: firstDefined(item.timestamp, item.ts, payload?.timestamp, payload?.ts, ""),
     isUnknown: kind === "unknown",

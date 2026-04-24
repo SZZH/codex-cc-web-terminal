@@ -119,6 +119,20 @@ function getAppName(mode) {
 }
 
 function buildFrontend() {
+  const packageJsonPath = path.join(root, "package.json");
+  let scripts = {};
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+    scripts = packageJson?.scripts && typeof packageJson.scripts === "object" ? packageJson.scripts : {};
+  } catch {
+    scripts = {};
+  }
+
+  if (!scripts["web:build"]) {
+    console.log('Skipping frontend build: missing "web:build" script in package.json.');
+    return;
+  }
+
   const result = spawnSync(npmCommand, ["run", "web:build"], {
     cwd: root,
     encoding: "utf8",
