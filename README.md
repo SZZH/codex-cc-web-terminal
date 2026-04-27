@@ -118,6 +118,26 @@ netstat -ano | findstr :5173
 - Then verify network path: same Wi-Fi or same Tailnet
 - If you changed `PORT`, use the same port in your phone URL.
 
+## Changelog
+
+### `v0.2.0`
+
+Core updates since `v0.1.0`:
+
+- Reworked the session/thread main pipeline around thread snapshots, canonical events, and SSE transport, making history, realtime continuation, and state synchronization more consistent.
+- Improved Codex history support across session list, message rendering, thread continuation, and image recovery for historical conversations.
+- Added a workspace changes panel with diff display, per-turn change anchoring, and revert actions.
+- Improved session list behavior to sort groups by latest usage time and align project-session filtering with Codex branch-aware rules.
+- Refined the thread/process UI, including unified process/file-change toggle icons, better process/code presentation, and auto-collapsing completed process sections.
+- Fixed multiple chat experience issues, including initial scroll-to-bottom behavior, follow-scroll stability after content updates, and historical message classification/rendering problems.
+- Fixed historical content leakage issues so Codex host directives such as git-related control markers do not appear inside conversation history bubbles.
+
+### `v0.1.0`
+
+Core updates:
+
+- Initialized repository rules, contribution guidance, and version-tag conventions.
+
 ## Open Source
 
 - [LICENSE](./LICENSE)

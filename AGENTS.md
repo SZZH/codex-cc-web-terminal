@@ -34,8 +34,11 @@
 - This is an open-source project. Use Git tags for releases or important feature milestones.
 - Git tags should use version-style names such as `v0.1.0` for releases or milestone snapshots unless the maintainer asks for another format.
 - Tag annotations must be written in Chinese.
-- Tag annotations should summarize the recent core work of that milestone, not step-by-step implementation logs.
-- If many fixes happened in the same milestone, summarize only the few most important ones.
+- When the maintainer asks to "打版本", "发版本", "切版本", or gives an equivalent release intent, treat it as a tag-release workflow by default unless they explicitly say otherwise.
+- Tag annotations should record the recent milestone changes as grouped bullet points, covering the main new features and major bug fixes included since the previous version tag.
+- Tag annotations should not be step-by-step terminal logs, but they also should not be overly brief; they should preserve the core shipped changes in a readable release-note style.
+- If many fixes happened in the same milestone, summarize them by functional area instead of listing noisy implementation details.
+- Keep `README.md` updated with a `Changelog` section organized by tag, and for each new tag add a concise summary of the main shipped changes without dumping every low-level detail.
 - Commit titles should still describe the main shipped outcome, but they do not need a forced `feat(...)` / `fix(...)` prefix unless the maintainer asks for it.
 - If a commit body is used, list only the core additions or a few key fixes.
 - Do not write step-by-step work logs, terminal actions, or review narration into commit messages.
