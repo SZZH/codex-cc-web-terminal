@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Composer Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4eee8;
+      --panel: rgba(255, 251, 248, 0.96);
+      --panel-strong: #fffdfa;
+      --line: rgba(218, 206, 196, 0.88);
+      --line-strong: rgba(188, 170, 154, 0.9);
+      --text: #372f29;
+      --muted: #8b7b6e;
+      --soft: #eee5dc;
+      --accent: #aa9888;
+      --accent-dark: #8e7b6b;
+      --green: #0f9f5d;
+      --red: #d14242;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 50% -8%, rgba(255, 255, 255, 0.78), transparent 34%),
+        linear-gradient(180deg, rgba(248, 244, 239, 0.98), var(--bg));
+      color: var(--text);
+    }
+
+    .phone {
+      width: min(430px, 100vw);
+      min-height: 100vh;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      border-inline: 1px solid rgba(222, 211, 201, 0.7);
+      background: rgba(246, 240, 234, 0.74);
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: 32px 1fr 32px;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid rgba(214, 201, 190, 0.52);
+      background: rgba(247, 242, 237, 0.82);
+      backdrop-filter: blur(18px);
+    }
+
+    .nav-dot {
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      border: 0;
+      background: rgba(229, 220, 212, 0.78);
+      color: #56483d;
+      font-size: 22px;
+      line-height: 1;
+    }
+
+    .title {
+      min-width: 0;
+      text-align: center;
+      font-size: 16px;
+      font-weight: 650;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .stream {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 18px 14px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .bubble {
+      max-width: 88%;
+      padding: 10px 12px;
+      border: 1px solid rgba(224, 213, 203, 0.88);
+      border-radius: 18px;
+      background: rgba(255, 252, 248, 0.94);
+      box-shadow: 0 10px 28px rgba(127, 107, 88, 0.05);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .bubble.user {
+      align-self: flex-end;
+      background: linear-gradient(180deg, #e8ddd2 0%, #e0d2c5 100%);
+    }
+
+    .bubble.agent {
+      align-self: flex-start;
+    }
+
+    .changes-card {
+      align-self: flex-start;
+      width: min(100%, 386px);
+      border: 1px solid rgba(224, 219, 213, 0.88);
+      border-radius: 14px;
+      overflow: hidden;
+      background: rgba(255, 253, 250, 0.85);
+      font-size: 13px;
+    }
+
+    .changes-card header {
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      color: #3c332d;
+    }
+
+    .changes-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-top: 1px solid rgba(230, 225, 219, 0.9);
+      background: rgba(246, 245, 243, 0.82);
+    }
+
+    .changes-row b {
+      min-width: 0;
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 500;
+    }
+
+    .composer-wrap {
+      position: sticky;
+      bottom: 0;
+      padding: 12px 12px 12px;
+      background: linear-gradient(180deg, rgba(244, 238, 232, 0) 0%, rgba(244, 238, 232, 0.92) 24%, var(--bg) 100%);
+      backdrop-filter: blur(16px);
+    }
+
+    .composer {
+      border: 1px solid rgba(219, 207, 197, 0.78);
+      border-radius: 20px;
+      background: linear-gradient(180deg, rgba(255, 253, 250, 0.98), rgba(253, 248, 244, 0.96));
+      box-shadow:
+        0 18px 42px rgba(113, 91, 72, 0.12),
+        0 1px 0 rgba(255, 255, 255, 0.9) inset;
+      overflow: hidden;
+    }
+
+    .draft {
+      width: 100%;
+      min-height: 78px;
+      max-height: 170px;
+      padding: 14px 15px 10px;
+      border: 0;
+      outline: 0;
+      resize: none;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 16px;
+      line-height: 1.55;
+    }
+
+    .attachments {
+      display: flex;
+      gap: 6px;
+      padding: 0 9px 8px;
+      overflow-x: auto;
+    }
+
+    .chip {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 136px;
+      height: 29px;
+      padding: 0 6px 0 8px;
+      border: 1px solid rgba(218, 207, 197, 0.72);
+      border-radius: 999px;
+      background: rgba(241, 235, 229, 0.72);
+      color: #5e5249;
+      font-size: 12px;
+    }
+
+    .chip span {
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .chip button {
+      width: 18px;
+      height: 18px;
+      border: 0;
+      border-radius: 99px;
+      background: rgba(223, 213, 204, 0.72);
+      color: #76685e;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .composer-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px;
+      border-top: 1px solid rgba(230, 221, 212, 0.58);
+      background: rgba(249, 245, 241, 0.68);
+    }
+
+    .icon-button {
+      width: 36px;
+      height: 36px;
+      display: inline-grid;
+      place-items: center;
+      border: 0;
+      border-radius: 13px;
+      background: transparent;
+      color: #75685f;
+      cursor: pointer;
+    }
+
+    .icon-button:hover,
+    .context-button:hover {
+      background: rgba(235, 226, 218, 0.88);
+    }
+
+    .icon-button svg {
+      width: 18px;
+      height: 18px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .action-spacer {
+      flex: 1;
+    }
+
+    .context-button {
+      min-width: 0;
+      flex: 1;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 10px;
+      border: 0;
+      border-radius: 999px;
+      background: rgba(239, 232, 225, 0.68);
+      color: #65584f;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .context-button span {
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .context-button svg {
+      width: 14px;
+      height: 14px;
+      flex: 0 0 auto;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .send {
+      min-width: 58px;
+      height: 36px;
+      border: 0;
+      border-radius: 999px;
+      background: linear-gradient(180deg, #b9a797 0%, #a18f7f 100%);
+      color: #fffdfa;
+      font-weight: 650;
+      box-shadow: 0 10px 22px rgba(139, 117, 97, 0.18);
+      cursor: pointer;
+    }
+
+    .popover {
+      position: fixed;
+      left: 50%;
+      bottom: 226px;
+      width: min(390px, calc(100vw - 28px));
+      transform: translateX(-50%);
+      border: 1px solid rgba(220, 209, 199, 0.84);
+      border-radius: 18px;
+      background: rgba(255, 252, 248, 0.98);
+      box-shadow: 0 22px 54px rgba(99, 78, 60, 0.18);
+      overflow: hidden;
+      display: none;
+      z-index: 5;
+    }
+
+    .popover.open {
+      display: block;
+    }
+
+    .popover header {
+      padding: 13px 14px 9px;
+      font-size: 13px;
+      font-weight: 650;
+      color: #4a4038;
+    }
+
+    .option {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      padding: 11px 14px;
+      border: 0;
+      border-top: 1px solid rgba(238, 230, 223, 0.82);
+      background: transparent;
+      text-align: left;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .option:hover {
+      background: rgba(246, 241, 236, 0.92);
+    }
+
+    .option b {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 3px;
+    }
+
+    .option small {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .setting-group {
+      padding: 10px 12px 12px;
+      border-top: 1px solid rgba(237, 229, 222, 0.92);
+    }
+
+    .setting-label {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .setting-row {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .setting-row::-webkit-scrollbar {
+      display: none;
+    }
+
+    .choice {
+      flex: 0 0 auto;
+      height: 32px;
+      padding: 0 10px;
+      border: 1px solid rgba(220, 209, 199, 0.92);
+      border-radius: 999px;
+      background: rgba(250, 246, 242, 0.9);
+      color: #574b42;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .choice.active {
+      border-color: var(--line-strong);
+      background: #eee4da;
+      color: #3f352e;
+      font-weight: 650;
+    }
+
+    .permission-row {
+      display: grid;
+      gap: 7px;
+    }
+
+    .permission-choice {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 22px 1fr auto;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 10px;
+      border: 1px solid rgba(222, 212, 202, 0.9);
+      border-radius: 13px;
+      background: rgba(250, 247, 244, 0.72);
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .permission-choice.active {
+      border-color: rgba(233, 113, 74, 0.36);
+      background: rgba(255, 244, 239, 0.9);
+      color: #d94d21;
+    }
+
+    .permission-choice svg {
+      width: 18px;
+      height: 18px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .permission-copy b {
+      display: block;
+      font-size: 13px;
+      margin-bottom: 2px;
+    }
+
+    .permission-copy small {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    .permission-choice.active .permission-copy small {
+      color: rgba(217, 77, 33, 0.72);
+    }
+
+    .check {
+      color: var(--green);
+      font-weight: 700;
+      align-self: center;
+    }
+
+    .branch-footer {
+      padding: 8px;
+      border-top: 1px solid rgba(237, 229, 222, 0.92);
+    }
+
+    .branch-footer button {
+      width: 100%;
+      height: 38px;
+      border: 1px dashed rgba(190, 174, 160, 0.9);
+      border-radius: 12px;
+      background: rgba(250, 247, 244, 0.84);
+      color: #65584e;
+      cursor: pointer;
+    }
+
+    @media (max-height: 720px) {
+      .popover {
+        bottom: 210px;
+        max-height: min(330px, calc(100vh - 240px));
+        overflow: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="phone">
+    <header class="topbar">
+      <button class="nav-dot">‹</button>
+      <div class="title">修复气泡自动换行</div>
+      <span></span>
+    </header>
+
+    <main class="stream">
+      <div class="bubble user">文件变更记录需要展示在对应轮次底部。</div>
+      <div class="bubble agent">已处理：历史里的文件变更会从该轮保存的 diff 渲染，不依赖当前工作区状态。</div>
+      <section class="changes-card">
+        <header><strong>2 个文件已更改</strong><span>撤销</span></header>
+        <div class="changes-row"><b>web/src/lib/thread-view-model.js</b><span style="color: var(--green)">+24</span><span style="color: var(--red)">-3</span></div>
+        <div class="changes-row"><b>tests/thread-item-renderers.test.js</b><span style="color: var(--green)">+31</span><span style="color: var(--red)">-0</span></div>
+      </section>
+      <div class="bubble user">输入区需要支持模型、思考强度、分支、图片和文件。</div>
+    </main>
+
+    <section class="composer-wrap">
+      <form class="composer">
+        <textarea class="draft" placeholder="给 Codex 发消息…">把输入区做成更完整的 composer。</textarea>
+
+        <div class="attachments">
+          <span class="chip">🖼 <span>screenshot.png</span><button type="button">×</button></span>
+          <span class="chip">📄 <span>requirements.md</span><button type="button">×</button></span>
+        </div>
+
+        <div class="composer-actions">
+          <button class="icon-button" type="button" data-menu="upload" aria-label="上传">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg>
+          </button>
+          <button class="context-button" type="button" data-menu="settings">
+            <svg viewBox="0 0 24 24"><path d="M4 7h16M7 12h10M10 17h4"></path></svg>
+            <span>GPT-5.5 · 中等 · feature/conversation-sync-fix</span>
+          </button>
+          <button class="send" type="button">发送</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <section id="settings" class="popover">
+    <header>输入设置</header>
+    <div class="setting-group">
+      <p class="setting-label">模型</p>
+      <div class="setting-row">
+        <button class="choice active">GPT-5.5</button>
+        <button class="choice">GPT-5.4</button>
+        <button class="choice">Mini</button>
+      </div>
+    </div>
+    <div class="setting-group">
+      <p class="setting-label">思考强度</p>
+      <div class="setting-row">
+        <button class="choice">低</button>
+        <button class="choice active">中等</button>
+        <button class="choice">高</button>
+        <button class="choice">极高</button>
+      </div>
+    </div>
+    <div class="setting-group">
+      <p class="setting-label">Codex 权限</p>
+      <div class="permission-row">
+        <button class="permission-choice">
+          <svg viewBox="0 0 24 24"><path d="M12 3l7 4v5c0 4-2.7 7.7-7 9-4.3-1.3-7-5-7-9V7z"></path></svg>
+          <span class="permission-copy"><b>默认权限</b><small>沿用当前项目配置</small></span>
+          <span></span>
+        </button>
+        <button class="permission-choice">
+          <svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-5"></path><path d="M4 4h16v16H4z"></path></svg>
+          <span class="permission-copy"><b>自动审查</b><small>写入工作区，必要时请求确认</small></span>
+          <span></span>
+        </button>
+        <button class="permission-choice active">
+          <svg viewBox="0 0 24 24"><path d="M12 2l2.2 6.8H21l-5.5 4 2.1 6.7L12 15.4 6.4 19.5l2.1-6.7L3 8.8h6.8z"></path></svg>
+          <span class="permission-copy"><b>完全访问权限</b><small>跳过审批和沙箱，仅 Codex 生效</small></span>
+          <span class="check">✓</span>
+        </button>
+      </div>
+    </div>
+    <button class="option" data-menu="branch"><span><b>Git 分支</b><small>feature/conversation-sync-fix</small></span></button>
+  </section>
+
+  <section id="branch" class="popover">
+    <header>切换 Git 分支</header>
+    <button class="option"><span><b>feature/conversation-sync-fix</b><small>当前分支 · 有未提交改动</small></span><span class="check">✓</span></button>
+    <button class="option"><span><b>main</b><small>默认分支 · 最新同步</small></span></button>
+    <button class="option"><span><b>feature/composer-panel</b><small>本地分支 · 2 个提交领先</small></span></button>
+    <button class="option"><span><b>origin/main</b><small>远程跟踪分支</small></span></button>
+    <div class="branch-footer"><button type="button">从当前状态新建 Git 分支</button></div>
+  </section>
+
+  <section id="upload" class="popover">
+    <header>添加内容</header>
+    <button class="option"><span><b>拍照</b><small>调用相机拍摄图片</small></span></button>
+    <button class="option"><span><b>上传图片</b><small>截图、设计稿、报错图片</small></span></button>
+    <button class="option"><span><b>上传文件</b><small>代码、文档、配置或日志</small></span></button>
+    <button class="option"><span><b>粘贴剪贴板图片</b><small>从系统剪贴板读取截图</small></span></button>
+  </section>
+
+  <script>
+    const popovers = Array.from(document.querySelectorAll(".popover"));
+    const closeAll = () => popovers.forEach((item) => item.classList.remove("open"));
+    document.querySelectorAll("[data-menu]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const target = document.getElementById(button.dataset.menu);
+        const wasOpen = target.classList.contains("open");
+        closeAll();
+        if (!wasOpen) target.classList.add("open");
+      });
+    });
+    document.addEventListener("click", closeAll);
+  </script>
+</body>
+</html>
