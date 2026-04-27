@@ -68,6 +68,23 @@ function sqlite3Json(dbPath, sql) {
   return text ? JSON.parse(text) : [];
 }
 
+function readGitBranch(cwd) {
+  const target = normalizePath(cwd);
+  if (!target || !fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
+    return "";
+  }
+  try {
+    return String(
+      execFileSync("git", ["-C", target, "branch", "--show-current"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }) || ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
 export class CodexSidebarService {
   constructor(config) {
     this.config = config;
@@ -88,7 +105,7 @@ export class CodexSidebarService {
       return sqlite3Json(
         this.stateDbPath,
         [
-          "select id, cwd, title, updated_at, archived, source, agent_path, agent_role, agent_nickname",
+          "select id, cwd, title, updated_at, archived, source, agent_path, agent_role, agent_nickname, git_branch",
           "from threads",
           "where archived = 0",
           "order by updated_at desc"
@@ -110,6 +127,7 @@ export class CodexSidebarService {
 
     const collapsedGroups = globalState["electron-persisted-atom-state"]?.["sidebar-collapsed-groups"] || {};
     const threads = this.loadThreads();
+    const branchByRoot = new Map(projectRoots.map((projectRoot) => [projectRoot, readGitBranch(projectRoot)]));
     const groups = new Map(
       projectRoots.map((projectRoot) => [
         projectRoot,
@@ -125,8 +143,16 @@ export class CodexSidebarService {
     );
 
     for (const thread of threads) {
+      if (String(thread.source || "").trim() !== "vscode") {
+        continue;
+      }
       const projectRoot = bestProjectRootForCwd(thread.cwd, projectRoots);
       if (!projectRoot || !groups.has(projectRoot)) {
+        continue;
+      }
+      const activeBranch = String(branchByRoot.get(projectRoot) || "").trim();
+      const threadBranch = String(thread.git_branch || "").trim();
+      if (activeBranch && threadBranch && activeBranch !== threadBranch) {
         continue;
       }
       groups.get(projectRoot).sessions.push({

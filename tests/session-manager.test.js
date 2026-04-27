@@ -926,10 +926,10 @@ test("codex sidebar keeps all non-archived threads and empty saved projects", ()
     "project-c",
     "project-d"
   ]);
-  assert.equal(groups[0].sessions.length, 2);
+  assert.equal(groups[0].sessions.length, 1);
   assert.deepEqual(
     groups[0].sessions.map((session) => session.name),
-    ["回复在吗", "子线程"]
+    ["回复在吗"]
   );
   assert.equal(groups[1].sessions.length, 1);
   assert.equal(groups[1].collapsed, true);
@@ -938,6 +938,88 @@ test("codex sidebar keeps all non-archived threads and empty saved projects", ()
   assert.equal(groups[2].sessions[0].name, "旧 ai 线程");
   assert.equal(groups[3].sessions.length, 1);
   assert.equal(groups[3].sessions[0].name, "改为透传");
+});
+
+test("codex sidebar filters project sessions to vscode threads on the active git branch", () => {
+  const rootDir = createTempDir();
+  const workspaceRoot = path.join(rootDir, "workspace", "codex-cc-web-terminal");
+  const codexDir = path.join(rootDir, ".codex");
+  const globalStatePath = path.join(codexDir, ".codex-global-state.json");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+
+  execFileSync("git", ["init"], { cwd: workspaceRoot, stdio: "ignore" });
+  execFileSync("git", ["checkout", "-b", "feature/conversation-sync-fix"], { cwd: workspaceRoot, stdio: "ignore" });
+
+  fs.writeFileSync(
+    globalStatePath,
+    JSON.stringify(
+      {
+        "project-order": [workspaceRoot],
+        "electron-saved-workspace-roots": [workspaceRoot]
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  const sqliteInit = `
+    create table threads (
+      id text primary key,
+      rollout_path text not null,
+      created_at integer not null,
+      updated_at integer not null,
+      source text not null,
+      model_provider text not null,
+      cwd text not null,
+      title text not null,
+      sandbox_policy text not null,
+      approval_mode text not null,
+      tokens_used integer not null default 0,
+      has_user_event integer not null default 0,
+      archived integer not null default 0,
+      archived_at integer,
+      git_sha text,
+      git_branch text,
+      git_origin_url text,
+      cli_version text not null default '',
+      first_user_message text not null default '',
+      agent_nickname text,
+      agent_role text,
+      memory_mode text not null default 'enabled',
+      model text,
+      reasoning_effort text,
+      agent_path text,
+      created_at_ms integer,
+      updated_at_ms integer
+    );
+    insert into threads (
+      id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+      sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
+      cli_version, first_user_message, agent_nickname, agent_role, memory_mode
+    ) values
+    ('thread-current-1','',1714200000,1714200000,'vscode','openai','${workspaceRoot}','branch session A','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled'),
+    ('thread-current-2','',1714201000,1714201000,'vscode','openai','${workspaceRoot}','branch session B','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled'),
+    ('thread-main','',1714100000,1714100000,'vscode','openai','${workspaceRoot}','main old session','danger','full',0,0,0,'main','','','','','enabled'),
+    ('thread-subagent','',1714202000,1714202000,'subagent','openai','${workspaceRoot}','subagent session','danger','full',0,0,0,'feature/conversation-sync-fix','','','','worker','enabled'),
+    ('thread-exec','',1714203000,1714203000,'exec','openai','${workspaceRoot}','exec session','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled');
+  `;
+  execFileSync("sqlite3", [stateDbPath, sqliteInit], { stdio: "ignore" });
+
+  const service = new CodexSidebarService({
+    home: rootDir,
+    codexGlobalStatePath: globalStatePath,
+    codexStateDbPath: stateDbPath
+  });
+  const groups = service.listProjectGroups();
+
+  assert.equal(groups.length, 1);
+  assert.deepEqual(
+    groups[0].sessions.map((session) => session.name),
+    ["branch session B", "branch session A"]
+  );
 });
 
 test("historical payload does not get overridden by a poorer live conversation with a higher version", () => {
