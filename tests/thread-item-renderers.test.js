@@ -130,3 +130,114 @@ test("thread view model keeps workspace changes anchored to the file-change turn
   assert.equal(viewModel.turns.find((turn) => turn.id === "turn-change")?.hasFileChange, true);
   assert.equal(viewModel.turns.find((turn) => turn.id === "turn-chat")?.hasFileChange, false);
 });
+
+test("thread view model extracts historical file changes from file-change payloads", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-change",
+        items: [
+          {
+            id: "patch-1",
+            kind: "FileChange",
+            status: "completed",
+            payload: {
+              changes: {
+                "/workspace/codex-cc-web-terminal/package.json": {
+                  type: "update",
+                  unified_diff: "@@ -1 +1 @@\n-foo\n+bar\n"
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(viewModel.latestFileChangeTurnId, "turn-change");
+  assert.deepEqual(viewModel.turns[0].fileChanges, [
+    {
+      path: "package.json",
+      previousPath: "",
+      status: "update",
+      additions: 1,
+      deletions: 1,
+      diff: "@@ -1 +1 @@\n-foo\n+bar"
+    }
+  ]);
+});
+
+test("thread view model keeps historical file changes on every changed turn", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-first-change",
+        items: [
+          {
+            id: "patch-1",
+            kind: "FileChange",
+            status: "completed",
+            payload: {
+              callId: "patch-1",
+              name: "apply_patch",
+              output: {
+                "/workspace/codex-cc-web-terminal/src/one.js": {
+                  type: "update",
+                  unified_diff: "@@ -1 +1 @@\n-old\n+new\n"
+                }
+              }
+            }
+          },
+          {
+            id: "patch-1b",
+            kind: "FileChange",
+            status: "completed",
+            payload: {
+              output: {
+                "/workspace/codex-cc-web-terminal/src/one.js": {
+                  type: "update",
+                  unified_diff: "@@ -2 +2 @@\n-left\n+right\n"
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        id: "turn-chat",
+        items: [{ id: "msg-1", kind: "AgentMessage", text: "中间普通问答" }]
+      },
+      {
+        id: "turn-second-change",
+        items: [
+          {
+            id: "patch-2",
+            kind: "FileChange",
+            status: "completed",
+            payload: {
+              output: {
+                "/workspace/codex-cc-web-terminal/src/two.js": {
+                  type: "update",
+                  unified_diff: "@@ -1 +1 @@\n-left\n+right\n"
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(viewModel.latestFileChangeTurnId, "turn-second-change");
+  assert.deepEqual(
+    viewModel.turns.map((turn) => [turn.id, turn.fileChanges.map((file) => file.path)]),
+    [
+      ["turn-first-change", ["src/one.js"]],
+      ["turn-chat", []],
+      ["turn-second-change", ["src/two.js"]]
+    ]
+  );
+  assert.equal(viewModel.turns[0].fileChanges[0].additions, 2);
+  assert.equal(viewModel.turns[0].fileChanges[0].deletions, 2);
+});

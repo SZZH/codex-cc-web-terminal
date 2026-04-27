@@ -3,7 +3,9 @@ import { computed, onMounted, ref, watch } from "vue";
 import { requestWorkspaceChanges, revertWorkspaceChanges } from "../../lib/api.js";
 
 const props = defineProps({
-  cwd: { type: String, default: "" }
+  cwd: { type: String, default: "" },
+  files: { type: Array, default: () => [] },
+  interactive: { type: Boolean, default: false }
 });
 
 const emit = defineEmits(["status"]);
@@ -14,7 +16,12 @@ const error = ref("");
 const changes = ref({ files: [] });
 const expanded = ref(new Set());
 
-const files = computed(() => Array.isArray(changes.value?.files) ? changes.value.files : []);
+const files = computed(() => {
+  if (Array.isArray(props.files) && props.files.length > 0) {
+    return props.files;
+  }
+  return Array.isArray(changes.value?.files) ? changes.value.files : [];
+});
 const hasChanges = computed(() => files.value.length > 0);
 const totalLabel = computed(() => `${files.value.length} 个文件已更改`);
 
@@ -58,7 +65,7 @@ function formatDiffLines(diff) {
 
 async function loadChanges({ silent = false } = {}) {
   const cwd = String(props.cwd || "").trim();
-  if (!cwd) {
+  if (!cwd || !props.interactive) {
     changes.value = { files: [] };
     return;
   }
@@ -78,7 +85,7 @@ async function loadChanges({ silent = false } = {}) {
 async function revertFiles(paths) {
   const cwd = String(props.cwd || "").trim();
   const selected = (Array.isArray(paths) ? paths : []).map((item) => String(item || "").trim()).filter(Boolean);
-  if (!cwd || reverting.value || !selected.length) {
+  if (!cwd || reverting.value || !selected.length || !props.interactive) {
     return;
   }
   reverting.value = true;
@@ -99,7 +106,7 @@ function revertAll() {
 }
 
 watch(
-  () => props.cwd,
+  () => `${props.cwd}:${props.interactive ? "1" : "0"}`,
   () => {
     expanded.value = new Set();
     loadChanges();
@@ -114,7 +121,7 @@ onMounted(() => loadChanges());
     <header class="workspace-changes-head">
       <strong>{{ loading ? "正在检查文件变更…" : totalLabel }}</strong>
       <button
-        v-if="hasChanges"
+        v-if="hasChanges && interactive"
         class="workspace-changes-action"
         type="button"
         :disabled="reverting"
@@ -136,6 +143,7 @@ onMounted(() => loadChanges());
         </button>
         <span class="workspace-change-spacer"></span>
         <button
+          v-if="interactive"
           class="workspace-change-icon"
           type="button"
           title="撤销这个文件"

@@ -7,7 +7,8 @@ const props = defineProps({
   turn: { type: Object, required: true },
   assistantName: { type: String, default: "Codex" },
   workspaceCwd: { type: String, default: "" },
-  showWorkspaceChanges: { type: Boolean, default: false }
+  showWorkspaceChanges: { type: Boolean, default: false },
+  interactiveWorkspaceChanges: { type: Boolean, default: false }
 });
 
 const emit = defineEmits(["status"]);
@@ -37,8 +38,10 @@ const statusLabel = computed(() => {
     />
 
     <WorkspaceChangesPanel
-      v-if="showWorkspaceChanges"
+      v-if="showWorkspaceChanges || (turn.fileChanges || []).length"
       :cwd="workspaceCwd"
+      :files="turn.fileChanges || []"
+      :interactive="interactiveWorkspaceChanges"
       @status="emit('status', $event)"
     />
 
