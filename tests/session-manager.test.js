@@ -64,6 +64,90 @@ test("providerCatalog exposes both provider definitions", () => {
   assert.equal(providers[1].defaultModel, "sonnet");
 });
 
+test("listProjectGroups sorts groups by latest session activity including live sessions", () => {
+  const { manager, rootDir } = createManager();
+  const alphaRoot = path.join(rootDir, "workspace", "alpha");
+  const betaRoot = path.join(rootDir, "workspace", "beta");
+  fs.mkdirSync(path.join(alphaRoot, "app"), { recursive: true });
+  fs.mkdirSync(betaRoot, { recursive: true });
+
+  manager.codexSidebarService.listProjectGroups = () => [
+    {
+      id: `project:${alphaRoot}`,
+      name: "alpha",
+      projectRoot: alphaRoot,
+      cwd: alphaRoot,
+      collapsed: false,
+      sessions: [
+        {
+          id: "history:codex:thread-alpha-old",
+          threadId: "thread-alpha-old",
+          provider: "codex",
+          providerLabel: "Codex",
+          cliLabel: "Codex CLI",
+          name: "旧 alpha",
+          cwd: alphaRoot,
+          kind: "history",
+          status: "saved",
+          createdAt: "",
+          updatedAt: "2026-04-20T10:00:00.000Z",
+          exitCode: null,
+          autoNamed: false,
+          inputPreview: "",
+          resumeSessionId: "thread-alpha-old",
+          model: "",
+          titleSource: "codex_state_db",
+          sessionType: "main",
+          parentThreadId: "",
+          agentRole: "",
+          agentNickname: ""
+        }
+      ]
+    },
+    {
+      id: `project:${betaRoot}`,
+      name: "beta",
+      projectRoot: betaRoot,
+      cwd: betaRoot,
+      collapsed: false,
+      sessions: [
+        {
+          id: "history:codex:thread-beta-old",
+          threadId: "thread-beta-old",
+          provider: "codex",
+          providerLabel: "Codex",
+          cliLabel: "Codex CLI",
+          name: "旧 beta",
+          cwd: betaRoot,
+          kind: "history",
+          status: "saved",
+          createdAt: "",
+          updatedAt: "2026-04-21T10:00:00.000Z",
+          exitCode: null,
+          autoNamed: false,
+          inputPreview: "",
+          resumeSessionId: "thread-beta-old",
+          model: "",
+          titleSource: "codex_state_db",
+          sessionType: "main",
+          parentThreadId: "",
+          agentRole: "",
+          agentNickname: ""
+        }
+      ]
+    }
+  ];
+
+  const created = manager.create({ provider: "codex", cwd: path.join(alphaRoot, "app"), name: "alpha live" });
+  const live = manager.get(created.id);
+  live.updatedAt = "2026-04-27T12:00:00.000Z";
+
+  const groups = manager.listProjectGroups();
+
+  assert.deepEqual(groups.map((group) => group.name), ["alpha", "beta"]);
+  assert.deepEqual(groups[0].sessions.map((session) => session.name), ["alpha live", "旧 alpha"]);
+});
+
 test("create rejects unsupported providers", () => {
   const { manager } = createManager();
   assert.throws(() => manager.create({ provider: "unknown-provider" }), /Unsupported session provider/);

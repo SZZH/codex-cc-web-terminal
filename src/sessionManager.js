@@ -50,6 +50,40 @@ function normalizeName(value, fallback) {
   return text || fallback;
 }
 
+function normalizeComparablePath(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  try {
+    return path.resolve(text);
+  } catch {
+    return text;
+  }
+}
+
+function isSubpathOf(targetPath, rootPath) {
+  const target = normalizeComparablePath(targetPath);
+  const root = normalizeComparablePath(rootPath);
+  if (!target || !root) {
+    return false;
+  }
+  if (target === root) {
+    return true;
+  }
+  const relative = path.relative(root, target);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function bestProjectRootForCwd(cwd, projectRoots) {
+  const matches = projectRoots.filter((rootPath) => isSubpathOf(cwd, rootPath));
+  return matches.sort((left, right) => right.length - left.length)[0] || "";
+}
+
+function byUpdatedAtDesc(left, right) {
+  return String(right?.updatedAt || "").localeCompare(String(left?.updatedAt || ""));
+}
+
 function isManuallyNamedSession(session) {
   const titleSource = String(session?.titleSource || "").trim().toLowerCase();
   return titleSource === "custom_name" || titleSource === "user_provided";
@@ -150,7 +184,45 @@ export class SessionManager {
   }
 
   listProjectGroups() {
-    return this.codexSidebarService.listProjectGroups();
+    const baseGroups = this.codexSidebarService.listProjectGroups();
+    if (!baseGroups.length) {
+      return [];
+    }
+
+    const groups = baseGroups.map((group) => ({
+      ...group,
+      sessions: Array.isArray(group.sessions) ? [...group.sessions] : []
+    }));
+    const projectRoots = groups.map((group) => String(group.projectRoot || group.cwd || "").trim()).filter(Boolean);
+    const groupsByRoot = new Map(groups.map((group) => [String(group.projectRoot || group.cwd || "").trim(), group]));
+
+    for (const session of this.listLiveSessions()) {
+      const projectRoot = bestProjectRootForCwd(session.cwd, projectRoots);
+      if (!projectRoot) {
+        continue;
+      }
+      const group = groupsByRoot.get(projectRoot);
+      if (!group) {
+        continue;
+      }
+      group.sessions.push(session);
+    }
+
+    for (const group of groups) {
+      const deduped = new Map();
+      for (const session of group.sessions) {
+        const identity = `${String(session.provider || "codex").trim()}:${String(
+          session.resumeSessionId || session.threadId || session.id || ""
+        ).trim()}`;
+        const existing = deduped.get(identity);
+        if (!existing || byUpdatedAtDesc(session, existing) < 0) {
+          deduped.set(identity, session);
+        }
+      }
+      group.sessions = [...deduped.values()].sort(byUpdatedAtDesc);
+    }
+
+    return groups.sort((left, right) => byUpdatedAtDesc(left.sessions[0], right.sessions[0]));
   }
 
   get(id) {
