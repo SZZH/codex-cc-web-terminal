@@ -29,6 +29,7 @@ const props = defineProps({
 
 const emit = defineEmits(["back", "update:draft", "submit", "interrupt", "status"]);
 const messageListEl = ref(null);
+const messageBottomEl = ref(null);
 const composerEl = ref(null);
 const viewportHeight = ref(0);
 const keyboardInset = ref(0);
@@ -49,6 +50,9 @@ const lightboxGesture = {
   startMidpointX: 0,
   startMidpointY: 0
 };
+let scrollAnimationFrame = 0;
+let scrollSettleTimer = 0;
+let streamResizeObserver = null;
 
 const chatShellStyle = computed(() => ({
   "--chat-vh": viewportHeight.value ? `${viewportHeight.value}px` : undefined,
@@ -367,14 +371,21 @@ function scrollToBottom(force = false) {
 
     const applyScroll = () => {
       el.scrollTop = el.scrollHeight;
+      messageBottomEl.value?.scrollIntoView({ block: "end" });
       isPinnedToBottom.value = true;
     };
 
     applyScroll();
     if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(applyScroll);
+      window.cancelAnimationFrame?.(scrollAnimationFrame);
+      scrollAnimationFrame = window.requestAnimationFrame(() => {
+        applyScroll();
+        scrollAnimationFrame = window.requestAnimationFrame(applyScroll);
       });
+    }
+    if (typeof window !== "undefined") {
+      window.clearTimeout?.(scrollSettleTimer);
+      scrollSettleTimer = window.setTimeout(applyScroll, 120);
     }
   });
 }
@@ -567,6 +578,21 @@ function handleWindowKeydown(event) {
   }
 }
 
+function observeMessageContentSize() {
+  if (typeof ResizeObserver === "undefined" || !messageListEl.value) {
+    return;
+  }
+  streamResizeObserver?.disconnect();
+  streamResizeObserver = new ResizeObserver(() => {
+    if (isPinnedToBottom.value) {
+      scrollToBottom(true);
+    }
+  });
+  for (const child of messageListEl.value.children) {
+    streamResizeObserver.observe(child);
+  }
+}
+
 watch(
   () =>
     hasThreadSnapshot.value
@@ -576,6 +602,7 @@ watch(
     if (!hasThreadSnapshot.value) {
       return;
     }
+    observeMessageContentSize();
     scrollToBottom(false);
   },
   { flush: "post" }
@@ -585,6 +612,7 @@ watch(
   () => `${props.sessionKey}::${props.openToken}`,
   () => {
     isPinnedToBottom.value = true;
+    observeMessageContentSize();
     scrollToBottom(true);
   },
   { flush: "post", immediate: true }
@@ -609,6 +637,7 @@ onMounted(() => {
     window.visualViewport?.addEventListener("scroll", handleViewportChange, { passive: true });
   }
   syncViewportMetrics();
+  observeMessageContentSize();
   scrollToBottom(true);
   resizeComposer(composerEl.value, { keepBottom: true });
 });
@@ -619,7 +648,10 @@ onBeforeUnmount(() => {
     window.removeEventListener("keydown", handleWindowKeydown);
     window.visualViewport?.removeEventListener("resize", handleViewportChange);
     window.visualViewport?.removeEventListener("scroll", handleViewportChange);
+    window.cancelAnimationFrame?.(scrollAnimationFrame);
+    window.clearTimeout?.(scrollSettleTimer);
   }
+  streamResizeObserver?.disconnect();
 });
 </script>
 
@@ -644,6 +676,7 @@ onBeforeUnmount(() => {
           :workspace-cwd="workspaceCwd"
           @status="emit('status', $event)"
         />
+        <span ref="messageBottomEl" class="message-bottom-anchor" aria-hidden="true"></span>
       </section>
 
       <p v-if="statusText" class="chat-status">{{ statusText }}</p>
@@ -795,6 +828,13 @@ onBeforeUnmount(() => {
   overflow-x: hidden;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+.message-bottom-anchor {
+  display: block;
+  width: 1px;
+  height: 1px;
+  flex: 0 0 1px;
 }
 
 .message-item {
