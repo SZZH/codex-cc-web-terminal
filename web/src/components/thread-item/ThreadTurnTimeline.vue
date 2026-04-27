@@ -6,8 +6,11 @@ import ThreadTurnCard from "./ThreadTurnCard.vue";
 const props = defineProps({
   snapshot: { type: Object, default: null },
   liveOverlay: { type: Object, default: null },
-  assistantName: { type: String, default: "Codex" }
+  assistantName: { type: String, default: "Codex" },
+  workspaceCwd: { type: String, default: "" }
 });
+
+const emit = defineEmits(["status"]);
 
 const viewModel = computed(() =>
   buildThreadViewModel(props.snapshot || {}, {
@@ -21,10 +24,12 @@ const viewModel = computed(() =>
   <div class="thread-turn-timeline">
     <ThreadTurnCard
       v-for="turn in viewModel.turns"
-      :key="turn.id"
-      :turn="turn"
-      :assistant-name="assistantName"
-    />
+        :key="turn.id"
+        :turn="turn"
+        :assistant-name="assistantName"
+        :workspace-cwd="workspaceCwd"
+        :show-workspace-changes="turn.id === viewModel.lastDisplayTurnId"
+        @status="emit('status', $event)"
+      />
   </div>
 </template>
-

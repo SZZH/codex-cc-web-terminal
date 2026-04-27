@@ -1,11 +1,16 @@
 <script setup>
 import { computed } from "vue";
 import ThreadTurnSegment from "./ThreadTurnSegment.vue";
+import WorkspaceChangesPanel from "./WorkspaceChangesPanel.vue";
 
 const props = defineProps({
   turn: { type: Object, required: true },
-  assistantName: { type: String, default: "Codex" }
+  assistantName: { type: String, default: "Codex" },
+  workspaceCwd: { type: String, default: "" },
+  showWorkspaceChanges: { type: Boolean, default: false }
 });
+
+const emit = defineEmits(["status"]);
 
 const statusLabel = computed(() => {
   const status = String(props.turn?.status || "").trim().toLowerCase();
@@ -31,10 +36,15 @@ const statusLabel = computed(() => {
       :assistant-name="assistantName"
     />
 
+    <WorkspaceChangesPanel
+      v-if="showWorkspaceChanges"
+      :cwd="workspaceCwd"
+      @status="emit('status', $event)"
+    />
+
     <footer class="thread-turn-footer">
       <span class="thread-turn-status">{{ statusLabel }}</span>
       <span v-if="turn.durationMs" class="thread-turn-duration">{{ Math.round(turn.durationMs / 1000) }}s</span>
     </footer>
   </article>
 </template>
-

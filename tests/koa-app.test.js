@@ -2,8 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
-import { login, parseCookieValue, startTestServer } from "./helpers/backendTestUtils.js";
+import { HistoricalSessionService } from "../src/sessions/history/HistoricalSessionService.js";
+import { buildProviders } from "../src/sessions/providers/buildProviders.js";
+import { createBaseConfig, createTempDir, login, parseCookieValue, startTestServer } from "./helpers/backendTestUtils.js";
 
 function createSessionManagerStub() {
   const calls = {
@@ -50,6 +53,18 @@ function createSessionManagerStub() {
     },
     listAll() {
       return [liveSession];
+    },
+    listProjectGroups() {
+      return [
+        {
+          id: "project:/tmp/demo",
+          name: "demo",
+          projectRoot: "/tmp/demo",
+          cwd: "/tmp/demo",
+          collapsed: false,
+          sessions: []
+        }
+      ];
     },
     listArchived() {
       return [{ ...liveSession, id: "history:codex:thread-1", kind: "archived", status: "archived" }];
@@ -237,6 +252,32 @@ test("cross-origin login is rejected before token validation", async (t) => {
   assert.deepEqual(await response.json(), { error: "Cross-origin request rejected" });
 });
 
+test("authorized local image proxy serves image files for history previews", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const auth = await login(server.baseUrl, server.config.accessToken);
+  assert.equal(auth.response.status, 200);
+
+  const imagePath = path.join(server.rootDir, "history-preview.png");
+  fs.writeFileSync(
+    imagePath,
+    Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a2X8AAAAASUVORK5CYII=", "base64")
+  );
+
+  const response = await fetch(
+    `${server.baseUrl}/api/local-file-image?path=${encodeURIComponent(imagePath)}`,
+    { headers: { cookie: auth.cookies } }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "image/png");
+  assert.ok((await response.arrayBuffer()).byteLength > 0);
+});
+
 test("login rate limit blocks after max failures and resets after block window", async (t) => {
   const sessionManager = createSessionManagerStub();
   const server = await startTestServer({
@@ -282,6 +323,7 @@ test("session routes delegate CRUD operations and health stays public", async (t
   assert.equal(listResponse.status, 200);
   const listPayload = await listResponse.json();
   assert.equal(listPayload.sessions.length, 1);
+  assert.equal(listPayload.projectGroups.length, 1);
 
   const createResponse = await fetch(`${server.baseUrl}/api/sessions`, {
     method: "POST",
@@ -1191,6 +1233,126 @@ test("history messages route prefers live continuation over stale persisted snap
   assert.equal(payload.threadSnapshot.turns[0].id, "turn-fresh");
   assert.equal(payload.threadSnapshot.turns[0].items[1].text, "新回答");
   assert.equal(payload.conversation.turns[0].assistant.body[0].text, "新回答");
+});
+
+test("history messages interface strips IAB wrapper from authoritative turns and thread snapshot", async (t) => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir });
+  const service = new HistoricalSessionService(config);
+  const providers = new Map(buildProviders(config).map((provider) => [provider.id, provider]));
+  const provider = providers.get("codex");
+
+  const dayDir = path.join(codexSessionsDir, "2026", "04", "24");
+  fs.mkdirSync(dayDir, { recursive: true });
+  const resumeSessionId = "019daee8-2852-7131-8d2e-9b7149cd6187";
+  const sessionFile = path.join(dayDir, `rollout-2026-04-24T12-00-00-${resumeSessionId}.jsonl`);
+  fs.writeFileSync(
+    path.join(path.dirname(codexSessionsDir), "session_index.jsonl"),
+    JSON.stringify({ id: resumeSessionId, thread_name: "IAB wrapper thread" }) + "\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    sessionFile,
+    `${JSON.stringify({
+      timestamp: "2026-04-24T00:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: resumeSessionId,
+        cwd: rootDir,
+        thread_name: "IAB wrapper thread",
+        originator: "codex_cli",
+        source: "cli"
+      }
+    })}\n${JSON.stringify({
+      timestamp: "2026-04-24T00:00:01.000Z",
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        message:
+          "\n# In app browser (IAB):\n- The user has the in-app browser (IAB) open.\n- Current URL: http://127.0.0.1:3210/#/chat/history:codex:019daf2c-f5a0-7033-a87c-b5df6ddef277\n\n## My request for Codex:\n执行\n"
+      }
+    })}\n`,
+    "utf8"
+  );
+
+  const sessionManager = createSessionManagerStub();
+  sessionManager.getHistoricalMessages = (providerId, threadId) =>
+    service.getHistoricalMessages(provider, threadId);
+  sessionManager.getThreadSnapshotBundle = (providerId, threadId) => {
+    const payload = service.getHistoricalMessages(provider, threadId);
+    return {
+      session: payload.session,
+      threadSnapshot: payload.threadSnapshot,
+      liveOverlay: payload.liveOverlay,
+      conversation: payload.conversation,
+      conversationSnapshot: payload.conversationSnapshot
+    };
+  };
+  sessionManager.getThreadContinuationRuntime = () => null;
+
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: { codexSessionsDir, dataDir: config.dataDir }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/history-messages?provider=codex&resumeSessionId=${resumeSessionId}`, {
+    headers: { cookie: cookies }
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.turns[0].user.text, "执行");
+  assert.equal(payload.threadSnapshot.turns[0].items[0].text, "执行");
+});
+
+test("workspace changes API lists diffs and reverts selected files", async (t) => {
+  const rootDir = createTempDir();
+  execFileSync("git", ["init"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: rootDir, stdio: "ignore" });
+  fs.writeFileSync(path.join(rootDir, "demo.txt"), "before\n", "utf8");
+  execFileSync("git", ["add", "demo.txt"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: rootDir, stdio: "ignore" });
+  fs.writeFileSync(path.join(rootDir, "demo.txt"), "before\nafter\n", "utf8");
+  fs.writeFileSync(path.join(rootDir, "new.txt"), "new file\n", "utf8");
+
+  const sessionManager = createSessionManagerStub();
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const params = new URLSearchParams({ cwd: rootDir });
+  const listResponse = await fetch(`${server.baseUrl}/api/workspace-changes?${params.toString()}`, {
+    headers: { cookie: cookies }
+  });
+  const listPayload = await listResponse.json();
+
+  assert.equal(listResponse.status, 200);
+  assert.deepEqual([...listPayload.files.map((file) => file.path)].sort(), ["demo.txt", "new.txt"]);
+  assert.match(listPayload.files.find((file) => file.path === "demo.txt").diff, /\+after/);
+
+  const revertResponse = await fetch(`${server.baseUrl}/api/workspace-changes/revert`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ cwd: rootDir, paths: ["demo.txt"] })
+  });
+  const revertPayload = await revertResponse.json();
+
+  assert.equal(revertResponse.status, 200);
+  assert.equal(fs.readFileSync(path.join(rootDir, "demo.txt"), "utf8"), "before\n");
+  assert.ok(fs.existsSync(path.join(rootDir, "new.txt")));
+  assert.deepEqual(revertPayload.reverted, ["demo.txt"]);
+  assert.deepEqual(revertPayload.files.map((file) => file.path), ["new.txt"]);
 });
 
 test("invalid input payloads return 400 for json-backed routes", async (t) => {

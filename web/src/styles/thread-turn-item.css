@@ -10,6 +10,7 @@
   flex-direction: column;
   gap: 10px;
   width: min(100%, 46rem);
+  min-width: 0;
   align-self: stretch;
 }
 
@@ -26,19 +27,20 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .turn-process-segment {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 12px 14px;
-  border-radius: 22px;
-  border: 1px solid rgba(214, 203, 193, 0.78);
-  background:
-    linear-gradient(180deg, rgba(250, 246, 242, 0.94), rgba(244, 238, 232, 0.88)),
-    rgba(247, 243, 239, 0.82);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.58);
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--process-border);
+  background: linear-gradient(180deg, rgba(255, 252, 249, 0.88), rgba(247, 242, 236, 0.78));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.58),
+    0 4px 14px rgba(123, 103, 86, 0.03);
 }
 
 .turn-process-toggle {
@@ -47,17 +49,22 @@
   justify-content: space-between;
   gap: 12px;
   width: 100%;
-  padding: 0;
+  min-height: 34px;
+  padding: 0 2px;
   border: 0;
   background: transparent;
-  color: #594c42;
-  font-size: 13px;
+  color: var(--process-shell-text);
+  font-size: 12.5px;
   line-height: 1.4;
+  font-weight: 550;
+  letter-spacing: 0.01em;
   text-align: left;
 }
 
 .turn-process-toggle-icon {
   flex: 0 0 auto;
+  color: var(--process-shell-icon);
+  font-size: 13px;
   transform: rotate(-90deg);
   transition: transform 160ms ease;
 }
@@ -71,47 +78,27 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .turn-process-items {
   position: relative;
-  max-height: min(42vh, 28rem);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding-right: 2px;
-  padding-top: 4px;
+  overflow: visible;
+  padding-right: 0;
+  padding-top: 2px;
   padding-bottom: 2px;
-}
-
-.turn-process-fade {
-  position: sticky;
-  left: 0;
-  right: 0;
-  z-index: 2;
-  height: 22px;
-  pointer-events: none;
-}
-
-.turn-process-fade-top {
-  top: -4px;
-  margin-bottom: -22px;
-  background: linear-gradient(180deg, rgba(248, 244, 240, 0.98), rgba(248, 244, 240, 0));
-}
-
-.turn-process-fade-bottom {
-  bottom: -2px;
-  margin-top: -22px;
-  background: linear-gradient(0deg, rgba(248, 244, 240, 0.98), rgba(248, 244, 240, 0));
 }
 
 .thread-item-card {
   width: fit-content;
   max-width: min(100%, 42rem);
+  min-width: 0;
   border-radius: 18px;
   border: 1px solid rgba(217, 206, 196, 0.92);
   background: rgba(255, 251, 247, 0.9);
   padding: 12px 14px;
   color: #342d28;
+  overflow-wrap: anywhere;
 }
 
 .thread-item-user {
@@ -132,10 +119,8 @@
   width: 100%;
   max-width: 100%;
   border-radius: 16px;
-  border-color: rgba(218, 209, 200, 0.96);
-  background:
-    linear-gradient(180deg, rgba(255, 253, 250, 0.96), rgba(247, 241, 235, 0.94)),
-    rgba(247, 243, 239, 0.9);
+  border-color: var(--process-border);
+  background: rgba(255, 252, 249, 0.72);
 }
 
 .thread-item-card.is-live-overlay {
@@ -176,13 +161,17 @@
 
 .thread-item-body {
   min-width: 0;
+  max-width: 100%;
   font-size: 14px;
   line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .thread-item-body.plain-body {
   margin: 0;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
   font-family: "SFMono-Regular", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   font-size: 12.5px;
@@ -206,4 +195,162 @@
 .thread-item-details dd {
   margin: 0;
   color: #413831;
+}
+
+.workspace-changes {
+  width: min(100%, 42rem);
+  align-self: flex-start;
+  overflow: hidden;
+  border-radius: 14px;
+  background: rgba(244, 243, 241, 0.96);
+  border: 1px solid rgba(228, 225, 221, 0.95);
+  color: #1f252b;
+}
+
+.workspace-changes-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 14px;
+  background: rgba(249, 249, 248, 0.86);
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.workspace-changes-action {
+  margin-left: auto;
+  color: #20252a;
+  font-size: 14px;
+}
+
+.workspace-changes-action:disabled,
+.workspace-change-icon:disabled {
+  opacity: 0.45;
+  cursor: wait;
+}
+
+.workspace-changes-error {
+  margin: 0;
+  padding: 8px 14px;
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workspace-change-file {
+  border-top: 1px solid rgba(223, 220, 216, 0.88);
+}
+
+.workspace-change-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 46px;
+  padding: 0 14px;
+  color: #1f252b;
+  text-align: left;
+}
+
+.workspace-change-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+  color: inherit;
+  text-align: left;
+}
+
+.workspace-change-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.workspace-change-status {
+  flex: 0 0 auto;
+  color: #747b83;
+  font-size: 12px;
+}
+
+.workspace-change-stat {
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.workspace-change-stat.add {
+  color: #00a647;
+}
+
+.workspace-change-stat.del {
+  color: #d12b2b;
+}
+
+.workspace-change-spacer {
+  flex: 1 1 auto;
+}
+
+.workspace-change-icon {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  color: #6f767d;
+  border-radius: 8px;
+}
+
+.workspace-change-icon:hover {
+  background: rgba(220, 218, 215, 0.86);
+}
+
+.workspace-change-diff {
+  max-height: min(360px, 48vh);
+  overflow: auto;
+  border-top: 1px solid rgba(224, 221, 217, 0.88);
+  background: #fbfbfa;
+}
+
+.workspace-change-code {
+  margin: 0;
+  padding: 0;
+  min-width: max-content;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.workspace-change-line {
+  display: block;
+  min-height: 20px;
+  padding: 0 14px;
+  color: #525960;
+}
+
+.workspace-change-line.add {
+  color: #008a2e;
+  background: #dff3e6;
+}
+
+.workspace-change-line.del {
+  color: #b42318;
+  background: #fde7e7;
+}
+
+.workspace-change-line.meta {
+  color: #6f5aa7;
+  background: #f0edf7;
+}
+
+.workspace-change-empty {
+  margin: 0;
+  padding: 12px 14px;
+  color: #747b83;
+  font-size: 13px;
 }

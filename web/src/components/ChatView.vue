@@ -19,6 +19,7 @@ const props = defineProps({
   assistantName: { type: String, default: "Codex" },
   threadSnapshot: { type: Object, default: null },
   liveOverlay: { type: Object, default: null },
+  workspaceCwd: { type: String, default: "" },
   draft: { type: String, default: "" },
   canSend: Boolean,
   canInterrupt: Boolean,
@@ -26,7 +27,7 @@ const props = defineProps({
   statusText: { type: String, default: "" }
 });
 
-const emit = defineEmits(["back", "update:draft", "submit", "interrupt"]);
+const emit = defineEmits(["back", "update:draft", "submit", "interrupt", "status"]);
 const messageListEl = ref(null);
 const composerEl = ref(null);
 const viewportHeight = ref(0);
@@ -640,6 +641,8 @@ onBeforeUnmount(() => {
           :snapshot="threadSnapshot"
           :live-overlay="liveOverlay"
           :assistant-name="assistantName"
+          :workspace-cwd="workspaceCwd"
+          @status="emit('status', $event)"
         />
       </section>
 
@@ -977,7 +980,7 @@ onBeforeUnmount(() => {
 .message-text {
   margin: 0;
   white-space: normal;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
   word-break: break-word;
   line-break: auto;
   font-size: 15px;
@@ -990,8 +993,8 @@ onBeforeUnmount(() => {
 .message-item.user .message-text {
   display: block;
   white-space: normal;
-  overflow-wrap: break-word;
-  word-break: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   max-width: 100%;
 }
 
@@ -1020,6 +1023,9 @@ onBeforeUnmount(() => {
 
 .markdown-body :deep(p) {
   margin: 0 0 4px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body :deep(p:last-child) {
@@ -1032,6 +1038,8 @@ onBeforeUnmount(() => {
   background: rgba(86, 72, 61, 0.1);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 0.92em;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body :deep(pre) {
@@ -1166,6 +1174,8 @@ onBeforeUnmount(() => {
 
 .markdown-body :deep(li) {
   margin-bottom: 4px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body :deep(a) {

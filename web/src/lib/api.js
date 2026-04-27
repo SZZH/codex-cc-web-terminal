@@ -111,6 +111,18 @@ export async function requestSessionById(sessionId) {
   return payload?.session || null;
 }
 
+export async function requestWorkspaceChanges(cwd) {
+  const params = new URLSearchParams({ cwd: String(cwd || "") });
+  return request(`/api/workspace-changes?${params.toString()}`);
+}
+
+export async function revertWorkspaceChanges(cwd, paths = []) {
+  return request("/api/workspace-changes/revert", {
+    method: "POST",
+    body: JSON.stringify({ cwd, paths })
+  });
+}
+
 export async function requestAuthSession(attempt = 0) {
   const response = await fetch("/api/auth/session", {
     credentials: "same-origin"

@@ -126,11 +126,15 @@ export function buildTurnViewModel(turn = {}, options = {}) {
 
 export function buildThreadViewModel(snapshot = {}, options = {}) {
   const turns = asArray(snapshot?.turns).map((turn) => buildTurnViewModel(turn, options));
+  const lastDisplayTurn = [...turns]
+    .reverse()
+    .find((turn) => turn.segments.some((segment) => segment.kind === "primary" || segment.kind === "process"));
   return {
     threadId: String(firstDefined(snapshot?.threadId, "")),
     version: Number(snapshot?.version || 0),
     updatedAt: firstDefined(snapshot?.updatedAt, ""),
     turns,
+    lastDisplayTurnId: String(lastDisplayTurn?.id || ""),
     isEmpty: turns.length === 0
   };
 }

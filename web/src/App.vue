@@ -32,11 +32,8 @@ import {
   shouldSyncPersistedThread
 } from "./lib/thread-display-state.js";
 import {
-  PREVIEW_FALLBACK,
   compactLine,
   createMessage,
-  fallbackPreviewForSession,
-  fallbackTitleForSession,
   filterTerminalNoise,
   formatRelativeTime,
   normalizeHistoryMessages,
@@ -83,6 +80,7 @@ const state = reactive({
   rememberToken: true,
   statusText: "",
   sessions: [],
+  projectGroups: [],
   routeSessionId: "",
   liveView: {
     sessionId: "",
@@ -171,11 +169,10 @@ function parseHistoryRouteSessionId(value) {
 }
 
 function decorateSession(session) {
-  const cache = sessionCache[cacheKey(session)] || {};
   return {
     ...session,
-    displayTitle: cache.title || String(session?.name || "").trim() || fallbackTitleForSession(session),
-    displayPreview: cache.preview || fallbackPreviewForSession(session),
+    displayTitle: String(session?.name || "").trim(),
+    displayPreview: String(session?.inputPreview || "").trim(),
     groupName: workspaceName(session.cwd)
   };
 }
@@ -193,12 +190,15 @@ function clearAuthoritativeThreadSnapshot() {
 }
 
 const groupedSessions = computed(() => {
+  if (Array.isArray(state.projectGroups) && state.projectGroups.length > 0) {
+    return state.projectGroups.map((group) => ({
+      ...group,
+      sessions: (group.sessions || []).map(decorateSession)
+    }));
+  }
   const sessionSorter = (left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt));
   const groups = new Map();
   for (const session of state.sessions.map(decorateSession)) {
-    if (String(session?.sessionType || "").trim().toLowerCase() === "subagent") {
-      continue;
-    }
     if (!groups.has(session.groupName)) {
       groups.set(session.groupName, []);
     }
@@ -294,6 +294,9 @@ const activeSessionTitle = computed(() => {
 });
 const activeWorkspaceName = computed(() =>
   workspaceName(displayedSessionMeta.value?.cwd || displayedThreadSnapshot.value?.metadata?.cwd || "")
+);
+const activeWorkspaceCwd = computed(() =>
+  String(displayedSessionMeta.value?.cwd || displayedThreadSnapshot.value?.metadata?.cwd || "").trim()
 );
 const activeAssistantName = computed(() => displayedSessionMeta.value?.providerLabel || "Codex");
 const threadMismatch = computed(() => {
@@ -1003,8 +1006,8 @@ async function hydrateSession(session, { includeMessages = false, silent = false
     if (!payload) {
       const nextValue = {
         hydrated: true,
-        title: String(session?.name || fallbackTitleForSession(session)).trim() || fallbackTitleForSession(session),
-        preview: String(session?.inputPreview || fallbackPreviewForSession(session)).trim() || fallbackPreviewForSession(session),
+        title: String(session?.name || "").trim(),
+        preview: String(session?.inputPreview || "").trim(),
         messages: [],
         turns: [],
         backgroundAgents: [],
@@ -1027,8 +1030,8 @@ async function hydrateSession(session, { includeMessages = false, silent = false
       turns,
       backgroundAgents
     });
-    const title = String(payload.session?.name || session.name || fallbackTitleForSession(session)).trim() || fallbackTitleForSession(session);
-    const preview = String(payload.session?.inputPreview || session.inputPreview || fallbackPreviewForSession(session)).trim() || fallbackPreviewForSession(session);
+    const title = String(payload.session?.name || session.name || "").trim();
+    const preview = String(payload.session?.inputPreview || session.inputPreview || "").trim();
     const nextValue = {
       hydrated: true,
       title,
@@ -1061,6 +1064,7 @@ async function hydrateSession(session, { includeMessages = false, silent = false
 async function refreshSessions() {
   const payload = await request("/api/sessions");
   const sessions = payload.sessions || [];
+  const projectGroups = payload.projectGroups || [];
   for (const session of sessions) {
     const key = cacheKey(session);
     const title = String(session?.name || "").trim();
@@ -1073,6 +1077,7 @@ async function refreshSessions() {
     };
   }
   state.sessions = sessions;
+  state.projectGroups = projectGroups;
 }
 
 function stopHistorySyncLoop() {
@@ -2092,10 +2097,6 @@ async function backToList() {
   await refreshSessions();
 }
 
-function defaultPreview(session) {
-  return PREVIEW_FALLBACK[session?.kind] || "继续这个会话";
-}
-
 watch(
   () => route.name,
   async (name) => {
@@ -2319,6 +2320,7 @@ if (typeof window !== 'undefined') {
         :expected-thread-id="expectedThreadId"
         :thread-mismatch="threadMismatch"
         :workspace-name="activeWorkspaceName"
+        :workspace-cwd="activeWorkspaceCwd"
         :assistant-name="activeAssistantName"
         :thread-snapshot="displayedThreadSnapshot"
         :live-overlay="displayedLiveOverlay"
@@ -2330,6 +2332,7 @@ if (typeof window !== 'undefined') {
         @back="backToList"
         @interrupt="interruptActiveSession"
         @submit="submitInput"
+        @status="setStatus"
       />
 
       <section v-else class="mobile-shell centered-shell">

@@ -6,6 +6,7 @@ import { handleAuthRoute } from "./routes/auth.js";
 import { handleConfigRoute } from "./routes/config.js";
 import { handleHistoryRoute } from "./routes/history.js";
 import { handleSessionRoute } from "./routes/sessions.js";
+import { handleWorkspaceChangesRoute } from "./routes/workspaceChanges.js";
 import { createRuntime } from "./runtime/createRuntime.js";
 
 export function createKoaApp({ config, sessionManager }) {
@@ -60,7 +61,7 @@ export function createKoaApp({ config, sessionManager }) {
       return;
     }
 
-    const handled = [handleAuthRoute, handleConfigRoute, handleHistoryRoute, handleSessionRoute];
+    const handled = [handleAuthRoute, handleConfigRoute, handleHistoryRoute, handleSessionRoute, handleWorkspaceChangesRoute];
     for (const route of handled) {
       if (await route(ctx, runtime)) {
         return;
