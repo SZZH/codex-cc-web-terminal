@@ -31,7 +31,8 @@ const emit = defineEmits(["close"]);
   position: fixed;
   left: 0;
   right: 0;
-  bottom: calc(88px + env(safe-area-inset-bottom));
+  max-height: min(70vh, calc(100vh - 92px - env(safe-area-inset-bottom)));
+  bottom: calc(env(safe-area-inset-bottom));
   width: min(420px, calc(100vw - 20px));
   margin: 0 auto;
   border: 1px solid rgba(220, 209, 199, 0.9);
@@ -40,7 +41,11 @@ const emit = defineEmits(["close"]);
   box-shadow:
     0 22px 54px rgba(99, 78, 60, 0.2),
     0 1px 0 rgba(255, 255, 255, 0.92) inset;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   z-index: 21;
   animation: drawer-in 180ms ease-out;
 }
@@ -68,14 +73,6 @@ const emit = defineEmits(["close"]);
   to {
     opacity: 1;
     transform: translateY(0);
-  }
-}
-
-@media (max-height: 720px) {
-  .popover-drawer {
-    bottom: calc(84px + env(safe-area-inset-bottom));
-    max-height: min(380px, calc(100vh - 120px));
-    overflow: auto;
   }
 }
 </style>

@@ -367,6 +367,7 @@ pre {
 .message-stream {
   flex: 1;
   padding: 10px 12px 124px;
+  padding-bottom: 0;
   overflow-y: auto;
   display: grid;
   gap: 10px;

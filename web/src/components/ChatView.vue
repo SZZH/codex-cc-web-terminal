@@ -45,10 +45,13 @@ const emit = defineEmits([
 const messageListEl = ref(null);
 const messageBottomEl = ref(null);
 const composerRef = ref(null);
+const composerHostEl = ref(null);
+const statusEl = ref(null);
 const viewportHeight = ref(0);
 const keyboardInset = ref(0);
+const composerHeight = ref(0);
+const statusHeight = ref(0);
 const isPinnedToBottom = ref(true);
-const shouldAutoStickToBottom = ref(true);
 const lightboxImage = ref(null);
 const lightboxScale = ref(1);
 const lightboxTranslateX = ref(0);
@@ -66,13 +69,14 @@ const lightboxGesture = {
 };
 let scrollAnimationFrame = 0;
 let initialScrollTimer = 0;
-let autoScrollFrame = 0;
-let streamResizeObserver = null;
-let streamMutationObserver = null;
+let layoutResizeObserver = null;
 
 const chatShellStyle = computed(() => ({
   "--chat-vh": viewportHeight.value ? `${viewportHeight.value}px` : undefined,
   "--chat-keyboard-inset": `${keyboardInset.value}px`
+}));
+const messageStreamStyle = computed(() => ({
+  "--chat-bottom-space": `${Math.max(56, composerHeight.value + statusHeight.value + 24)}px`
 }));
 const lightboxImageStyle = computed(() => ({
   transform: `translate3d(${lightboxTranslateX.value}px, ${lightboxTranslateY.value}px, 0) scale(${lightboxScale.value})`
@@ -347,9 +351,16 @@ function isNearBottom(element, threshold = BOTTOM_THRESHOLD) {
 function resizeComposer(target, { keepBottom = false } = {}) {
   const wasNearBottom = keepBottom && isNearBottom(messageListEl.value);
   composerRef.value?.resizeComposer?.();
+  syncBottomLayoutMetrics();
   if (wasNearBottom) {
     scrollToBottom(true);
   }
+}
+
+function syncBottomLayoutMetrics() {
+  const composerElement = composerHostEl.value || composerRef.value?.$el || null;
+  composerHeight.value = composerElement ? Math.ceil(composerElement.getBoundingClientRect().height) : 0;
+  statusHeight.value = statusEl.value ? Math.ceil(statusEl.value.getBoundingClientRect().height) : 0;
 }
 
 function scrollToBottom(force = false) {
@@ -358,25 +369,17 @@ function scrollToBottom(force = false) {
     if (!el) {
       return;
     }
-    if (!force && !shouldAutoStickToBottom.value && !isPinnedToBottom.value) {
+    if (!force && !isPinnedToBottom.value) {
       return;
     }
 
     const applyScroll = () => {
-      autoScrollFrame = 2;
       el.scrollTop = el.scrollHeight;
       messageBottomEl.value?.scrollIntoView({ block: "end" });
       isPinnedToBottom.value = true;
-      shouldAutoStickToBottom.value = true;
     };
 
-    applyScroll();
-    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-      window.cancelAnimationFrame?.(scrollAnimationFrame);
-      scrollAnimationFrame = window.requestAnimationFrame(() => {
-        scrollAnimationFrame = window.requestAnimationFrame(applyScroll);
-      });
-    }
+    setTimeout(applyScroll, 1000)
   });
 }
 
@@ -385,30 +388,19 @@ function settleScrollToBottom(force = false) {
 }
 
 function settleInitialScrollToBottom() {
-  settleScrollToBottom(true);
   if (typeof window === "undefined") {
+    settleScrollToBottom(true);
     return;
   }
   window.clearTimeout?.(initialScrollTimer);
   initialScrollTimer = window.setTimeout(() => {
-    shouldAutoStickToBottom.value = true;
     settleScrollToBottom(true);
-  }, 260);
+  }, 1000);
 }
 
 function handleStreamScroll(event) {
   const nearBottom = isNearBottom(event.target);
-  if (nearBottom) {
-    isPinnedToBottom.value = true;
-    shouldAutoStickToBottom.value = true;
-    return;
-  }
-  if (autoScrollFrame > 0) {
-    autoScrollFrame -= 1;
-    return;
-  }
-  isPinnedToBottom.value = false;
-  shouldAutoStickToBottom.value = false;
+  isPinnedToBottom.value = nearBottom;
 }
 
 function openLightboxImage(url, alt = "image") {
@@ -539,15 +531,12 @@ function syncViewportMetrics() {
 
 function handleViewportChange() {
   syncViewportMetrics();
-  resizeComposer(composerRef.value, { keepBottom: true });
-  if (isPinnedToBottom.value) {
-    scrollToBottom(true);
-  }
+  resizeComposer(composerRef.value, { keepBottom: false });
 }
 
 function handleWindowResize() {
   syncViewportMetrics();
-  resizeComposer(composerRef.value, { keepBottom: true });
+  resizeComposer(composerRef.value, { keepBottom: false });
 }
 
 function handleWindowKeydown(event) {
@@ -556,38 +545,20 @@ function handleWindowKeydown(event) {
   }
 }
 
-function observeMessageContentSize() {
-  const messageList = messageListEl.value;
-  if (!messageList) {
+function observeBottomLayout() {
+  layoutResizeObserver?.disconnect();
+  if (typeof ResizeObserver === "undefined") {
     return;
   }
-
-  const keepBottomOnContentChange = () => {
-    if (shouldAutoStickToBottom.value || isPinnedToBottom.value || isNearBottom(messageList, BOTTOM_THRESHOLD * 3)) {
-      settleScrollToBottom(true);
-    }
-  };
-
-  if (typeof ResizeObserver !== "undefined") {
-    streamResizeObserver?.disconnect();
-    streamResizeObserver = new ResizeObserver(keepBottomOnContentChange);
-    streamResizeObserver.observe(messageList);
-    for (const child of messageList.children) {
-      streamResizeObserver.observe(child);
-    }
+  layoutResizeObserver = new ResizeObserver(() => {
+    syncBottomLayoutMetrics();
+  });
+  const composerElement = composerHostEl.value || composerRef.value?.$el || null;
+  if (composerElement) {
+    layoutResizeObserver.observe(composerElement);
   }
-
-  if (typeof MutationObserver !== "undefined") {
-    streamMutationObserver?.disconnect();
-    streamMutationObserver = new MutationObserver(() => {
-      observeMessageContentSize();
-      keepBottomOnContentChange();
-    });
-    streamMutationObserver.observe(messageList, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
+  if (statusEl.value) {
+    layoutResizeObserver.observe(statusEl.value);
   }
 }
 
@@ -600,8 +571,7 @@ watch(
     if (!hasThreadSnapshot.value) {
       return;
     }
-    observeMessageContentSize();
-    scrollToBottom(false);
+    settleInitialScrollToBottom();
   },
   { flush: "post" }
 );
@@ -610,10 +580,9 @@ watch(
   () => `${props.sessionKey}::${props.openToken}`,
   () => {
     isPinnedToBottom.value = true;
-    shouldAutoStickToBottom.value = true;
-    observeMessageContentSize();
     nextTick(() => {
-      resizeComposer(composerRef.value, { keepBottom: true });
+      resizeComposer(composerRef.value, { keepBottom: false });
+      observeBottomLayout();
       settleInitialScrollToBottom();
     });
   },
@@ -636,10 +605,11 @@ onMounted(() => {
     window.visualViewport?.addEventListener("scroll", handleViewportChange, { passive: true });
   }
   syncViewportMetrics();
-  observeMessageContentSize();
+  syncBottomLayoutMetrics();
   nextTick(() => {
-    resizeComposer(composerRef.value, { keepBottom: true });
-    settleScrollToBottom(true);
+    resizeComposer(composerRef.value, { keepBottom: false });
+    observeBottomLayout();
+    settleInitialScrollToBottom();
   });
 });
 
@@ -651,10 +621,8 @@ onBeforeUnmount(() => {
     window.visualViewport?.removeEventListener("scroll", handleViewportChange);
     window.cancelAnimationFrame?.(scrollAnimationFrame);
     window.clearTimeout?.(initialScrollTimer);
-    autoScrollFrame = 0;
   }
-  streamResizeObserver?.disconnect();
-  streamMutationObserver?.disconnect();
+  layoutResizeObserver?.disconnect();
 });
 </script>
 
@@ -671,7 +639,7 @@ onBeforeUnmount(() => {
     </header>
 
     <main class="chat-screen">
-      <section ref="messageListEl" class="message-stream" @scroll="handleStreamScroll">
+      <section ref="messageListEl" class="message-stream" :style="messageStreamStyle" @scroll="handleStreamScroll">
         <ThreadTurnTimeline
           :snapshot="threadSnapshot"
           :live-overlay="liveOverlay"
@@ -682,29 +650,31 @@ onBeforeUnmount(() => {
         <span ref="messageBottomEl" class="message-bottom-anchor" aria-hidden="true"></span>
       </section>
 
-      <p v-if="statusText" class="chat-status">{{ statusText }}</p>
+      <p v-if="statusText" ref="statusEl" class="chat-status">{{ statusText }}</p>
 
-      <ChatComposer
-        ref="composerRef"
-        :draft="draft"
-        :composer-options="composerOptions"
-        :models="models"
-        :git-state="gitState"
-        :provider-id="providerId"
-        :can-send="canSend"
-        :can-interrupt="canInterrupt"
-        :loading="loading"
-        @update:draft="emit('update:draft', $event)"
-        @submit="emit('submit')"
-        @interrupt="emit('interrupt')"
-        @status="emit('status', $event)"
-        @update:composer-options="emit('update:composer-options', $event)"
-        @add-attachments="emit('add-attachments', $event)"
-        @remove-attachment="emit('remove-attachment', $event)"
-        @retry-attachment="emit('retry-attachment', $event)"
-        @switch-git-branch="emit('switch-git-branch', $event)"
-        @create-git-branch="emit('create-git-branch', $event)"
-      />
+      <div ref="composerHostEl" class="chat-composer-host">
+        <ChatComposer
+          ref="composerRef"
+          :draft="draft"
+          :composer-options="composerOptions"
+          :models="models"
+          :git-state="gitState"
+          :provider-id="providerId"
+          :can-send="canSend"
+          :can-interrupt="canInterrupt"
+          :loading="loading"
+          @update:draft="emit('update:draft', $event)"
+          @submit="emit('submit')"
+          @interrupt="emit('interrupt')"
+          @status="emit('status', $event)"
+          @update:composer-options="emit('update:composer-options', $event)"
+          @add-attachments="emit('add-attachments', $event)"
+          @remove-attachment="emit('remove-attachment', $event)"
+          @retry-attachment="emit('retry-attachment', $event)"
+          @switch-git-branch="emit('switch-git-branch', $event)"
+          @create-git-branch="emit('create-git-branch', $event)"
+        />
+      </div>
     </main>
 
     <div
@@ -829,11 +799,16 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 18px 14px calc(40px + env(safe-area-inset-bottom));
+  padding: 18px 14px var(--chat-bottom-space, calc(40px + env(safe-area-inset-bottom)));
+  padding-bottom: 0;
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+.chat-composer-host {
+  flex: 0 0 auto;
 }
 
 .message-bottom-anchor {
