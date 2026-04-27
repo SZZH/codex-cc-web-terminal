@@ -24,12 +24,12 @@ const viewModel = computed(() =>
   <div class="thread-turn-timeline">
     <ThreadTurnCard
       v-for="turn in viewModel.turns"
-        :key="turn.id"
-        :turn="turn"
-        :assistant-name="assistantName"
-        :workspace-cwd="workspaceCwd"
-        :show-workspace-changes="turn.id === viewModel.lastDisplayTurnId"
-        @status="emit('status', $event)"
-      />
+      :key="turn.id"
+      :turn="turn"
+      :assistant-name="assistantName"
+      :workspace-cwd="workspaceCwd"
+      :show-workspace-changes="turn.id === viewModel.latestFileChangeTurnId"
+      @status="emit('status', $event)"
+    />
   </div>
 </template>

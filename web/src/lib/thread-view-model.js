@@ -111,6 +111,9 @@ export function segmentTurnItems(items = [], turn = {}, options = {}) {
 export function buildTurnViewModel(turn = {}, options = {}) {
   const items = appendLiveOverlay(asArray(turn?.items), turn, options.liveOverlay);
   const segments = segmentTurnItems(items, turn, options);
+  const hasFileChange = segments.some((segment) =>
+    segment.items.some((item) => String(item?.kind || "").trim().toLowerCase() === "filechange")
+  );
   return {
     id: String(turn?.id || ""),
     status: String(turn?.status || "inProgress"),
@@ -120,21 +123,22 @@ export function buildTurnViewModel(turn = {}, options = {}) {
     error: turn?.error || null,
     segments,
     hasPrimary: segments.some((segment) => segment.kind === "primary"),
-    hasProcess: segments.some((segment) => segment.kind === "process")
+    hasProcess: segments.some((segment) => segment.kind === "process"),
+    hasFileChange
   };
 }
 
 export function buildThreadViewModel(snapshot = {}, options = {}) {
   const turns = asArray(snapshot?.turns).map((turn) => buildTurnViewModel(turn, options));
-  const lastDisplayTurn = [...turns]
+  const latestFileChangeTurn = [...turns]
     .reverse()
-    .find((turn) => turn.segments.some((segment) => segment.kind === "primary" || segment.kind === "process"));
+    .find((turn) => turn.hasFileChange);
   return {
     threadId: String(firstDefined(snapshot?.threadId, "")),
     version: Number(snapshot?.version || 0),
     updatedAt: firstDefined(snapshot?.updatedAt, ""),
     turns,
-    lastDisplayTurnId: String(lastDisplayTurn?.id || ""),
+    latestFileChangeTurnId: String(latestFileChangeTurn?.id || ""),
     isEmpty: turns.length === 0
   };
 }

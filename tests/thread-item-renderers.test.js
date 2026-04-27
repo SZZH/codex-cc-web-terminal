@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { normalizeImageUrl } from "../web/src/lib/image-url.js";
 import { normalizeThreadItem, summarizeProcessItems } from "../web/src/lib/thread-item-renderers.js";
+import { buildThreadViewModel } from "../web/src/lib/thread-view-model.js";
 
 test("thread item renderer normalizes process items with explicit type title and status label", () => {
   const item = normalizeThreadItem({
@@ -104,4 +105,28 @@ test("thread item renderer summarizes process counts by type", () => {
   assert.match(summary.label, /思考 1/);
   assert.match(summary.label, /命令 2/);
   assert.match(summary.label, /工具 1/);
+});
+
+test("thread view model keeps workspace changes anchored to the file-change turn", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-change",
+        items: [
+          { id: "msg-1", kind: "AgentMessage", text: "已完成修改" },
+          { id: "patch-1", kind: "FileChange", status: "completed", summary: "apply_patch" }
+        ]
+      },
+      {
+        id: "turn-chat",
+        items: [
+          { id: "msg-2", kind: "AgentMessage", text: "后续普通问答" }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(viewModel.latestFileChangeTurnId, "turn-change");
+  assert.equal(viewModel.turns.find((turn) => turn.id === "turn-change")?.hasFileChange, true);
+  assert.equal(viewModel.turns.find((turn) => turn.id === "turn-chat")?.hasFileChange, false);
 });
