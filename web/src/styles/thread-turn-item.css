@@ -302,7 +302,26 @@
   display: inline-grid;
   place-items: center;
   color: #6f767d;
+  background: transparent;
+  border: 0;
   border-radius: 8px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.workspace-change-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.16s ease;
+}
+
+.workspace-change-icon.expanded svg {
+  transform: rotate(180deg);
 }
 
 .workspace-change-icon:hover {

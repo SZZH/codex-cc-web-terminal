@@ -143,16 +143,16 @@ onMounted(() => loadChanges());
         </button>
         <span class="workspace-change-spacer"></span>
         <button
-          v-if="interactive"
           class="workspace-change-icon"
+          :class="{ expanded: isExpanded(file) }"
           type="button"
-          title="撤销这个文件"
-          :disabled="reverting"
-          @click.stop="revertFiles([file.path])"
+          :aria-label="isExpanded(file) ? '折叠文件变更' : '展开文件变更'"
+          @click="toggleFile(file)"
         >
-          ↶
+          <svg viewBox="0 0 24 24" focusable="false">
+            <path d="M6 9l6 6 6-6" />
+          </svg>
         </button>
-        <span class="workspace-change-icon" aria-hidden="true">{{ isExpanded(file) ? "⌃" : "⌄" }}</span>
       </div>
 
       <div v-if="isExpanded(file)" class="workspace-change-diff">
