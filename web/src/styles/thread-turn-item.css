@@ -63,14 +63,31 @@
 
 .turn-process-toggle-icon {
   flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
   color: var(--process-shell-icon);
-  font-size: 13px;
-  transform: rotate(-90deg);
-  transition: transform 160ms ease;
+  border-radius: 8px;
 }
 
-.turn-process-toggle-icon.expanded {
-  transform: rotate(0deg);
+.turn-process-toggle-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.16s ease;
+}
+
+.turn-process-toggle-icon.expanded svg {
+  transform: rotate(180deg);
+}
+
+.turn-process-toggle:hover .turn-process-toggle-icon {
+  background: rgba(220, 218, 215, 0.62);
 }
 
 .turn-process-items,

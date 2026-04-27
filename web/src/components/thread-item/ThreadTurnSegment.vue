@@ -27,7 +27,11 @@ watch(
         @click="collapsed = !collapsed"
       >
         <span>{{ segment.processSummary?.label || `执行过程 ${segment.items.length} 项` }}</span>
-        <span class="turn-process-toggle-icon" :class="{ expanded: !collapsed }">›</span>
+        <span class="turn-process-toggle-icon" :class="{ expanded: !collapsed }" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false">
+            <path d="M6 9l6 6 6-6" />
+          </svg>
+        </span>
       </button>
 
       <div v-if="!collapsed" class="turn-process-items">
