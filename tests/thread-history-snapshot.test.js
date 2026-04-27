@@ -124,6 +124,41 @@ test("thread history snapshot preserves assistant output images from response_it
   assert.equal(assistantText.text, "图已经生成好了");
 });
 
+test("thread history snapshot strips codex git directives from assistant final output", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-thread-history-directive-"));
+  const filePath = path.join(tempDir, "session.jsonl");
+  fs.writeFileSync(
+    filePath,
+    `${JSON.stringify({
+      timestamp: "2026-04-27T00:00:00.000Z",
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        message: "按功能分别提交代码"
+      }
+    })}\n${JSON.stringify({
+      timestamp: "2026-04-27T00:00:02.000Z",
+      type: "event_msg",
+      payload: {
+        type: "agent_message",
+        phase: "final_answer",
+        message: "已经按功能分别提交好了。\n\n::git-commit{cwd=\"/workspace/codex-cc-web-terminal\"}"
+      }
+    })}\n`,
+    "utf8"
+  );
+
+  const snapshot = buildThreadSnapshotFromFile(filePath, {
+    threadId: "thread-directive-1",
+    metadata: {}
+  });
+
+  assert.ok(snapshot);
+  const assistantText = snapshot.turns[0].items.find((item) => item.kind === "AgentMessage");
+  assert.ok(assistantText);
+  assert.equal(assistantText.text, "已经按功能分别提交好了。");
+});
+
 test("thread history snapshot materializes images from image_generation_end events", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-thread-history-imagegen-"));
   const filePath = path.join(tempDir, "session.jsonl");

@@ -30,6 +30,10 @@ const HISTORICAL_META_LINE_PATTERNS = [
   /^(完成后请返回|请返回|修改文件列表|优化摘要|风险说明|风险\/后续建议|风险\/后续建议（若有）|兼容性注意事项|视觉优化要点|关键 tokens 清单|自检点|潜在冲突点|可能冲突点|你做了哪些视觉提升|必须遵守|严格写入边界)[:：]?/i
 ];
 
+function isCodexDirectiveLine(value) {
+  return /^::[a-z0-9-]+\{[\s\S]*\}$/i.test(String(value || "").trim());
+}
+
 function isHistoricalMetaLine(value) {
   const line = sanitizeTitleFragment(value);
   if (!line) {
@@ -157,6 +161,7 @@ function historicalMeaningfulLines(value) {
     .map((line) => sanitizeHistoricalLine(line))
     .filter(Boolean)
     .filter((line) => !isBoilerplateUserText(line))
+    .filter((line) => !isCodexDirectiveLine(line))
     .filter((line) => !isHistoricalMetaLine(line))
     .filter((line) => !line.startsWith("<") && !line.startsWith("["));
 }
@@ -230,6 +235,7 @@ export function cleanHistoricalMessageText(value) {
     .map((line) => sanitizeHistoricalLine(line))
     .filter(Boolean)
     .filter((line) => !isBoilerplateUserText(line))
+    .filter((line) => !isCodexDirectiveLine(line))
     .filter((line) => !isHistoricalMetaLine(line))
     .filter((line) => !/^<.*>$/.test(line))
     .filter((line) => !/^\[.*\]$/.test(line));

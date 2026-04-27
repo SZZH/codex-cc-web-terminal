@@ -19,13 +19,30 @@ function asArray(value) {
   return Array.isArray(value) ? value : value == null ? [] : [value];
 }
 
+function sanitizeAssistantOutputText(value) {
+  const lines = String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .filter((line) => !/^::[a-z0-9-]+\{[\s\S]*\}$/i.test(String(line || "").trim()));
+  return lines.join("\n").trim();
+}
+
 function firstTextContent(content = []) {
   for (const part of asArray(content)) {
     if (part?.type === "output_text" || part?.type === "input_text") {
-      return part.text ?? "";
+      const text = sanitizeAssistantOutputText(part.text ?? "");
+      if (text) {
+        return text;
+      }
+      continue;
     }
     if (part?.type === "text") {
-      return part.text ?? "";
+      const text = sanitizeAssistantOutputText(part.text ?? "");
+      if (text) {
+        return text;
+      }
+      continue;
     }
   }
   return "";
@@ -46,7 +63,7 @@ function extractRenderableAssistantParts(content = []) {
       continue;
     }
     if (type === "outputtext" || type === "inputtext" || type === "text") {
-      const text = String(part.text ?? part.value ?? "").trim();
+      const text = sanitizeAssistantOutputText(part.text ?? part.value ?? "");
       if (!text) {
         continue;
       }
@@ -431,8 +448,11 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
 
     if (subtype === "agent_message") {
       const phase = payload.phase ?? "commentary";
-      const text = payload.text ?? payload.message ?? "";
+      const text = sanitizeAssistantOutputText(payload.text ?? payload.message ?? "");
       if (phase === "final_answer") {
+        if (!text) {
+          return [];
+        }
         return [
           makeEvent(record, state, {
             eventType: "agent_message_recorded",
@@ -664,6 +684,10 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
     const partType = String(part.type || "").toLowerCase();
 
     if (role === "assistant" && partType === "text" && text) {
+      const sanitizedText = sanitizeAssistantOutputText(text);
+      if (!sanitizedText) {
+        return [];
+      }
       return [
         createCanonicalEvent({
           threadId: record.threadId,
@@ -673,7 +697,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
           eventTs: record.recordTs,
           sourceRecordId: record.id,
           payload: {
-            text,
+            text: sanitizedText,
             source: phase === "streaming" ? "primary_output_text" : "primary_output_text",
             phase
           }
@@ -734,6 +758,10 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
     }
 
     if ((itemType === "agentmessage" || itemType === "message") && text) {
+      const sanitizedText = sanitizeAssistantOutputText(text);
+      if (!sanitizedText) {
+        return [];
+      }
       return [
         createCanonicalEvent({
           threadId: record.threadId,
@@ -742,7 +770,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
           eventType: "agent_message_recorded",
           eventTs: record.recordTs,
           sourceRecordId: record.id,
-          payload: { text, source: "primary_output_text", phase: item.phase ?? null }
+          payload: { text: sanitizedText, source: "primary_output_text", phase: item.phase ?? null }
         })
       ];
     }
