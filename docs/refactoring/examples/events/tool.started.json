@@ -1,0 +1,17 @@
+{
+  "id": "evt-thread-refactor-001-0002",
+  "seq": 2,
+  "provider": "codex",
+  "providerThreadId": "provider-thread-refactor-001",
+  "providerTurnId": "provider-turn-refactor-001",
+  "threadId": "thread-refactor-001",
+  "turnId": "turn-refactor-001",
+  "ts": "2026-04-22T10:00:01.000Z",
+  "kind": "tool.started",
+  "payload": {
+    "callId": "call-refactor-001",
+    "toolName": "rg",
+    "category": "command",
+    "inputSummary": "搜索 refactoring 文档里的 canonical schema 关键字段"
+  }
+}

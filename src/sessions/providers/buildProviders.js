@@ -114,6 +114,7 @@ export function buildProviders(config) {
       historyLabel: "Saved Codex sessions",
       fallbackPrefix: "codex",
       sessionsDir: config.codexSessionsDir,
+      historyDir: config.codexArchivedSessionsDir || config.codexSessionsDir,
       bootstrapNames: codexBootstrapNames,
       defaultModel: config.codexModel,
       models: codexModelOptions,

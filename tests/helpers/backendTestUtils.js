@@ -10,10 +10,12 @@ export function createTempDir(prefix = "codex-cc-web-terminal-test-") {
 export function createBaseConfig(rootDir, overrides = {}) {
   const dataDir = overrides.dataDir || path.join(rootDir, "data");
   const codexSessionsDir = overrides.codexSessionsDir || path.join(rootDir, ".codex", "sessions");
+  const codexArchivedSessionsDir = overrides.codexArchivedSessionsDir || codexSessionsDir;
   const ccSessionsDir = overrides.ccSessionsDir || path.join(rootDir, ".claude", "projects");
 
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(codexSessionsDir, { recursive: true });
+  mkdirSync(codexArchivedSessionsDir, { recursive: true });
   mkdirSync(ccSessionsDir, { recursive: true });
 
   return {
@@ -56,6 +58,8 @@ export function createBaseConfig(rootDir, overrides = {}) {
     maxQueuedInputs: 200,
     dataDir,
     codexSessionsDir,
+    codexArchivedSessionsDir,
+    codexSessionIndexPath: overrides.codexSessionIndexPath || path.join(rootDir, ".codex", "session_index.jsonl"),
     ccSessionsDir,
     timezone: "UTC",
     ...overrides

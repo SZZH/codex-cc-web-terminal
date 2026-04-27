@@ -1,0 +1,72 @@
+{
+  "authoritativeSnapshot": {
+    "threadId": "thread-refactor-001",
+    "version": 3,
+    "updatedAt": "2026-04-22T10:00:04.500Z",
+    "activeTurnId": "turn-refactor-001",
+    "metadata": {
+      "title": "Refactoring contract walkthrough",
+      "cwd": "/workspace/codex-cc-web-terminal",
+      "providerSet": [
+        "codex"
+      ],
+      "tags": [
+        "refactoring",
+        "contract-test"
+      ]
+    },
+    "turns": [
+      {
+        "id": "turn-refactor-001",
+        "status": "running",
+        "startedAt": "2026-04-22T10:00:00.000Z",
+        "items": [
+          {
+            "kind": "UserMessage",
+            "id": "item-user-refactor-001",
+            "text": "请给我最小但有代表性的 canonical JSON 样本。",
+            "createdAt": "2026-04-22T10:00:00.000Z"
+          }
+        ]
+      }
+    ],
+    "backgroundAgents": []
+  },
+  "liveTurnOverlay": {
+    "threadId": "thread-refactor-001",
+    "turnId": "turn-refactor-001",
+    "status": "running",
+    "message": {
+      "text": "我先给你整理一组最小但完整的契约样本，",
+      "seq": 1
+    },
+    "tools": [
+      {
+        "kind": "ToolCall",
+        "id": "item-tool-call-refactor-001",
+        "callId": "call-refactor-001",
+        "toolName": "rg",
+        "status": "completed",
+        "summary": "命中 canonical-event-schema、thread-snapshot-schema、contract-testing-strategy",
+        "createdAt": "2026-04-22T10:00:01.000Z",
+        "updatedAt": "2026-04-22T10:00:02.000Z"
+      }
+    ],
+    "artifacts": [
+      {
+        "kind": "Artifact",
+        "id": "item-artifact-refactor-001",
+        "artifactKind": "file",
+        "label": "canonical-samples-manifest.json",
+        "url": "file:///artifacts/canonical-samples-manifest.json",
+        "metadata": {
+          "contentType": "application/json",
+          "bytes": 812,
+          "source": "docs/refactoring/examples"
+        },
+        "createdAt": "2026-04-22T10:00:03.000Z",
+        "updatedAt": "2026-04-22T10:00:03.000Z"
+      }
+    ]
+  }
+}

@@ -120,6 +120,8 @@ export const config = {
   maxQueuedInputs: intEnv("MAX_QUEUED_INPUTS", 200),
   dataDir: path.join(root, "data"),
   codexSessionsDir: env("CODEX_SESSIONS_DIR", path.join(home, ".codex", "sessions")),
+  codexArchivedSessionsDir: env("CODEX_ARCHIVED_SESSIONS_DIR", path.join(home, ".codex", "archived_sessions")),
+  codexSessionIndexPath: env("CODEX_SESSION_INDEX_PATH", path.join(home, ".codex", "session_index.jsonl")),
   ccSessionsDir: env("CC_SESSIONS_DIR", path.join(home, ".claude", "projects")),
   timezone: env("DISPLAY_TIMEZONE", "UTC")
 };

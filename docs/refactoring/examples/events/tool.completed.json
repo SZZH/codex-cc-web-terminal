@@ -1,0 +1,17 @@
+{
+  "id": "evt-thread-refactor-001-0003",
+  "seq": 3,
+  "provider": "codex",
+  "providerThreadId": "provider-thread-refactor-001",
+  "providerTurnId": "provider-turn-refactor-001",
+  "threadId": "thread-refactor-001",
+  "turnId": "turn-refactor-001",
+  "ts": "2026-04-22T10:00:02.000Z",
+  "kind": "tool.completed",
+  "payload": {
+    "callId": "call-refactor-001",
+    "toolName": "rg",
+    "status": "completed",
+    "outputSummary": "命中 canonical-event-schema、thread-snapshot-schema、contract-testing-strategy"
+  }
+}

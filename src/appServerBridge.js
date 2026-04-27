@@ -22,6 +22,16 @@ export class AppServerBridge extends EventEmitter {
     this.shuttingDown = false;
   }
 
+  isProcessAlive() {
+    return Boolean(this.proc && this.proc.exitCode == null && !this.proc.killed);
+  }
+
+  resetConnectionState() {
+    this.connected = false;
+    this.initialized = false;
+    this.ws = null;
+  }
+
   async ensureReady() {
     if (!this.config.codexAppServerEnabled) {
       throw new Error("codex app-server is disabled");
@@ -41,25 +51,39 @@ export class AppServerBridge extends EventEmitter {
   }
 
   async connectInternal() {
-    await this.startProcess();
-    await this.openWebSocket();
-    await this.request("initialize", {
-      clientInfo: {
-        name: "codex-cc-web-terminal",
-        title: "Codex CC Web Terminal",
-        version: "0.1.0"
-      },
-      capabilities: {
-        experimentalApi: true
+    const maxAttempts = 3;
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.startProcess();
+        await this.openWebSocket();
+        await this.request("initialize", {
+          clientInfo: {
+            name: "codex-cc-web-terminal",
+            title: "Codex CC Web Terminal",
+            version: "0.1.0"
+          },
+          capabilities: {
+            experimentalApi: true
+          }
+        });
+        this.initialized = true;
+        return;
+      } catch (error) {
+        lastError = error;
+        this.emit("log", `bridge connect attempt ${attempt} failed: ${error?.message || String(error)}`);
+        await this.forceRestartProcess();
+        await wait(500 * attempt);
       }
-    });
-    this.initialized = true;
+    }
+    throw lastError || new Error("app-server connect failed");
   }
 
   async startProcess() {
-    if (this.proc && !this.proc.killed) {
+    if (this.isProcessAlive()) {
       return;
     }
+    this.proc = null;
     const args = ["app-server", "--listen", this.listenUrl];
     this.proc = spawn(this.config.codexBin, args, {
       cwd: this.config.root,
@@ -73,34 +97,65 @@ export class AppServerBridge extends EventEmitter {
       }
     });
     this.proc.on("exit", () => {
-      this.connected = false;
-      this.initialized = false;
-      this.ws = null;
+      this.resetConnectionState();
     });
-    await wait(350);
+    await wait(1_200);
   }
 
   async openWebSocket() {
-    const url = this.listenUrl;
-    this.ws = new WebSocket(url);
     const connectTimeoutMs = Math.max(1_000, Number(this.config.codexAppServerConnectTimeoutMs) || 5_000);
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("app-server websocket connect timeout")), connectTimeoutMs);
-      this.ws.once("open", () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      this.ws.once("error", (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-    });
-    this.connected = true;
-    this.ws.on("message", (raw) => this.handleMessage(raw));
-    this.ws.on("close", () => {
-      this.connected = false;
-      this.initialized = false;
-    });
+    const deadline = Date.now() + connectTimeoutMs;
+    let lastError = null;
+    while (Date.now() < deadline) {
+      const url = this.listenUrl;
+      const socket = new WebSocket(url);
+      try {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("app-server websocket connect timeout")), 1_000);
+          socket.once("open", () => {
+            clearTimeout(timer);
+            resolve();
+          });
+          socket.once("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        });
+        this.ws = socket;
+        this.connected = true;
+        this.ws.on("message", (raw) => this.handleMessage(raw));
+        this.ws.on("close", () => {
+          this.resetConnectionState();
+        });
+        return;
+      } catch (error) {
+        lastError = error;
+        try {
+          socket.close();
+        } catch {
+          // no-op
+        }
+        await wait(250);
+      }
+    }
+    throw lastError || new Error("app-server websocket connect timeout");
+  }
+
+  async forceRestartProcess() {
+    try {
+      this.ws?.close();
+    } catch {
+      // no-op
+    }
+    try {
+      if (this.isProcessAlive()) {
+        this.proc.kill("SIGTERM");
+      }
+    } catch {
+      // no-op
+    }
+    this.proc = null;
+    this.resetConnectionState();
   }
 
   handleMessage(raw) {
@@ -254,17 +309,6 @@ export class AppServerBridge extends EventEmitter {
 
   async shutdown() {
     this.shuttingDown = true;
-    try {
-      this.ws?.close();
-    } catch {
-      // no-op
-    }
-    try {
-      this.proc?.kill("SIGTERM");
-    } catch {
-      // no-op
-    }
-    this.connected = false;
-    this.initialized = false;
+    await this.forceRestartProcess();
   }
 }

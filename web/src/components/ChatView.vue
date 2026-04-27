@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js";
+import ThreadTurnTimeline from "./thread-item/ThreadTurnTimeline.vue";
 
 const BOTTOM_THRESHOLD = 84;
 const MAX_COMPOSER_HEIGHT = 160;
@@ -16,7 +17,9 @@ const props = defineProps({
   threadMismatch: { type: Boolean, default: false },
   workspaceName: { type: String, default: "" },
   assistantName: { type: String, default: "Codex" },
-  messages: { type: Array, default: () => [] },
+  threadSnapshot: { type: Object, default: null },
+  liveOverlay: { type: Object, default: null },
+  workspaceCwd: { type: String, default: "" },
   draft: { type: String, default: "" },
   canSend: Boolean,
   canInterrupt: Boolean,
@@ -24,15 +27,15 @@ const props = defineProps({
   statusText: { type: String, default: "" }
 });
 
-const emit = defineEmits(["back", "update:draft", "submit", "interrupt"]);
+const emit = defineEmits(["back", "update:draft", "submit", "interrupt", "status"]);
 const messageListEl = ref(null);
+const messageBottomEl = ref(null);
 const composerEl = ref(null);
 const viewportHeight = ref(0);
 const keyboardInset = ref(0);
 const isPinnedToBottom = ref(true);
+const shouldAutoStickToBottom = ref(true);
 const isTouchDevice = ref(false);
-const showProcessDetails = ref(false);
-const expandedEventGroups = ref(new Set());
 const lightboxImage = ref(null);
 const lightboxScale = ref(1);
 const lightboxTranslateX = ref(0);
@@ -48,6 +51,11 @@ const lightboxGesture = {
   startMidpointX: 0,
   startMidpointY: 0
 };
+let scrollAnimationFrame = 0;
+let initialScrollTimer = 0;
+let autoScrollFrame = 0;
+let streamResizeObserver = null;
+let streamMutationObserver = null;
 
 const chatShellStyle = computed(() => ({
   "--chat-vh": viewportHeight.value ? `${viewportHeight.value}px` : undefined,
@@ -55,7 +63,9 @@ const chatShellStyle = computed(() => ({
 }));
 const isRunning = computed(() => Boolean(props.canInterrupt));
 const primaryActionLabel = computed(() => (isRunning.value ? "中断" : "发送"));
-const canPrimaryAction = computed(() => (isRunning.value ? !props.loading : props.canSend && !props.loading));
+const canPrimaryAction = computed(() => {
+  return isRunning.value ? !props.loading : props.canSend && !props.loading;
+});
 const lightboxImageStyle = computed(() => ({
   transform: `translate3d(${lightboxTranslateX.value}px, ${lightboxTranslateY.value}px, 0) scale(${lightboxScale.value})`
 }));
@@ -170,7 +180,7 @@ function renderCodeFence(sourceText, languageTag) {
   return [
     `<pre class="code-block language-${resolvedLanguage} family-${family}">`,
     `<span class="code-lang">${languageLabel}</span>`,
-    `<code class="hljs language-${resolvedLanguage}">${highlighted}</code>`,
+    `<span class="code-scroll"><code class="hljs language-${resolvedLanguage}">${highlighted}</code></span>`,
     "</pre>"
   ].join("");
 }
@@ -192,25 +202,6 @@ function isProcessLine(line) {
     return true;
   }
   return PROCESS_PATTERNS.some((pattern) => pattern.test(compact));
-}
-
-function splitMessageParts(message) {
-  const text = String(message?.text || "").trim();
-  if (!text || message?.role === "user") {
-    return { primary: text, process: "" };
-  }
-
-  const lines = text
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .filter((line) => String(line || "").trim().length > 0);
-
-  const processLines = lines.filter((line) => isProcessLine(line));
-  return {
-    // Keep full assistant text visible by default to avoid hiding real content.
-    primary: lines.join("\n").trim(),
-    process: processLines.join("\n").trim()
-  };
 }
 
 const md = new MarkdownIt({
@@ -336,223 +327,9 @@ function compactText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
-function mapEventTypeToZh(rawType, fallbackLabel = "事件") {
-  const key = String(rawType || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_/-]/g, "");
-  if (!key) {
-    return fallbackLabel;
-  }
-  if (key.includes("commandexecution")) {
-    return "命令执行";
-  }
-  if (key.includes("filechange")) {
-    return "文件变更";
-  }
-  if (key.includes("reasoning")) {
-    return "思考过程";
-  }
-  if (key.includes("agentmessage")) {
-    return "执行进度";
-  }
-  if (key.includes("subagent") || key.includes("collab")) {
-    return "子任务";
-  }
-  if (key.includes("reference") || key.includes("citation")) {
-    return "引用信息";
-  }
-  if (key.includes("toolcall") || key.includes("mcptool")) {
-    return "工具调用";
-  }
-  return fallbackLabel;
-}
-
-function mapStatusToZh(value) {
-  const key = String(value || "").trim().toLowerCase();
-  if (!key) {
-    return "";
-  }
-  if (["success", "succeeded", "done", "completed", "ok"].includes(key)) {
-    return "完成";
-  }
-  if (["running", "inprogress", "processing"].includes(key)) {
-    return "执行中";
-  }
-  if (["failed", "error", "aborted", "cancelled", "canceled"].includes(key)) {
-    return "失败";
-  }
-  return String(value || "").trim();
-}
-
-function isNoisySummary(value, rawType) {
-  const text = compactText(value).toLowerCase();
-  const type = compactText(rawType).toLowerCase();
-  if (!text) {
-    return true;
-  }
-  if (text === type) {
-    return true;
-  }
-  if (["commentary", "reasoning", "agentmessage", "commandexecution", "event", "tool"].includes(text)) {
-    return true;
-  }
-  return false;
-}
-
-function buildEventDetails(payload, rawType) {
-  const source = payload && typeof payload === "object" ? payload : {};
-  const nested = source.payload && typeof source.payload === "object" ? source.payload : {};
-  const fields = [
-    { label: "命令", value: nested.command || source.command },
-    { label: "工具", value: nested.toolName || nested.tool_name || source.toolName || source.tool_name },
-    { label: "路径", value: nested.path || source.path },
-    { label: "状态", value: mapStatusToZh(nested.status || source.status) }
-  ];
-  const details = fields
-    .map((item) => ({ ...item, value: compactText(item.value) }))
-    .filter((item) => Boolean(item.value));
-  if (details.length) {
-    return details;
-  }
-  const fallback = mapEventTypeToZh(rawType, "");
-  return fallback ? [{ label: "类型", value: fallback }] : [];
-}
-
-function buildEventCompactText(summary, details, fallbackType) {
-  const cleanSummary = compactText(summary);
-  if (cleanSummary) {
-    return cleanSummary;
-  }
-  if (Array.isArray(details) && details.length > 0) {
-    const first = details[0];
-    if (first?.label && first?.value) {
-      return `${first.label}：${first.value}`;
-    }
-  }
-  return fallbackType || "事件";
-}
-
-function formatDurationLabel(ms) {
-  const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes <= 0) {
-    return `${seconds}s`;
-  }
-  return `${minutes}m ${seconds}s`;
-}
-
-const renderedMessages = computed(() =>
-  props.messages.map((message) => {
-    const parts = splitMessageParts(message);
-    const partType = String(message?.partType || "").trim();
-    const payload = message?.payload || {};
-    const imageUrl = String(payload?.url || "").trim();
-    const imageAlt = String(payload?.alt || "").trim() || "image";
-    const structuredPart = new Set(["tool", "subagent", "reference", "event"]);
-    const renderKind = partType === "image" && imageUrl ? "image" : structuredPart.has(partType) ? "event" : "markdown";
-    const eventLabelMap = {
-      tool: "工具调用",
-      subagent: "子任务",
-      reference: "引用",
-      event: "事件"
-    };
-    const eventLabel = eventLabelMap[partType] || "事件";
-    const eventRawType = String(payload?.rawType || message?.rawType || "").trim();
-    const eventTypeText = mapEventTypeToZh(eventRawType, eventLabel);
-    const baseSummary = compactText(payload?.summary || parts.primary || message.text || "");
-    const eventSummary = isNoisySummary(baseSummary, eventRawType) ? "" : baseSummary;
-    const eventDetails = buildEventDetails(payload, eventRawType);
-    const eventCompactText = buildEventCompactText(eventSummary, eventDetails, eventTypeText);
-    return {
-      ...message,
-      renderKind,
-      imageUrl,
-      imageAlt,
-      eventLabel: eventTypeText,
-      eventSummary,
-      eventDetails,
-      eventCompactText,
-      displayText: parts.primary || "",
-      renderedHtml: renderMarkdownToHtml(parts.primary || message.text || ""),
-      fileMentions: message.role === "assistant" && renderKind === "markdown" ? extractFileMentions(message.text) : [],
-      processText: parts.process || "",
-      hasProcessDetails: Boolean(parts.process),
-      processSummary: parts.primary ? "查看过程详情" : "查看运行过程"
-    };
-  })
+const hasThreadSnapshot = computed(
+  () => props.threadSnapshot && Array.isArray(props.threadSnapshot.turns)
 );
-
-const hasAnyProcessDetails = computed(() => renderedMessages.value.some((message) => message.hasProcessDetails));
-const hasAssistantBody = computed(() =>
-  renderedMessages.value.some(
-    (message) => message.role === "assistant" && message.renderKind === "markdown" && compactText(message.displayText)
-  )
-);
-const shouldCollapseCompletedGroups = computed(() => hasAssistantBody.value && !props.canInterrupt && !props.loading);
-function isEventGroupExpanded(toggleId) {
-  return expandedEventGroups.value.has(toggleId);
-}
-
-function toggleEventGroup(toggleId) {
-  const next = new Set(expandedEventGroups.value);
-  if (next.has(toggleId)) {
-    next.delete(toggleId);
-  } else {
-    next.add(toggleId);
-  }
-  expandedEventGroups.value = next;
-}
-
-const visibleMessages = computed(() => {
-  if (!shouldCollapseCompletedGroups.value) {
-    return renderedMessages.value;
-  }
-
-  const output = [];
-  let pendingEventGroup = [];
-  const flushPending = () => {
-    if (!pendingEventGroup.length) {
-      return;
-    }
-    const toggleId = `event-toggle-${pendingEventGroup[0].id}`;
-    if (pendingEventGroup.length === 1) {
-      output.push(...pendingEventGroup);
-      pendingEventGroup = [];
-      return;
-    }
-    const timestamps = pendingEventGroup
-      .map((message) => Date.parse(String(message.ts || message.timestamp || "")))
-      .filter((value) => Number.isFinite(value));
-    const durationLabel =
-      timestamps.length >= 2 ? formatDurationLabel(Math.max(...timestamps) - Math.min(...timestamps)) : "";
-    output.push({
-      id: toggleId,
-      toggleId,
-      renderKind: "event-toggle",
-      count: pendingEventGroup.length,
-      durationLabel
-    });
-    if (isEventGroupExpanded(toggleId)) {
-      output.push(...pendingEventGroup);
-    } else {
-      output.push(pendingEventGroup[pendingEventGroup.length - 1]);
-    }
-    pendingEventGroup = [];
-  };
-
-  for (const message of renderedMessages.value) {
-    if (message.role === "assistant" && message.renderKind === "event") {
-      pendingEventGroup.push(message);
-      continue;
-    }
-    flushPending();
-    output.push(message);
-  }
-  flushPending();
-  return output;
-});
 const visibleThreadId = computed(() => String(props.threadId || props.expectedThreadId || "").trim());
 const threadHint = computed(() => {
   if (!visibleThreadId.value) {
@@ -591,22 +368,42 @@ function scrollToBottom(force = false) {
     if (!el) {
       return;
     }
-    if (!force && !isPinnedToBottom.value) {
+    if (!force && !shouldAutoStickToBottom.value && !isPinnedToBottom.value) {
       return;
     }
 
     const applyScroll = () => {
+      autoScrollFrame = 2;
       el.scrollTop = el.scrollHeight;
+      messageBottomEl.value?.scrollIntoView({ block: "end" });
       isPinnedToBottom.value = true;
+      shouldAutoStickToBottom.value = true;
     };
 
     applyScroll();
     if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(applyScroll);
+      window.cancelAnimationFrame?.(scrollAnimationFrame);
+      scrollAnimationFrame = window.requestAnimationFrame(() => {
+        scrollAnimationFrame = window.requestAnimationFrame(applyScroll);
       });
     }
   });
+}
+
+function settleScrollToBottom(force = false) {
+  scrollToBottom(force);
+}
+
+function settleInitialScrollToBottom() {
+  settleScrollToBottom(true);
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.clearTimeout?.(initialScrollTimer);
+  initialScrollTimer = window.setTimeout(() => {
+    shouldAutoStickToBottom.value = true;
+    settleScrollToBottom(true);
+  }, 260);
 }
 
 function handleInput(event) {
@@ -642,7 +439,18 @@ function handlePrimaryAction() {
 }
 
 function handleStreamScroll(event) {
-  isPinnedToBottom.value = isNearBottom(event.target);
+  const nearBottom = isNearBottom(event.target);
+  if (nearBottom) {
+    isPinnedToBottom.value = true;
+    shouldAutoStickToBottom.value = true;
+    return;
+  }
+  if (autoScrollFrame > 0) {
+    autoScrollFrame -= 1;
+    return;
+  }
+  isPinnedToBottom.value = false;
+  shouldAutoStickToBottom.value = false;
 }
 
 function openLightboxImage(url, alt = "image") {
@@ -797,9 +605,51 @@ function handleWindowKeydown(event) {
   }
 }
 
+function observeMessageContentSize() {
+  const messageList = messageListEl.value;
+  if (!messageList) {
+    return;
+  }
+
+  const keepBottomOnContentChange = () => {
+    if (shouldAutoStickToBottom.value || isPinnedToBottom.value || isNearBottom(messageList, BOTTOM_THRESHOLD * 3)) {
+      settleScrollToBottom(true);
+    }
+  };
+
+  if (typeof ResizeObserver !== "undefined") {
+    streamResizeObserver?.disconnect();
+    streamResizeObserver = new ResizeObserver(keepBottomOnContentChange);
+    streamResizeObserver.observe(messageList);
+    for (const child of messageList.children) {
+      streamResizeObserver.observe(child);
+    }
+  }
+
+  if (typeof MutationObserver !== "undefined") {
+    streamMutationObserver?.disconnect();
+    streamMutationObserver = new MutationObserver(() => {
+      observeMessageContentSize();
+      keepBottomOnContentChange();
+    });
+    streamMutationObserver.observe(messageList, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+  }
+}
+
 watch(
-  () => props.messages.map((message) => `${message.id}:${message.text?.length || 0}`).join("|"),
+  () =>
+    hasThreadSnapshot.value
+      ? `${props.threadSnapshot?.version || 0}:${props.threadSnapshot?.turns?.length || 0}:${props.liveOverlay?.id || props.liveOverlay?.turnId || ""}:${props.liveOverlay?.text?.length || 0}`
+      : "",
   () => {
+    if (!hasThreadSnapshot.value) {
+      return;
+    }
+    observeMessageContentSize();
     scrollToBottom(false);
   },
   { flush: "post" }
@@ -809,8 +659,9 @@ watch(
   () => `${props.sessionKey}::${props.openToken}`,
   () => {
     isPinnedToBottom.value = true;
-    expandedEventGroups.value = new Set();
-    scrollToBottom(true);
+    shouldAutoStickToBottom.value = true;
+    observeMessageContentSize();
+    settleInitialScrollToBottom();
   },
   { flush: "post", immediate: true }
 );
@@ -834,7 +685,8 @@ onMounted(() => {
     window.visualViewport?.addEventListener("scroll", handleViewportChange, { passive: true });
   }
   syncViewportMetrics();
-  scrollToBottom(true);
+  observeMessageContentSize();
+  settleScrollToBottom(true);
   resizeComposer(composerEl.value, { keepBottom: true });
 });
 
@@ -844,7 +696,12 @@ onBeforeUnmount(() => {
     window.removeEventListener("keydown", handleWindowKeydown);
     window.visualViewport?.removeEventListener("resize", handleViewportChange);
     window.visualViewport?.removeEventListener("scroll", handleViewportChange);
+    window.cancelAnimationFrame?.(scrollAnimationFrame);
+    window.clearTimeout?.(initialScrollTimer);
+    autoScrollFrame = 0;
   }
+  streamResizeObserver?.disconnect();
+  streamMutationObserver?.disconnect();
 });
 </script>
 
@@ -862,79 +719,15 @@ onBeforeUnmount(() => {
 
     <main class="chat-screen">
       <section ref="messageListEl" class="message-stream" @scroll="handleStreamScroll">
-        <article v-for="message in visibleMessages" :key="message.id" class="message-item" :class="message.role">
-          <button
-            v-if="message.renderKind === 'event-toggle'"
-            type="button"
-            class="event-collapsed-toggle"
-            @click="toggleEventGroup(message.toggleId)"
-          >
-            {{ isEventGroupExpanded(message.toggleId) ? "收起执行过程" : "查看执行过程" }}
-            <span class="event-collapsed-meta">
-              （{{ message.count }} 条<span v-if="message.durationLabel">，{{ message.durationLabel }}</span>）
-            </span>
-          </button>
-
-          <div v-if="message.renderKind === 'image'" class="message-bubble image-bubble">
-            <img
-              class="message-image"
-              :src="message.imageUrl"
-              :alt="message.imageAlt"
-              loading="lazy"
-              decoding="async"
-              @click="openLightboxImage(message.imageUrl, message.imageAlt)"
-            />
-          </div>
-
-          <div v-else-if="message.renderKind === 'event'" class="message-bubble event-bubble">
-            <p class="event-compact">{{ message.eventCompactText }}</p>
-            <dl v-if="message.eventDetails.length" class="event-details">
-              <template v-for="detail in message.eventDetails" :key="`${message.id}-${detail.label}`">
-                <dt>{{ detail.label }}</dt>
-                <dd>{{ detail.value }}</dd>
-              </template>
-            </dl>
-            <p
-              v-if="message.eventSummary && message.eventSummary !== message.eventCompactText"
-              class="event-summary"
-            >
-              {{ message.eventSummary }}
-            </p>
-          </div>
-
-          <div v-else-if="message.displayText || message.role === 'user'" class="message-bubble">
-            <div class="message-text markdown-body" v-html="message.renderedHtml" @click="handleMarkdownBodyClick"></div>
-          </div>
-
-          <section v-if="message.fileMentions?.length" class="change-scope-card">
-            <p class="change-scope-title">{{ message.fileMentions.length }} 个文件已修改</p>
-            <div class="change-scope-list">
-              <div
-                v-for="file in message.fileMentions"
-                :key="`${message.id}-${file.path}`"
-                class="change-scope-item"
-              >
-                {{ file.label }}
-              </div>
-            </div>
-          </section>
-
-          <details v-if="showProcessDetails && message.hasProcessDetails" class="message-process">
-            <summary>{{ message.processSummary }}</summary>
-            <pre class="message-process-text">{{ message.processText }}</pre>
-          </details>
-        </article>
-
+        <ThreadTurnTimeline
+          :snapshot="threadSnapshot"
+          :live-overlay="liveOverlay"
+          :assistant-name="assistantName"
+          :workspace-cwd="workspaceCwd"
+          @status="emit('status', $event)"
+        />
+        <span ref="messageBottomEl" class="message-bottom-anchor" aria-hidden="true"></span>
       </section>
-
-      <button
-        v-if="hasAnyProcessDetails"
-        class="process-toggle"
-        type="button"
-        @click="showProcessDetails = !showProcessDetails"
-      >
-        {{ showProcessDetails ? "隐藏过程详情" : "显示过程详情" }}
-      </button>
 
       <p v-if="statusText" class="chat-status">{{ statusText }}</p>
 
@@ -990,6 +783,9 @@ onBeforeUnmount(() => {
 .chat-shell {
   height: var(--chat-vh, 100dvh);
   min-height: var(--chat-vh, 100dvh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background:
     radial-gradient(circle at top, rgba(255, 255, 255, 0.5), transparent 34%),
     linear-gradient(180deg, rgba(248, 244, 239, 0.98) 0%, rgba(243, 237, 231, 0.95) 100%),
@@ -1068,15 +864,17 @@ onBeforeUnmount(() => {
 }
 
 .chat-screen {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  min-height: calc(100dvh - 72px);
+  min-height: 0;
   min-width: 0;
   overflow-x: hidden;
 }
 
 .message-stream {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1085,6 +883,13 @@ onBeforeUnmount(() => {
   overflow-x: hidden;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+.message-bottom-anchor {
+  display: block;
+  width: 1px;
+  height: 1px;
+  flex: 0 0 1px;
 }
 
 .message-item {
@@ -1270,7 +1075,7 @@ onBeforeUnmount(() => {
 .message-text {
   margin: 0;
   white-space: normal;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
   word-break: break-word;
   line-break: auto;
   font-size: 15px;
@@ -1283,8 +1088,8 @@ onBeforeUnmount(() => {
 .message-item.user .message-text {
   display: block;
   white-space: normal;
-  overflow-wrap: break-word;
-  word-break: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   max-width: 100%;
 }
 
@@ -1313,6 +1118,9 @@ onBeforeUnmount(() => {
 
 .markdown-body :deep(p) {
   margin: 0 0 4px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body :deep(p:last-child) {
@@ -1325,6 +1133,8 @@ onBeforeUnmount(() => {
   background: rgba(86, 72, 61, 0.1);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 0.92em;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body :deep(pre) {
@@ -1352,46 +1162,61 @@ onBeforeUnmount(() => {
 .markdown-body :deep(pre.code-block) {
   position: relative;
   padding-top: 28px;
+  overflow: hidden;
+  border-radius: 16px;
+  border: 1px solid rgba(81, 88, 106, 0.9);
+  background:
+    radial-gradient(circle at top right, rgba(118, 129, 160, 0.12), transparent 28%),
+    linear-gradient(180deg, rgba(33, 37, 48, 0.98), rgba(22, 25, 34, 0.98));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 12px 30px rgba(26, 24, 32, 0.18);
 }
 
 .markdown-body :deep(pre.code-block .code-lang) {
   position: absolute;
   top: 8px;
   right: 10px;
-  padding: 1px 7px;
+  padding: 2px 8px;
   border-radius: 999px;
   font-size: 10px;
   line-height: 1.3;
   text-transform: lowercase;
   letter-spacing: 0.01em;
-  border: 1px solid rgba(170, 160, 149, 0.42);
-  background: rgba(255, 255, 255, 0.76);
-  color: #7a6a5c;
+  border: 1px solid rgba(111, 124, 156, 0.42);
+  background: rgba(255, 255, 255, 0.08);
+  color: #d5ddf5;
+}
+
+.markdown-body :deep(pre.code-block .code-scroll) {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 14px 14px;
 }
 
 .markdown-body :deep(pre.code-block.family-sql) {
-  border-color: rgba(164, 131, 92, 0.55);
-  background: linear-gradient(180deg, rgba(253, 246, 236, 0.92), rgba(246, 238, 226, 0.94));
+  border-color: rgba(151, 126, 88, 0.82);
 }
 
 .markdown-body :deep(pre.code-block.family-shell) {
-  border-color: rgba(109, 138, 105, 0.58);
-  background: linear-gradient(180deg, rgba(237, 247, 239, 0.9), rgba(229, 241, 233, 0.94));
+  border-color: rgba(102, 136, 102, 0.84);
 }
 
 .markdown-body :deep(pre.code-block.family-config) {
-  border-color: rgba(103, 124, 168, 0.56);
-  background: linear-gradient(180deg, rgba(239, 244, 253, 0.92), rgba(231, 238, 250, 0.95));
+  border-color: rgba(97, 121, 171, 0.84);
 }
 
 .markdown-body :deep(pre.code-block .hljs) {
-  color: #2f2a27;
+  display: block;
+  min-width: max-content;
+  color: #e8ecf8;
   background: transparent;
 }
 
 .markdown-body :deep(.hljs-comment),
 .markdown-body :deep(.hljs-quote) {
-  color: #8a7e73;
+  color: #8d96ad;
   font-style: italic;
 }
 
@@ -1400,7 +1225,7 @@ onBeforeUnmount(() => {
 .markdown-body :deep(.hljs-literal),
 .markdown-body :deep(.hljs-built_in),
 .markdown-body :deep(.hljs-type) {
-  color: #a34f18;
+  color: #f0b776;
   font-weight: 600;
 }
 
@@ -1411,7 +1236,7 @@ onBeforeUnmount(() => {
 .markdown-body :deep(.hljs-attribute),
 .markdown-body :deep(.hljs-symbol),
 .markdown-body :deep(.hljs-bullet) {
-  color: #1f7a43;
+  color: #86d7aa;
 }
 
 .markdown-body :deep(.hljs-number),
@@ -1419,7 +1244,7 @@ onBeforeUnmount(() => {
 .markdown-body :deep(.hljs-variable),
 .markdown-body :deep(.hljs-template-variable),
 .markdown-body :deep(.hljs-params) {
-  color: #4d5ea8;
+  color: #8fb0ff;
 }
 
 .markdown-body :deep(blockquote) {
@@ -1444,6 +1269,8 @@ onBeforeUnmount(() => {
 
 .markdown-body :deep(li) {
   margin-bottom: 4px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-body :deep(a) {
@@ -1525,36 +1352,22 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
-.message-process {
-  width: 100%;
-  max-width: 100%;
-  border: 1px solid rgba(223, 214, 206, 0.8);
-  border-radius: 16px;
-  background: rgba(255, 251, 247, 0.72);
-  overflow: hidden;
+
+.turn-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
-.message-process summary {
-  list-style: none;
-  padding: 10px 14px;
-  color: #8b7f73;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
+.turn-process-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 
-.message-process summary::-webkit-details-marker {
-  display: none;
-}
-
-.message-process-text {
-  margin: 0;
-  padding: 0 14px 14px;
-  color: #74675b;
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
+.turn-process-item {
+  align-self: stretch;
 }
 
 .empty-state {
@@ -1580,16 +1393,87 @@ onBeforeUnmount(() => {
   color: #99897c;
 }
 
-.process-toggle {
-  align-self: flex-start;
-  margin: 0 14px 8px;
-  padding: 0;
+.subagent-panel {
+  margin: 0 14px 10px;
+  border: 1px solid rgba(220, 211, 201, 0.9);
+  border-radius: 18px;
+  background: rgba(255, 251, 248, 0.92);
+  overflow: hidden;
+}
+
+.subagent-panel-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
   border: 0;
   background: transparent;
+  color: #6d6156;
+  font-size: 14px;
+  text-align: left;
+}
+
+.subagent-panel-chevron {
+  font-size: 18px;
+  line-height: 1;
+  transform: rotate(90deg);
+  transition: transform 160ms ease;
+}
+
+.subagent-panel-chevron.expanded {
+  transform: rotate(-90deg);
+}
+
+.subagent-panel-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border-top: 1px solid rgba(228, 220, 212, 0.9);
+}
+
+.subagent-panel-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(244, 238, 233, 0.9);
+}
+
+.subagent-panel-item:first-child {
+  border-top: 0;
+}
+
+.subagent-panel-name {
+  min-width: 0;
+  color: #433831;
+  font-size: 14px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subagent-panel-status {
+  flex-shrink: 0;
   color: #8d7d70;
   font-size: 12px;
-  line-height: 1.4;
+  text-transform: lowercase;
 }
+
+.subagent-panel-status[data-status="running"] {
+  color: #8b6d34;
+}
+
+.subagent-panel-status[data-status="done"] {
+  color: #3f7d54;
+}
+
+.subagent-panel-status[data-status="failed"] {
+  color: #b5483d;
+}
+
 
 .composer {
   position: sticky;

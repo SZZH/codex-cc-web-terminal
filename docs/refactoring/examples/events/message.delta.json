@@ -1,0 +1,16 @@
+{
+  "id": "evt-thread-refactor-001-0005",
+  "seq": 5,
+  "provider": "codex",
+  "providerThreadId": "provider-thread-refactor-001",
+  "providerTurnId": "provider-turn-refactor-001",
+  "threadId": "thread-refactor-001",
+  "turnId": "turn-refactor-001",
+  "ts": "2026-04-22T10:00:04.000Z",
+  "kind": "message.delta",
+  "payload": {
+    "text": "我先给你整理一组最小但完整的契约样本，",
+    "deltaSeq": 1,
+    "role": "assistant"
+  }
+}
