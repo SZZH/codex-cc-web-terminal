@@ -51,7 +51,6 @@ const lightboxGesture = {
   startMidpointY: 0
 };
 let scrollAnimationFrame = 0;
-let scrollSettleTimer = 0;
 let streamResizeObserver = null;
 let streamMutationObserver = null;
 
@@ -380,25 +379,14 @@ function scrollToBottom(force = false) {
     if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
       window.cancelAnimationFrame?.(scrollAnimationFrame);
       scrollAnimationFrame = window.requestAnimationFrame(() => {
-        applyScroll();
         scrollAnimationFrame = window.requestAnimationFrame(applyScroll);
       });
-    }
-    if (typeof window !== "undefined") {
-      window.clearTimeout?.(scrollSettleTimer);
-      scrollSettleTimer = window.setTimeout(applyScroll, 120);
     }
   });
 }
 
 function settleScrollToBottom(force = false) {
   scrollToBottom(force);
-  if (typeof window === "undefined") {
-    return;
-  }
-  for (const delay of [60, 160, 360, 720]) {
-    window.setTimeout(() => scrollToBottom(force), delay);
-  }
 }
 
 function handleInput(event) {
@@ -680,7 +668,6 @@ onBeforeUnmount(() => {
     window.visualViewport?.removeEventListener("resize", handleViewportChange);
     window.visualViewport?.removeEventListener("scroll", handleViewportChange);
     window.cancelAnimationFrame?.(scrollAnimationFrame);
-    window.clearTimeout?.(scrollSettleTimer);
   }
   streamResizeObserver?.disconnect();
   streamMutationObserver?.disconnect();
