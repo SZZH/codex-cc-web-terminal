@@ -16,6 +16,7 @@
 
 * {
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
 }
 
 html,
@@ -298,10 +299,6 @@ pre {
 
 .session-row.pending {
   opacity: 0.6;
-}
-
-.session-row:active {
-  background: rgba(47, 109, 246, 0.06);
 }
 
 .session-row-body {
