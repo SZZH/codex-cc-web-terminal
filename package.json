@@ -27,6 +27,13 @@
     "test:quiet": "pnpm run rebuild:sqlite && node ./scripts/ensure-electron-binary.mjs && vitest run --silent --reporter=dot",
     "playwright:agent:repl": "pnpm run rebuild:sqlite && node --import tsx ./scripts/playwright-electron-agent-cdp.mjs",
     "web:build": "npx vite build --config ./web/vite.config.js",
+    "service:start": "node ./scripts/service.mjs start",
+    "service:restart": "node ./scripts/service.mjs restart",
+    "service:stop": "node ./scripts/service.mjs stop",
+    "service:status": "node ./scripts/service.mjs status",
+    "service:logs": "node ./scripts/service.mjs logs",
+    "service:list": "node ./scripts/service.mjs list",
+    "service:resurrect": "node ./scripts/service.mjs resurrect",
     "devtools:reset": "sh -c 'rm -rf \"$HOME/Library/Application Support/Codex/extensions/fmkadmapgofadopljbjfkapdkoienihi\" \"$HOME/Library/Application Support/Codex/Service Worker\" \"$HOME/Library/Application Support/Codex/Code Cache\"'",
     "rebuild:forge-natives": "node ./scripts/rebuild-forge-natives.mjs",
     "rebuild:sqlite": "node ./scripts/rebuild-sqlite.mjs"
