@@ -247,6 +247,9 @@ export async function handleHistoryRoute(ctx, runtime) {
         runtime.json(ctx, 200, getThreadBundle(provider, resumeSessionId));
         return true;
       }
+      if (suffix === "composer-state") {
+        return false;
+      }
       if (suffix === "conversation") {
         runtime.json(ctx, 200, getThreadConversationPayload(provider, resumeSessionId));
         return true;

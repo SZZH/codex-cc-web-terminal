@@ -8,9 +8,44 @@ import { HistoricalSessionService } from "../src/sessions/history/HistoricalSess
 import { buildProviders } from "../src/sessions/providers/buildProviders.js";
 import { createBaseConfig, createTempDir, login, parseCookieValue, startTestServer } from "./helpers/backendTestUtils.js";
 
+function createCodexThreadsTableSql() {
+  return `
+    create table threads (
+      id text primary key,
+      rollout_path text not null,
+      created_at integer not null,
+      updated_at integer not null,
+      source text not null,
+      model_provider text not null,
+      cwd text not null,
+      title text not null,
+      sandbox_policy text not null,
+      approval_mode text not null,
+      tokens_used integer not null default 0,
+      has_user_event integer not null default 0,
+      archived integer not null default 0,
+      archived_at integer,
+      git_sha text,
+      git_branch text,
+      git_origin_url text,
+      cli_version text not null default '',
+      first_user_message text not null default '',
+      agent_nickname text,
+      agent_role text,
+      memory_mode text not null default 'enabled',
+      model text,
+      reasoning_effort text,
+      agent_path text,
+      created_at_ms integer,
+      updated_at_ms integer
+    );
+  `;
+}
+
 function createSessionManagerStub() {
   const calls = {
     create: [],
+    updateSessionOptions: [],
     rename: [],
     close: [],
     resize: [],
@@ -36,6 +71,8 @@ function createSessionManagerStub() {
     inputPreview: "",
     resumeSessionId: "thread-1",
     model: "gpt-5",
+    reasoningEffort: "medium",
+    permissionMode: "default",
     titleSource: "user_provided",
     sessionType: "main",
     parentThreadId: "",
@@ -77,7 +114,22 @@ function createSessionManagerStub() {
     },
     create(body) {
       calls.create.push(body);
-      return { ...liveSession, name: body.name || liveSession.name, cwd: body.cwd || liveSession.cwd };
+      return {
+        ...liveSession,
+        name: body.name || liveSession.name,
+        cwd: body.cwd || liveSession.cwd,
+        model: body.model || liveSession.model,
+        reasoningEffort: body.reasoningEffort || liveSession.reasoningEffort,
+        permissionMode: body.permissionMode || liveSession.permissionMode
+      };
+    },
+    updateSessionOptions(session, body) {
+      calls.updateSessionOptions.push({
+        id: session?.id || "",
+        ...body
+      });
+      Object.assign(session, body);
+      return session;
     },
     rename(id, name) {
       calls.rename.push({ id, name });
@@ -200,6 +252,47 @@ test("authorized requests extend auth-session expiration", async (t) => {
 
   const refreshedExpiry = server.runtime.authSessions.get(sessionId)?.expiresAt;
   assert.ok(refreshedExpiry > initialExpiry);
+});
+
+test("config route exposes codex desktop defaults from local config files", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const rootDir = createTempDir();
+  const codexConfigPath = path.join(rootDir, ".codex", "config.toml");
+  const codexGlobalStatePath = path.join(rootDir, ".codex", ".codex-global-state.json");
+  fs.mkdirSync(path.dirname(codexConfigPath), { recursive: true });
+  fs.writeFileSync(
+    codexConfigPath,
+    'model = "gpt-5.4"\nmodel_reasoning_effort = "high"\nmodel = "gpt-5.5"\nmodel_reasoning_effort = "low"\n',
+    "utf8"
+  );
+  fs.writeFileSync(
+    codexGlobalStatePath,
+    JSON.stringify({ "agent-mode": "full-access" }),
+    "utf8"
+  );
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      home: rootDir,
+      codexConfigPath,
+      codexGlobalStatePath
+    }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const auth = await login(server.baseUrl, server.config.accessToken);
+  const configResponse = await fetch(`${server.baseUrl}/api/config`, {
+    headers: { cookie: auth.cookies }
+  });
+  assert.equal(configResponse.status, 200);
+  const payload = await configResponse.json();
+  assert.deepEqual(payload.codexDefaults, {
+    model: "gpt-5.5",
+    reasoningEffort: "low",
+    permissionMode: "full-access"
+  });
 });
 
 test("stale auth cookie is rejected after server restart instead of keeping protected routes in a loading state", async (t) => {
@@ -390,6 +483,40 @@ test("session create reuses existing live session for same provider+resume id", 
   assert.equal(sessionManager.calls.create.length, 0);
 });
 
+test("session create forwards composer runtime options to the session manager", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      provider: "codex",
+      cwd: "/tmp/composer-demo",
+      model: "gpt-5-mini",
+      reasoningEffort: "high",
+      permissionMode: "full-access"
+    })
+  });
+
+  assert.equal(response.status, 201);
+  assert.equal(sessionManager.calls.create.length, 1);
+  assert.deepEqual(sessionManager.calls.create[0], {
+    provider: "codex",
+    cwd: "/tmp/composer-demo",
+    model: "gpt-5-mini",
+    reasoningEffort: "high",
+    permissionMode: "full-access"
+  });
+});
+
 test("session input-stream route returns typed sse events and applies input to the session manager", async (t) => {
   const writes = [];
   const liveSession = {
@@ -418,8 +545,11 @@ test("session input-stream route returns typed sse events and applies input to t
 
   const sessionManager = createSessionManagerStub();
   sessionManager.get = (id) => (id === liveSession.id ? liveSession : null);
-  sessionManager.ensureLiveSessionForThread = (threadId) => {
+  sessionManager.ensureLiveSessionForThread = (threadId, options = {}) => {
     assert.equal(threadId, liveSession.resumeSessionId);
+    assert.equal(options.model, "gpt-5-mini");
+    assert.equal(options.reasoningEffort, "high");
+    assert.equal(options.permissionMode, "full-access");
     return liveSession;
   };
   sessionManager.getConversationSnapshot = () => ({
@@ -519,7 +649,13 @@ test("session input-stream route returns typed sse events and applies input to t
       "content-type": "application/json",
       accept: "text/event-stream"
     },
-    body: JSON.stringify({ type: "input", data: "你好\n" }),
+    body: JSON.stringify({
+      type: "input",
+      data: "你好\n",
+      model: "gpt-5-mini",
+      reasoningEffort: "high",
+      permissionMode: "full-access"
+    }),
     signal: controller.signal
   });
 
@@ -558,6 +694,14 @@ test("session input-stream route returns typed sse events and applies input to t
   controller.abort();
 
   assert.deepEqual(writes, [{ id: liveSession.id, data: "你好\n" }]);
+  assert.deepEqual(sessionManager.calls.updateSessionOptions, [
+    {
+      id: liveSession.id,
+      model: "gpt-5-mini",
+      reasoningEffort: "high",
+      permissionMode: "full-access"
+    }
+  ]);
   assert.ok(events.some((event) => event.event === "thread.snapshot"));
   assert.ok(events.some((event) => event.event === "thread.overlay"));
 });
@@ -591,7 +735,15 @@ test("thread input-stream route can resume or create a live session from thread 
 
   const sessionManager = createSessionManagerStub();
   sessionManager.findRunningLiveSessionByResume = () => ({ id: liveSession.id });
-  sessionManager.ensureLiveSessionForThread = () => liveSession;
+  sessionManager.ensureLiveSessionForThread = (threadId, options = {}) => {
+    assert.equal(threadId, liveSession.resumeSessionId);
+    assert.equal(options.providerId, "codex");
+    assert.equal(options.cwd, "/tmp/thread-workspace");
+    assert.equal(options.model, "gpt-5-mini");
+    assert.equal(options.reasoningEffort, "low");
+    assert.equal(options.permissionMode, "auto-review");
+    return liveSession;
+  };
   sessionManager.get = (id) => (id === liveSession.id ? liveSession : null);
   sessionManager.attachClient = (id, client) => {
     if (id !== liveSession.id) {
@@ -673,7 +825,14 @@ test("thread input-stream route can resume or create a live session from thread 
       "content-type": "application/json",
       accept: "text/event-stream"
     },
-    body: JSON.stringify({ type: "input", data: "继续这个 thread\n" }),
+    body: JSON.stringify({
+      type: "input",
+      data: "继续这个 thread\n",
+      cwd: "/tmp/thread-workspace",
+      model: "gpt-5-mini",
+      reasoningEffort: "low",
+      permissionMode: "auto-review"
+    }),
     signal: controller.signal
   });
 
@@ -712,6 +871,14 @@ test("thread input-stream route can resume or create a live session from thread 
   controller.abort();
 
   assert.deepEqual(writes, [{ id: liveSession.id, data: "继续这个 thread\n" }]);
+  assert.deepEqual(sessionManager.calls.updateSessionOptions, [
+    {
+      id: liveSession.id,
+      model: "gpt-5-mini",
+      reasoningEffort: "low",
+      permissionMode: "auto-review"
+    }
+  ]);
   assert.ok(events.some((event) => event.event === "thread.snapshot"));
   assert.ok(events.some((event) => event.event === "thread.overlay"));
 });
@@ -854,6 +1021,138 @@ test("history messages route returns manager-owned historical snapshot without r
   assert.equal(historyPayload.turns[0].user.text, "历史问题");
   assert.equal(historyPayload.turns[0].assistant.body[0].text, "历史答案");
   assert.equal(sessionManager.calls.create.length, 0);
+});
+
+test("thread composer-state route returns thread-specific composer state and git state", async (t) => {
+  const rootDir = createTempDir();
+  const codexDir = path.join(rootDir, ".codex");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const sessionManager = createSessionManagerStub();
+  fs.mkdirSync(codexDir, { recursive: true });
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      [
+        createCodexThreadsTableSql(),
+        `insert into threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+          sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
+          cli_version, first_user_message, memory_mode, model, reasoning_effort, created_at_ms, updated_at_ms
+        ) values (
+          'thread-1', '', 1714200000, 1714200000, 'vscode', 'openai', '${process.cwd()}',
+          'Thread One', '{"type":"danger-full-access"}', 'never', 0, 0, 0, 'feature/test-thread',
+          '', '', 'enabled', 'gpt-5.4', 'xhigh', 1714200000000, 1714200000000
+        );`
+      ].join("\n")
+    ],
+    { stdio: "ignore" }
+  );
+
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      codexStateDbPath: stateDbPath,
+      codexConfigPath: path.join(createTempDir(), "missing-config.toml"),
+      codexGlobalStatePath: path.join(createTempDir(), "missing-global-state.json")
+    }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(
+    `${server.baseUrl}/api/threads/codex/${encodeURIComponent("thread-1")}/composer-state`,
+    { headers: { cookie: cookies } }
+  );
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.threadId, "thread-1");
+  assert.equal(payload.provider, "codex");
+  assert.equal(payload.model, "gpt-5.4");
+  assert.equal(payload.reasoningEffort, "xhigh");
+  assert.equal(payload.permissionMode, "full-access");
+  assert.equal(typeof payload.git.isGitRepo, "boolean");
+});
+
+test("thread composer-state patch updates sqlite-backed thread state and live session", async (t) => {
+  const rootDir = createTempDir();
+  const codexDir = path.join(rootDir, ".codex");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const sessionManager = createSessionManagerStub();
+  fs.mkdirSync(codexDir, { recursive: true });
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      [
+        createCodexThreadsTableSql(),
+        `insert into threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+          sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
+          cli_version, first_user_message, memory_mode, model, reasoning_effort, created_at_ms, updated_at_ms
+        ) values (
+          'thread-1', '', 1714200000, 1714200000, 'vscode', 'openai', '${process.cwd()}',
+          'Thread One', '{"type":"danger-full-access"}', 'never', 0, 0, 0, 'feature/old-branch',
+          '', '', 'enabled', 'gpt-5.5', 'low', 1714200000000, 1714200000000
+        );`
+      ].join("\n")
+    ],
+    { stdio: "ignore" }
+  );
+  sessionManager.findLiveSessionByThreadId = () => sessionManager.get("session-1");
+
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      codexStateDbPath: stateDbPath
+    }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(
+    `${server.baseUrl}/api/threads/codex/${encodeURIComponent("thread-1")}/composer-state`,
+    {
+      method: "PATCH",
+      headers: {
+        cookie: cookies,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        reasoningEffort: "medium",
+        permissionMode: "auto-review",
+        gitBranch: "feature/new-branch"
+      })
+    }
+  );
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.model, "gpt-5.4");
+  assert.equal(payload.reasoningEffort, "medium");
+  assert.equal(payload.permissionMode, "auto-review");
+
+  const row = execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      "select model, reasoning_effort, sandbox_policy, approval_mode, git_branch from threads where id='thread-1';"
+    ],
+    { encoding: "utf8" }
+  ).trim();
+  assert.equal(
+    row,
+    `gpt-5.4|medium|{"type":"workspace-write"}|on-request|feature/new-branch`
+  );
+  assert.equal(sessionManager.get("session-1").model, "gpt-5.4");
+  assert.equal(sessionManager.get("session-1").reasoningEffort, "medium");
+  assert.equal(sessionManager.get("session-1").permissionMode, "auto-review");
 });
 
 test("single-thread model contract: history conversation route returns the persisted thread snapshot only, without live continuation turns", async (t) => {
@@ -1353,6 +1652,102 @@ test("workspace changes API lists diffs and reverts selected files", async (t) =
   assert.ok(fs.existsSync(path.join(rootDir, "new.txt")));
   assert.deepEqual(revertPayload.reverted, ["demo.txt"]);
   assert.deepEqual(revertPayload.files.map((file) => file.path), ["new.txt"]);
+});
+
+test("workspace git API lists branches, creates a branch, and checks out a clean workspace", async (t) => {
+  const rootDir = createTempDir();
+  execFileSync("git", ["init"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: rootDir, stdio: "ignore" });
+  fs.writeFileSync(path.join(rootDir, "demo.txt"), "before\n", "utf8");
+  execFileSync("git", ["add", "demo.txt"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: rootDir, stdio: "ignore" });
+  const initialBranch = execFileSync("git", ["branch", "--show-current"], { cwd: rootDir, encoding: "utf8" }).trim();
+
+  const sessionManager = createSessionManagerStub();
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const params = new URLSearchParams({ cwd: rootDir });
+  const listResponse = await fetch(`${server.baseUrl}/api/workspace-git?${params.toString()}`, {
+    headers: { cookie: cookies }
+  });
+  const listPayload = await listResponse.json();
+
+  assert.equal(listResponse.status, 200);
+  assert.equal(listPayload.isGitRepo, true);
+  assert.equal(listPayload.currentBranch, initialBranch);
+  assert.deepEqual(listPayload.branches.map((branch) => branch.name), [initialBranch]);
+
+  const createResponse = await fetch(`${server.baseUrl}/api/workspace-git/branches`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ cwd: rootDir, branch: "feature/composer-api", checkout: false })
+  });
+  const createPayload = await createResponse.json();
+
+  assert.equal(createResponse.status, 200);
+  assert.equal(createPayload.currentBranch, initialBranch);
+  assert.deepEqual(createPayload.branches.map((branch) => branch.name), [initialBranch, "feature/composer-api"]);
+
+  const checkoutResponse = await fetch(`${server.baseUrl}/api/workspace-git/checkout`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ cwd: rootDir, branch: "feature/composer-api" })
+  });
+  const checkoutPayload = await checkoutResponse.json();
+
+  assert.equal(checkoutResponse.status, 200);
+  assert.equal(checkoutPayload.currentBranch, "feature/composer-api");
+  assert.equal(checkoutPayload.branches[0].name, "feature/composer-api");
+  assert.equal(checkoutPayload.branches[0].current, true);
+});
+
+test("workspace git checkout API rejects dirty workspaces with 409", async (t) => {
+  const rootDir = createTempDir();
+  execFileSync("git", ["init"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: rootDir, stdio: "ignore" });
+  fs.writeFileSync(path.join(rootDir, "demo.txt"), "before\n", "utf8");
+  execFileSync("git", ["add", "demo.txt"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: rootDir, stdio: "ignore" });
+  const initialBranch = execFileSync("git", ["branch", "--show-current"], { cwd: rootDir, encoding: "utf8" }).trim();
+  execFileSync("git", ["checkout", "-b", "feature/dirty-target"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["checkout", initialBranch], { cwd: rootDir, stdio: "ignore" });
+  fs.writeFileSync(path.join(rootDir, "demo.txt"), "before\nafter\n", "utf8");
+
+  const sessionManager = createSessionManagerStub();
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/workspace-git/checkout`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ cwd: rootDir, branch: "feature/dirty-target" })
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(payload, {
+    error: "Workspace has uncommitted changes",
+    dirty: true
+  });
+  assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: rootDir, encoding: "utf8" }).trim(), initialBranch);
 });
 
 test("invalid input payloads return 400 for json-backed routes", async (t) => {

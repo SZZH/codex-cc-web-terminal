@@ -3,11 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js";
+import ChatComposer from "./composer/ChatComposer.vue";
 import ThreadTurnTimeline from "./thread-item/ThreadTurnTimeline.vue";
 
 const BOTTOM_THRESHOLD = 84;
-const MAX_COMPOSER_HEIGHT = 160;
-
 const props = defineProps({
   sessionKey: { type: String, default: "" },
   openToken: { type: [String, Number], default: 0 },
@@ -15,27 +14,41 @@ const props = defineProps({
   threadId: { type: String, default: "" },
   expectedThreadId: { type: String, default: "" },
   threadMismatch: { type: Boolean, default: false },
-  workspaceName: { type: String, default: "" },
   assistantName: { type: String, default: "Codex" },
   threadSnapshot: { type: Object, default: null },
   liveOverlay: { type: Object, default: null },
   workspaceCwd: { type: String, default: "" },
   draft: { type: String, default: "" },
+  composerOptions: { type: Object, required: true },
+  models: { type: Array, default: () => [] },
+  gitState: { type: Object, required: true },
+  providerId: { type: String, default: "codex" },
   canSend: Boolean,
   canInterrupt: Boolean,
   loading: Boolean,
   statusText: { type: String, default: "" }
 });
 
-const emit = defineEmits(["back", "update:draft", "submit", "interrupt", "status"]);
+const emit = defineEmits([
+  "back",
+  "update:draft",
+  "submit",
+  "interrupt",
+  "status",
+  "update:composer-options",
+  "add-attachments",
+  "remove-attachment",
+  "retry-attachment",
+  "switch-git-branch",
+  "create-git-branch"
+]);
 const messageListEl = ref(null);
 const messageBottomEl = ref(null);
-const composerEl = ref(null);
+const composerRef = ref(null);
 const viewportHeight = ref(0);
 const keyboardInset = ref(0);
 const isPinnedToBottom = ref(true);
 const shouldAutoStickToBottom = ref(true);
-const isTouchDevice = ref(false);
 const lightboxImage = ref(null);
 const lightboxScale = ref(1);
 const lightboxTranslateX = ref(0);
@@ -61,11 +74,6 @@ const chatShellStyle = computed(() => ({
   "--chat-vh": viewportHeight.value ? `${viewportHeight.value}px` : undefined,
   "--chat-keyboard-inset": `${keyboardInset.value}px`
 }));
-const isRunning = computed(() => Boolean(props.canInterrupt));
-const primaryActionLabel = computed(() => (isRunning.value ? "中断" : "发送"));
-const canPrimaryAction = computed(() => {
-  return isRunning.value ? !props.loading : props.canSend && !props.loading;
-});
 const lightboxImageStyle = computed(() => ({
   transform: `translate3d(${lightboxTranslateX.value}px, ${lightboxTranslateY.value}px, 0) scale(${lightboxScale.value})`
 }));
@@ -208,7 +216,6 @@ const md = new MarkdownIt({
   html: false,
   breaks: true,
   linkify: true,
-  typographer: true,
   highlight(code, language) {
     return renderCodeFence(String(code || ""), language);
   }
@@ -330,17 +337,6 @@ function compactText(value) {
 const hasThreadSnapshot = computed(
   () => props.threadSnapshot && Array.isArray(props.threadSnapshot.turns)
 );
-const visibleThreadId = computed(() => String(props.threadId || props.expectedThreadId || "").trim());
-const threadHint = computed(() => {
-  if (!visibleThreadId.value) {
-    return "thread_id: 暂未获取";
-  }
-  if (props.threadMismatch) {
-    return `thread_id 不一致：当前 ${props.threadId} / 目标 ${props.expectedThreadId}`;
-  }
-  return `thread_id: ${visibleThreadId.value}`;
-});
-
 function isNearBottom(element, threshold = BOTTOM_THRESHOLD) {
   if (!element) {
     return true;
@@ -349,14 +345,8 @@ function isNearBottom(element, threshold = BOTTOM_THRESHOLD) {
 }
 
 function resizeComposer(target, { keepBottom = false } = {}) {
-  const el = target?.target || target;
-  if (!el) {
-    return;
-  }
   const wasNearBottom = keepBottom && isNearBottom(messageListEl.value);
-  el.style.height = "auto";
-  el.style.height = `${Math.min(el.scrollHeight, MAX_COMPOSER_HEIGHT)}px`;
-  el.style.overflowY = el.scrollHeight > MAX_COMPOSER_HEIGHT ? "auto" : "hidden";
+  composerRef.value?.resizeComposer?.();
   if (wasNearBottom) {
     scrollToBottom(true);
   }
@@ -404,38 +394,6 @@ function settleInitialScrollToBottom() {
     shouldAutoStickToBottom.value = true;
     settleScrollToBottom(true);
   }, 260);
-}
-
-function handleInput(event) {
-  emit("update:draft", event.target.value);
-  resizeComposer(event, { keepBottom: true });
-}
-
-function handleComposerKeydown(event) {
-  if (event.isComposing || event.keyCode === 229) {
-    return;
-  }
-
-  const wantsSubmitShortcut =
-    event.key === "Enter" &&
-    !event.shiftKey &&
-    !event.altKey &&
-    !event.ctrlKey &&
-    !event.metaKey &&
-    !isTouchDevice.value;
-
-  if (wantsSubmitShortcut) {
-    event.preventDefault();
-    emit("submit");
-  }
-}
-
-function handlePrimaryAction() {
-  if (isRunning.value) {
-    emit("interrupt");
-    return;
-  }
-  emit("submit");
 }
 
 function handleStreamScroll(event) {
@@ -564,13 +522,6 @@ function handleLightboxTouchEnd() {
   lightboxGesture.mode = "";
 }
 
-function handleComposerFocus() {
-  if (!isNearBottom(messageListEl.value)) {
-    return;
-  }
-  scrollToBottom(true);
-}
-
 function syncViewportMetrics() {
   if (typeof window === "undefined") {
     return;
@@ -588,7 +539,7 @@ function syncViewportMetrics() {
 
 function handleViewportChange() {
   syncViewportMetrics();
-  resizeComposer(composerEl.value, { keepBottom: true });
+  resizeComposer(composerRef.value, { keepBottom: true });
   if (isPinnedToBottom.value) {
     scrollToBottom(true);
   }
@@ -596,7 +547,7 @@ function handleViewportChange() {
 
 function handleWindowResize() {
   syncViewportMetrics();
-  resizeComposer(composerEl.value, { keepBottom: true });
+  resizeComposer(composerRef.value, { keepBottom: true });
 }
 
 function handleWindowKeydown(event) {
@@ -661,7 +612,10 @@ watch(
     isPinnedToBottom.value = true;
     shouldAutoStickToBottom.value = true;
     observeMessageContentSize();
-    settleInitialScrollToBottom();
+    nextTick(() => {
+      resizeComposer(composerRef.value, { keepBottom: true });
+      settleInitialScrollToBottom();
+    });
   },
   { flush: "post", immediate: true }
 );
@@ -669,16 +623,13 @@ watch(
 watch(
   () => props.draft,
   () => {
-    nextTick(() => resizeComposer(composerEl.value, { keepBottom: true }));
+    nextTick(() => resizeComposer(composerRef.value, { keepBottom: true }));
   },
   { flush: "post", immediate: true }
 );
 
 onMounted(() => {
   if (typeof window !== "undefined") {
-    isTouchDevice.value =
-      window.matchMedia?.("(pointer: coarse)").matches ||
-      navigator.maxTouchPoints > 0;
     window.addEventListener("resize", handleWindowResize, { passive: true });
     window.addEventListener("keydown", handleWindowKeydown);
     window.visualViewport?.addEventListener("resize", handleViewportChange, { passive: true });
@@ -686,8 +637,10 @@ onMounted(() => {
   }
   syncViewportMetrics();
   observeMessageContentSize();
-  settleScrollToBottom(true);
-  resizeComposer(composerEl.value, { keepBottom: true });
+  nextTick(() => {
+    resizeComposer(composerRef.value, { keepBottom: true });
+    settleScrollToBottom(true);
+  });
 });
 
 onBeforeUnmount(() => {
@@ -731,29 +684,27 @@ onBeforeUnmount(() => {
 
       <p v-if="statusText" class="chat-status">{{ statusText }}</p>
 
-      <form class="composer" @submit.prevent="emit('submit')">
-        <textarea
-          ref="composerEl"
-          :value="draft"
-          class="composer-input"
-          rows="1"
-          :placeholder="isTouchDevice ? '给 Codex 发消息…' : 'Enter 发送，Shift + Enter 换行'"
-          :disabled="loading"
-          :enterkeyhint="isTouchDevice ? 'enter' : 'send'"
-          @input="handleInput"
-          @focus="handleComposerFocus"
-          @keydown="handleComposerKeydown"
-        ></textarea>
-        <button
-          class="primary-button composer-send"
-          type="button"
-          :aria-label="isRunning ? '中断当前流程' : '发送消息'"
-          :disabled="!canPrimaryAction"
-          @click="handlePrimaryAction"
-        >
-          {{ primaryActionLabel }}
-        </button>
-      </form>
+      <ChatComposer
+        ref="composerRef"
+        :draft="draft"
+        :composer-options="composerOptions"
+        :models="models"
+        :git-state="gitState"
+        :provider-id="providerId"
+        :can-send="canSend"
+        :can-interrupt="canInterrupt"
+        :loading="loading"
+        @update:draft="emit('update:draft', $event)"
+        @submit="emit('submit')"
+        @interrupt="emit('interrupt')"
+        @status="emit('status', $event)"
+        @update:composer-options="emit('update:composer-options', $event)"
+        @add-attachments="emit('add-attachments', $event)"
+        @remove-attachment="emit('remove-attachment', $event)"
+        @retry-attachment="emit('retry-attachment', $event)"
+        @switch-git-branch="emit('switch-git-branch', $event)"
+        @create-git-branch="emit('create-git-branch', $event)"
+      />
     </main>
 
     <div
@@ -1474,79 +1425,5 @@ onBeforeUnmount(() => {
   color: #b5483d;
 }
 
-
-.composer {
-  position: sticky;
-  bottom: 0;
-  z-index: 5;
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 12px 14px calc(12px + env(safe-area-inset-bottom) + clamp(0px, var(--chat-keyboard-inset, 0px), 24px));
-  background: linear-gradient(180deg, rgba(244, 238, 232, 0) 0%, rgba(244, 238, 232, 0.92) 28%, #f4eee8 100%);
-  backdrop-filter: blur(16px);
-}
-
-.composer-interrupt {
-  flex-shrink: 0;
-  min-width: 60px;
-  min-height: 48px;
-  padding: 0 12px;
-  border-radius: 16px;
-}
-
-.composer-interrupt:disabled {
-  opacity: 0.46;
-  box-shadow: none;
-}
-
-.composer-input {
-  flex: 1;
-  min-height: 48px;
-  max-height: 160px;
-  padding: 13px 16px;
-  border: 1px solid rgba(217, 205, 194, 0.92);
-  border-radius: 18px;
-  background: rgba(255, 251, 248, 0.95);
-  color: #3a312b;
-  font-size: 16px;
-  line-height: 1.55;
-  resize: none;
-  box-shadow: 0 10px 28px rgba(127, 107, 88, 0.05);
-  outline: none;
-  -webkit-appearance: none;
-}
-
-.composer-input:focus {
-  border-color: rgba(186, 168, 152, 0.92);
-  box-shadow:
-    0 0 0 4px rgba(205, 191, 179, 0.34),
-    0 10px 28px rgba(127, 107, 88, 0.06);
-}
-
-.composer-input:disabled {
-  color: #aa9b8f;
-  background: rgba(247, 242, 237, 0.9);
-}
-
-.composer-send {
-  flex-shrink: 0;
-  min-width: 74px;
-  min-height: 48px;
-  padding: 0 18px;
-  border: 0;
-  border-radius: 16px;
-  background: linear-gradient(180deg, #bfafa0 0%, #ae9d8d 100%);
-  color: #fffdfa;
-  font-size: 14px;
-  font-weight: 600;
-  box-shadow: 0 12px 24px rgba(139, 117, 97, 0.16);
-  touch-action: manipulation;
-}
-
-.composer-send:disabled {
-  opacity: 0.46;
-  box-shadow: none;
-}
 
 </style>

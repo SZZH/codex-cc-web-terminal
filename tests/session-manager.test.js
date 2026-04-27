@@ -64,6 +64,32 @@ test("providerCatalog exposes both provider definitions", () => {
   assert.equal(providers[1].defaultModel, "sonnet");
 });
 
+test("providerCatalog reads codex model options from models cache when available", () => {
+  const { manager, config, rootDir } = createManager();
+  const cachePath = path.join(rootDir, ".codex", "models_cache.json");
+  fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+  fs.writeFileSync(
+    cachePath,
+    JSON.stringify({
+      models: [
+        { slug: "gpt-5.5", display_name: "GPT-5.5", visibility: "list", supported_in_api: true, priority: 0 },
+        { slug: "gpt-5.4", display_name: "GPT-5.4", visibility: "list", supported_in_api: true, priority: 1 },
+        { slug: "codex-auto-review", display_name: "Codex Auto Review", visibility: "hide", supported_in_api: true, priority: 2 }
+      ]
+    }),
+    "utf8"
+  );
+  manager.config.codexModelsCachePath = cachePath;
+
+  const providers = manager.providerCatalog();
+  const codexProvider = providers.find((provider) => provider.id === "codex");
+
+  assert.deepEqual(codexProvider.models, [
+    { value: "gpt-5.5", label: "GPT-5.5" },
+    { value: "gpt-5.4", label: "GPT-5.4" }
+  ]);
+});
+
 test("listProjectGroups sorts groups by latest session activity including live sessions", () => {
   const { manager, rootDir } = createManager();
   const alphaRoot = path.join(rootDir, "workspace", "alpha");
@@ -151,6 +177,60 @@ test("listProjectGroups sorts groups by latest session activity including live s
 test("create rejects unsupported providers", () => {
   const { manager } = createManager();
   assert.throws(() => manager.create({ provider: "unknown-provider" }), /Unsupported session provider/);
+});
+
+test("codex session stores composer runtime options and switches to json_exec for permission overrides", () => {
+  const { manager } = createManager();
+  const created = manager.create({
+    provider: "codex",
+    cwd: process.cwd(),
+    model: "gpt-5-mini",
+    reasoningEffort: "high",
+    permissionMode: "full-access"
+  });
+  const live = manager.get(created.id);
+
+  assert.equal(created.model, "gpt-5-mini");
+  assert.equal(created.reasoningEffort, "high");
+  assert.equal(created.permissionMode, "full-access");
+  assert.equal(live.runnerMode, "json_exec");
+
+  manager.updateSessionOptions(live, {
+    model: "gpt-5",
+    reasoningEffort: "low",
+    permissionMode: "default"
+  });
+
+  assert.equal(live.model, "gpt-5");
+  assert.equal(live.reasoningEffort, "low");
+  assert.equal(live.permissionMode, "default");
+  assert.equal(live.runnerMode, "app_server");
+});
+
+test("buildCodexJsonExecArgs maps permissionMode without guessing reasoning flags", () => {
+  const { manager } = createManager({ codexFullAccess: true });
+
+  const defaultSession = manager.get(manager.create({ provider: "codex", cwd: process.cwd() }).id);
+  const autoReviewSession = manager.get(
+    manager.create({ provider: "codex", cwd: process.cwd(), permissionMode: "auto-review", reasoningEffort: "xhigh" }).id
+  );
+  const fullAccessSession = manager.get(
+    manager.create({ provider: "codex", cwd: process.cwd(), permissionMode: "full-access" }).id
+  );
+
+  const defaultArgs = manager.buildCodexJsonExecArgs(defaultSession, "hello");
+  const autoReviewArgs = manager.buildCodexJsonExecArgs(autoReviewSession, "hello");
+  const fullAccessArgs = manager.buildCodexJsonExecArgs(fullAccessSession, "hello");
+
+  assert.ok(defaultArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.deepEqual(
+    autoReviewArgs.slice(autoReviewArgs.indexOf("--sandbox"), autoReviewArgs.indexOf("--sandbox") + 4),
+    ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
+  );
+  assert.ok(!autoReviewArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.ok(fullAccessArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.ok(!autoReviewArgs.some((arg) => String(arg).includes("reason")));
+  assert.ok(!fullAccessArgs.some((arg) => String(arg).includes("reason")));
 });
 
 test("codex live session auto-renames and streams app-server replies", async () => {

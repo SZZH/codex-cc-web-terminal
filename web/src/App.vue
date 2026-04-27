@@ -10,9 +10,14 @@ import {
   request,
   requestAuthSession,
   requestHistoryMessages,
+  patchThreadComposerState,
   requestSessionById,
   requestSessionInputStream,
-  requestThreadInputStream
+  requestThreadComposerState,
+  requestThreadInputStream,
+  requestWorkspaceGit,
+  requestWorkspaceGitBranchCreate,
+  requestWorkspaceGitCheckout
 } from "./lib/api.js";
 import {
   applyConversationDeltaPayload,
@@ -42,14 +47,29 @@ import {
   wait,
   workspaceName
 } from "./lib/session-helpers.js";
+import {
+  buildInputRequest,
+  buildSessionCreateRequest,
+  canSendComposerMessage,
+  collectAttachmentLimitError,
+  createAttachmentRecord,
+  createComposerOptions,
+  createWorkspaceGitState,
+  getProviderModelOptions,
+  hasOnlyFileAttachments,
+  validateGitBranchName
+} from "./lib/composer.js";
 
 const composerDraft = ref("");
+const composerOptions = ref(createComposerOptions());
+const workspaceGitState = ref(createWorkspaceGitState());
 const router = useRouter();
 const route = useRoute();
 const historyApiAvailable = ref(null);
 const sessionCache = reactive({});
 const pendingHydrations = new Map();
 const TOKEN_STORAGE_KEY = "codex-web-terminal.saved-token";
+const GIT_DIRTY_ERROR_MESSAGE = "当前工作区有未提交改动，无法直接切换分支。";
 let autoLoginTried = false;
 let replaySuppressionLines = new Set();
 let submitFallbackTimer = null;
@@ -79,6 +99,13 @@ const state = reactive({
   accessToken: "",
   rememberToken: true,
   statusText: "",
+  providerCatalog: [],
+  codexDefaults: {
+    model: "",
+    reasoningEffort: "medium",
+    permissionMode: "default"
+  },
+  defaultProvider: "codex",
   sessions: [],
   projectGroups: [],
   routeSessionId: "",
@@ -298,6 +325,16 @@ const activeWorkspaceName = computed(() =>
 const activeWorkspaceCwd = computed(() =>
   String(displayedSessionMeta.value?.cwd || displayedThreadSnapshot.value?.metadata?.cwd || "").trim()
 );
+const activeProviderId = computed(() => {
+  return String(displayedSessionMeta.value?.provider || state.defaultProvider || "codex").trim().toLowerCase() || "codex";
+});
+const availableModels = computed(() =>
+  getProviderModelOptions(
+    state.providerCatalog,
+    activeProviderId.value,
+    composerOptions.value.model || displayedSessionMeta.value?.model || ""
+  )
+);
 const activeAssistantName = computed(() => displayedSessionMeta.value?.providerLabel || "Codex");
 const threadMismatch = computed(() => {
   if (!expectedThreadId.value) {
@@ -308,10 +345,18 @@ const threadMismatch = computed(() => {
   }
   return expectedThreadId.value !== activeThreadId.value;
 });
-const canSend = computed(() => Boolean(composerDraft.value.trim()) && !state.loading && Boolean(activeThreadId.value || displayedSessionMeta.value));
+const canSend = computed(() => {
+  if (state.loading || !Boolean(activeThreadId.value || displayedSessionMeta.value)) {
+    return false;
+  }
+  return canSendComposerMessage(composerDraft.value, composerOptions.value.attachments || []);
+});
 const canRenderChatView = computed(() => {
   if (route.name !== "chat") {
     return false;
+  }
+  if (routeHistoryTarget.value) {
+    return Boolean(displayedThreadSnapshot.value);
   }
   return Boolean(displayedSessionMeta.value || displayedThreadSnapshot.value);
 });
@@ -424,7 +469,7 @@ async function forceBackToLogin(statusMessage = "登录状态已失效，请重�
   state.sessions = [];
   state.routeSessionId = "";
   state.pendingSessionId = "";
-  composerDraft.value = "";
+  resetComposerDraftState({ keepOptions: false });
   resetLiveView();
   resetThreadView();
   setStatus(statusMessage);
@@ -651,6 +696,298 @@ function buildSubmissionText(text) {
     fragments.push(trimmedText);
   }
   return fragments.join("\n\n").trim();
+}
+
+function resetComposerDraftState({ keepOptions = true } = {}) {
+  composerDraft.value = "";
+  composerOptions.value = keepOptions
+    ? {
+        ...composerOptions.value,
+        attachments: []
+      }
+    : createComposerOptions(state.codexDefaults);
+}
+
+function updateComposerOptions(patch = {}) {
+  composerOptions.value = {
+    ...composerOptions.value,
+    ...patch,
+    attachments: Array.isArray(patch.attachments) ? patch.attachments : composerOptions.value.attachments
+  };
+}
+
+async function persistThreadComposerPatch(patch = {}, { silent = true } = {}) {
+  const threadId = String(activeThreadId.value || expectedThreadId.value || "").trim();
+  const providerId = String(activeProviderId.value || "codex").trim().toLowerCase() || "codex";
+  if (!threadId || providerId !== "codex") {
+    return null;
+  }
+  try {
+    const payload = await patchThreadComposerState(providerId, threadId, patch);
+    applyComposerStatePayload(payload);
+    return payload;
+  } catch (error) {
+    if (!silent) {
+      setStatus(error?.message || String(error));
+    }
+    throw error;
+  }
+}
+
+async function handleComposerOptionsChange(patch = {}) {
+  const nextPatch = { ...patch };
+  delete nextPatch.attachments;
+  if (!Object.keys(nextPatch).length) {
+    updateComposerOptions(patch);
+    return;
+  }
+
+  const previous = {
+    model: composerOptions.value.model,
+    reasoningEffort: composerOptions.value.reasoningEffort,
+    permissionMode: composerOptions.value.permissionMode,
+    gitBranch: composerOptions.value.gitBranch
+  };
+
+  updateComposerOptions(nextPatch);
+  try {
+    await persistThreadComposerPatch(nextPatch, { silent: false });
+    setStatus("");
+  } catch {
+    updateComposerOptions(previous);
+  }
+}
+
+function assignWorkspaceGitState(patch = {}) {
+  workspaceGitState.value = {
+    ...workspaceGitState.value,
+    ...patch
+  };
+}
+
+function applyComposerStatePayload(payload = null) {
+  const git = payload?.git || {};
+  composerOptions.value = {
+    ...composerOptions.value,
+    model: String(payload?.model || state.codexDefaults.model || "").trim(),
+    reasoningEffort: String(payload?.reasoningEffort || state.codexDefaults.reasoningEffort || "medium").trim() || "medium",
+    permissionMode: String(payload?.permissionMode || state.codexDefaults.permissionMode || "default").trim() || "default",
+    gitBranch: String(git?.currentBranch || "").trim(),
+    attachments: composerOptions.value.attachments
+  };
+  workspaceGitState.value = createWorkspaceGitState({
+    ...git,
+    available: Boolean(git && Object.keys(git).length),
+    loading: false
+  });
+}
+
+function applyHistoricalComposerValues(session = null, snapshot = null) {
+  const model = String(session?.model || snapshot?.metadata?.model || "").trim();
+  const reasoningEffort = String(session?.reasoningEffort || "").trim();
+  const permissionMode = String(session?.permissionMode || "").trim();
+  const patch = {};
+  if (model) {
+    patch.model = model;
+  }
+  if (reasoningEffort) {
+    patch.reasoningEffort = reasoningEffort;
+  }
+  if (permissionMode) {
+    patch.permissionMode = permissionMode;
+  }
+  if (Object.keys(patch).length > 0) {
+    updateComposerOptions(patch);
+  }
+}
+
+async function syncComposerStateForThread(provider, threadId, { silent = true } = {}) {
+  const resolvedProvider = String(provider || "codex").trim().toLowerCase() || "codex";
+  const resolvedThreadId = String(threadId || "").trim();
+  if (!resolvedThreadId) {
+    return false;
+  }
+  try {
+    const payload = await requestThreadComposerState(resolvedProvider, resolvedThreadId);
+    applyComposerStatePayload(payload);
+    return true;
+  } catch (error) {
+    if (!silent) {
+      setStatus(error?.message || String(error));
+    }
+    return false;
+  }
+}
+
+async function refreshWorkspaceGit({ silent = true } = {}) {
+  const cwd = activeWorkspaceCwd.value;
+  if (!cwd) {
+    workspaceGitState.value = createWorkspaceGitState();
+    updateComposerOptions({ gitBranch: "" });
+    return;
+  }
+
+  assignWorkspaceGitState({ loading: true, error: "" });
+  try {
+    const payload = await requestWorkspaceGit(cwd);
+    workspaceGitState.value = createWorkspaceGitState({
+      available: true,
+      loading: false,
+      isGitRepo: Boolean(payload?.isGitRepo),
+      currentBranch: String(payload?.currentBranch || "").trim(),
+      dirty: Boolean(payload?.dirty),
+      branches: Array.isArray(payload?.branches) ? payload.branches : [],
+      error: "",
+      cwd: String(payload?.cwd || cwd).trim()
+    });
+    updateComposerOptions({ gitBranch: workspaceGitState.value.currentBranch });
+  } catch (error) {
+    workspaceGitState.value = createWorkspaceGitState({
+      available: false,
+      loading: false,
+      error: error?.message || String(error)
+    });
+    updateComposerOptions({ gitBranch: "" });
+    if (!silent) {
+      setStatus(error?.message || String(error));
+    }
+  }
+}
+
+function setAttachmentState(attachmentId, patch = {}) {
+  const nextAttachments = [...composerOptions.value.attachments];
+  const index = nextAttachments.findIndex((attachment) => attachment.id === attachmentId);
+  if (index < 0) {
+    return;
+  }
+  nextAttachments[index] = {
+    ...nextAttachments[index],
+    ...patch
+  };
+  updateComposerOptions({ attachments: nextAttachments });
+}
+
+function addAttachments({ files = [], kindHint = "", source = "" } = {}) {
+  let nextAttachments = [...composerOptions.value.attachments];
+  let nonSendableFilesAdded = false;
+  let statusMessage = "";
+
+  for (const file of files) {
+    const nextAttachment = createAttachmentRecord(file, { kindHint, source });
+    const errorMessage = collectAttachmentLimitError(nextAttachments, nextAttachment);
+    if (errorMessage) {
+      statusMessage = errorMessage;
+      continue;
+    }
+    if (nextAttachment.kind === "file") {
+      nonSendableFilesAdded = true;
+    }
+    nextAttachments.push(nextAttachment);
+  }
+
+  updateComposerOptions({ attachments: nextAttachments });
+  if (statusMessage) {
+    setStatus(statusMessage);
+    return;
+  }
+  if (nonSendableFilesAdded && !String(composerDraft.value || "").trim()) {
+    setStatus("当前版本文件附件仅保存选择状态，暂不随消息发送。");
+  }
+}
+
+function removeAttachment(attachmentId) {
+  updateComposerOptions({
+    attachments: composerOptions.value.attachments.filter((attachment) => attachment.id !== attachmentId)
+  });
+}
+
+async function retryAttachment(attachmentId) {
+  const target = composerOptions.value.attachments.find((attachment) => attachment.id === attachmentId);
+  if (!target) {
+    return;
+  }
+  setAttachmentState(attachmentId, {
+    status: "uploading",
+    error: ""
+  });
+  await wait(120);
+  setAttachmentState(attachmentId, {
+    status: "failed",
+    error: "附件上传接口待后端接入"
+  });
+  setStatus(`${target.name} 的上传接口待后端接入，当前先保留失败态占位。`);
+}
+
+async function switchGitBranch(branchName) {
+  const cwd = activeWorkspaceCwd.value;
+  const branch = String(branchName || "").trim();
+  if (!cwd || !branch || branch === workspaceGitState.value.currentBranch) {
+    return;
+  }
+  if (state.loading || canInterrupt.value) {
+    return;
+  }
+  if (workspaceGitState.value.dirty) {
+    setStatus(GIT_DIRTY_ERROR_MESSAGE);
+    return;
+  }
+
+  assignWorkspaceGitState({ loading: true, error: "" });
+  try {
+    await requestWorkspaceGitCheckout(cwd, branch);
+    await refreshWorkspaceGit();
+    await persistThreadComposerPatch(
+      {
+        gitBranch: workspaceGitState.value.currentBranch,
+        cwd
+      },
+      { silent: true }
+    );
+    setStatus("");
+  } catch (error) {
+    const message = String(error?.message || error || "").trim();
+    if (/uncommitted changes/i.test(message)) {
+      setStatus(GIT_DIRTY_ERROR_MESSAGE);
+      assignWorkspaceGitState({ loading: false, error: GIT_DIRTY_ERROR_MESSAGE });
+      return;
+    }
+    assignWorkspaceGitState({ loading: false, error: message });
+    setStatus(message);
+  }
+}
+
+async function createGitBranch(branchName) {
+  const cwd = activeWorkspaceCwd.value;
+  let branch = String(branchName || "").trim();
+  if (!branch && typeof window !== "undefined") {
+    branch = String(window.prompt("输入新的 Git 分支名", "") || "").trim();
+  }
+  const validationMessage = validateGitBranchName(branch);
+  if (validationMessage) {
+    setStatus(validationMessage);
+    return;
+  }
+  if (!cwd || state.loading || canInterrupt.value) {
+    return;
+  }
+
+  assignWorkspaceGitState({ loading: true, error: "" });
+  try {
+    await requestWorkspaceGitBranchCreate(cwd, branch);
+    await refreshWorkspaceGit();
+    await persistThreadComposerPatch(
+      {
+        gitBranch: workspaceGitState.value.currentBranch,
+        cwd
+      },
+      { silent: true }
+    );
+    setStatus("");
+  } catch (error) {
+    const message = error?.message || String(error);
+    assignWorkspaceGitState({ loading: false, error: message });
+    setStatus(message);
+  }
 }
 
 function bumpActiveSessionOpenToken() {
@@ -1207,6 +1544,16 @@ function resolveWsUrl(sessionId) {
 async function bootstrapWorkspace({ includeSessions = true } = {}) {
   const configPayload = await request("/api/config");
   applyBackendConfig(configPayload);
+  state.providerCatalog = Array.isArray(configPayload?.providers) ? configPayload.providers : [];
+  state.codexDefaults = {
+    model: String(configPayload?.codexDefaults?.model || "").trim(),
+    reasoningEffort: String(configPayload?.codexDefaults?.reasoningEffort || "medium").trim() || "medium",
+    permissionMode: String(configPayload?.codexDefaults?.permissionMode || "default").trim() || "default"
+  };
+  state.defaultProvider = String(configPayload?.defaultProvider || "codex").trim().toLowerCase() || "codex";
+  if (!composerOptions.value.model && !composerOptions.value.attachments.length) {
+    composerOptions.value = createComposerOptions(state.codexDefaults);
+  }
   if (includeSessions) {
     await refreshSessions();
   }
@@ -1664,7 +2011,7 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
   if (!skipRoute && (route.name !== "chat" || String(route.params.sessionId || "").trim() !== session.id)) {
     await router.push({ name: "chat", params: { sessionId: session.id } });
   }
-  composerDraft.value = "";
+  resetComposerDraftState({ keepOptions: false });
   state.liveView.replayGuardActive = false;
   state.liveView.replayGuardPrompt = "";
   state.liveView.replayGuardUntil = 0;
@@ -1679,6 +2026,7 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
     threadId: String(session.resumeSessionId || "")
   });
   if (session.resumeSessionId) {
+    const composerStateSynced = await syncComposerStateForThread(session.provider, session.resumeSessionId, { silent: true });
     const hydrated = await hydrateSession(
       {
         ...session,
@@ -1698,6 +2046,9 @@ async function openLiveSession(session, { skipRoute = false } = {}) {
     });
     historyThreadSnapshot = hydrated?.threadSnapshot || null;
     historyLiveOverlay = hydrated?.liveOverlay || null;
+    if (!composerStateSynced) {
+      applyHistoricalComposerValues(hydrated?.session || null, historyThreadSnapshot);
+    }
     if (hydrated?.session) {
       state.liveView.sessionMeta = {
         ...state.liveView.sessionMeta,
@@ -1748,7 +2099,11 @@ async function openThreadSession(session, { skipRoute = false } = {}) {
   if (!skipRoute && (route.name !== "chat" || String(route.params.sessionId || "").trim() !== session.id)) {
     await router.push({ name: "chat", params: { sessionId: session.id } });
   }
-  composerDraft.value = "";
+  resetComposerDraftState({ keepOptions: false });
+  const composerStateSynced = await syncComposerStateForThread(session.provider, targetThreadId, { silent: true });
+  if (!composerStateSynced) {
+    applyHistoricalComposerValues(hydrated?.session || null, historyThreadSnapshot);
+  }
   setThreadSnapshot(historyThreadSnapshot);
   if (!keepInteractiveState) {
     startHistorySyncLoop();
@@ -1805,10 +2160,11 @@ async function createSessionInGroup(group) {
     setStatus("正在创建会话…");
     const payload = await request("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({
+      body: JSON.stringify(buildSessionCreateRequest({
         provider: "codex",
-        cwd
-      })
+        cwd,
+        composerOptions: composerOptions.value
+      }))
     });
     await refreshSessions();
     if (payload?.session) {
@@ -1885,12 +2241,13 @@ async function ensureLiveSession() {
 
   const resumed = await request("/api/sessions", {
     method: "POST",
-    body: JSON.stringify({
+    body: JSON.stringify(buildSessionCreateRequest({
       provider: state.liveView.sessionMeta.provider,
       cwd: state.liveView.sessionMeta.cwd,
       name: state.liveView.sessionMeta.displayTitle || state.liveView.sessionMeta.name,
-      resumeSessionId: state.liveView.sessionMeta.resumeSessionId
-    })
+      resumeSessionId: state.liveView.sessionMeta.resumeSessionId,
+      composerOptions: composerOptions.value
+    }))
   });
 
   state.liveView.sessionMeta = {
@@ -1917,22 +2274,38 @@ async function submitInput() {
   if (!canSend.value || state.loading) {
     return;
   }
-  const text = composerDraft.value.trim();
-  if (!text) {
+  const draftText = String(composerDraft.value || "");
+  const submissionText = buildSubmissionText(draftText);
+  const requestBody = buildInputRequest({
+    text: submissionText,
+    composerOptions: composerOptions.value
+  });
+  const sendableImages = requestBody.attachments || [];
+  const attachmentsSnapshot = [...composerOptions.value.attachments];
+
+  if (!submissionText && !sendableImages.length) {
+    if (hasOnlyFileAttachments(composerOptions.value.attachments)) {
+      setStatus("当前版本文件附件仅保存选择状态，暂不随消息发送。");
+    }
     return;
   }
   const now = Date.now();
-  const submissionText = buildSubmissionText(text);
-  if (submissionText === state.lastSubmitText && now - Number(state.lastSubmitAt || 0) < 2500) {
+  const submissionFingerprint = JSON.stringify({
+    text: submissionText,
+    attachments: sendableImages.map((attachment) => attachment.name)
+  });
+  if (submissionFingerprint === state.lastSubmitText && now - Number(state.lastSubmitAt || 0) < 2500) {
     return;
   }
-  state.lastSubmitText = submissionText;
+  state.lastSubmitText = submissionFingerprint;
   state.lastSubmitAt = now;
-  const optimisticUserMessage = createMessage("user", submissionText, new Date().toISOString(), {
-    source: "draft",
-    partType: "text",
-    payload: {}
-  });
+  const optimisticUserMessage = submissionText
+    ? createMessage("user", submissionText, new Date().toISOString(), {
+        source: "draft",
+        partType: "text",
+        payload: {}
+      })
+    : null;
 
   try {
     state.loading = true;
@@ -1944,9 +2317,10 @@ async function submitInput() {
         `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。请返回列表后重新打开该会话。`
       );
     }
-    rebuildReplaySuppressionLines([...state.liveView.messages, optimisticUserMessage]);
-    setMessages([...state.liveView.messages, optimisticUserMessage]);
-    composerDraft.value = "";
+    const nextMessages = optimisticUserMessage ? [...state.liveView.messages, optimisticUserMessage] : [...state.liveView.messages];
+    rebuildReplaySuppressionLines(nextMessages);
+    setMessages(nextMessages);
+    resetComposerDraftState();
     const liveSessionId = await ensureLiveSession();
     const targetThreadId = String(
       expectedThreadId.value ||
@@ -1977,10 +2351,7 @@ async function submitInput() {
       await requestThreadInputStream(
         targetProvider,
         targetThreadId,
-        {
-          type: "input",
-          data: `${submissionText}\n`
-        },
+        requestBody,
         {
           onPayload(payload) {
             handleLivePayload(payload);
@@ -1990,10 +2361,7 @@ async function submitInput() {
     } else {
       await requestSessionInputStream(
         liveSessionId,
-        {
-          type: "input",
-          data: `${submissionText}\n`
-        },
+        requestBody,
         {
           onPayload(payload) {
             handleLivePayload(payload);
@@ -2009,11 +2377,14 @@ async function submitInput() {
       setStatus("");
     }
   } catch (error) {
-    if (String(composerDraft.value || "").trim() === "") {
+    updateComposerOptions({ attachments: attachmentsSnapshot });
+    if (submissionText && String(composerDraft.value || "").trim() === "") {
       composerDraft.value = submissionText;
     }
     setMessages(
-      state.liveView.messages.filter((message) => String(message.id || "") !== String(optimisticUserMessage.id || ""))
+      optimisticUserMessage
+        ? state.liveView.messages.filter((message) => String(message.id || "") !== String(optimisticUserMessage.id || ""))
+        : state.liveView.messages
     );
     if (!state.liveView.liveSessionId) {
       startHistorySyncLoop();
@@ -2088,7 +2459,7 @@ async function backToList() {
   stopHistorySyncLoop();
   finalizeAssistantStream();
   state.routeSessionId = "";
-  composerDraft.value = "";
+  resetComposerDraftState();
   resetLiveView();
   resetThreadView();
   if (route.name !== "sessions") {
@@ -2113,6 +2484,28 @@ watch(
       }
     }
   }
+);
+
+watch(
+  () => activeProviderId.value,
+  () => {
+    if (composerOptions.value.model) {
+      return;
+    }
+    const model = availableModels.value[0]?.value || "";
+    if (model) {
+      updateComposerOptions({ model });
+    }
+  },
+  { immediate: true }
+);
+
+watch(
+  () => activeWorkspaceCwd.value,
+  () => {
+    refreshWorkspaceGit({ silent: true }).catch(() => {});
+  },
+  { immediate: true }
 );
 
 watch(
@@ -2255,6 +2648,7 @@ if (typeof window !== 'undefined') {
     state,
     groupedSessions,
     composerDraft,
+    composerOptions,
     computed: {
       get routeName() {
         return route.name;
@@ -2325,6 +2719,10 @@ if (typeof window !== 'undefined') {
         :thread-snapshot="displayedThreadSnapshot"
         :live-overlay="displayedLiveOverlay"
         v-model:draft="composerDraft"
+        :composer-options="composerOptions"
+        :models="availableModels"
+        :git-state="workspaceGitState"
+        :provider-id="activeProviderId"
         :can-send="canSend"
         :can-interrupt="canInterrupt"
         :loading="state.loading"
@@ -2333,6 +2731,12 @@ if (typeof window !== 'undefined') {
         @interrupt="interruptActiveSession"
         @submit="submitInput"
         @status="setStatus"
+        @update:composer-options="handleComposerOptionsChange"
+        @add-attachments="addAttachments"
+        @remove-attachment="removeAttachment"
+        @retry-attachment="retryAttachment"
+        @switch-git-branch="switchGitBranch"
+        @create-git-branch="createGitBranch"
       />
 
       <section v-else class="mobile-shell centered-shell">

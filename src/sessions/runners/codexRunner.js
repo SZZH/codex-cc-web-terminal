@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 
 import { buildEventPartFromItem } from "../history/historicalPayloads.js";
 import { extractAgentTextFromItem, extractTurnItems, isAgentMessageType, normalizeSymbolToken, nowIso } from "../shared/text.js";
+import { buildCodexPermissionArgs } from "../shared/composerOptions.js";
 
 function emitNoReplyFallback(manager, session) {
   if (!session || session.turnNoReplyNotified) {
@@ -219,9 +220,7 @@ export function buildCodexJsonExecArgs(manager, session, prompt) {
   if (manager.config.codexProfile) {
     args.push("--profile", manager.config.codexProfile);
   }
-  if (manager.config.codexFullAccess) {
-    args.push("--dangerously-bypass-approvals-and-sandbox");
-  }
+  args.push(...buildCodexPermissionArgs(session.permissionMode || "default", manager.config));
   if (Array.isArray(manager.config.codexExtraArgs) && manager.config.codexExtraArgs.length > 0) {
     args.push(...manager.config.codexExtraArgs);
   }

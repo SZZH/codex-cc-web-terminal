@@ -10,6 +10,7 @@ import { buildConversationStateFromHistory } from "../conversation/state.js";
 import { CONVERSATION_PROTOCOL_VERSION } from "../conversation/protocol.js";
 import { nowIso } from "../shared/text.js";
 import { buildThreadSnapshotFromFile, deriveConversationStateFromThreadSnapshot } from "../../threads/index.js";
+import { parseHistoricalThreadComposerContext } from "../shared/historicalComposerState.js";
 
 const CODEX_PROJECT_LIST_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -396,6 +397,7 @@ export class HistoricalSessionService {
 
   buildHistoricalSession(provider, entry, kind = "history", { canonicalTitle = false } = {}) {
     const rawName = String(entry.title || "").trim();
+    const composerContext = parseHistoricalThreadComposerContext(entry.filePath);
     return {
       id: `history:${provider.id}:${entry.resumeSessionId}`,
       provider: provider.id,
@@ -412,6 +414,9 @@ export class HistoricalSessionService {
       autoNamed: false,
       inputPreview: "",
       resumeSessionId: entry.resumeSessionId,
+      model: String(composerContext?.model || "").trim(),
+      reasoningEffort: String(composerContext?.reasoningEffort || "").trim(),
+      permissionMode: String(composerContext?.permissionMode || "").trim(),
       archivedAt: this.getArchivedAt(provider.id, entry.resumeSessionId),
       sessionType: entry.sessionType === "subagent" ? "subagent" : "main",
       parentThreadId: String(entry.parentThreadId || "").trim(),

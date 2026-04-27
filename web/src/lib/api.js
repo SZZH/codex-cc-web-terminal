@@ -116,6 +116,25 @@ export async function requestWorkspaceChanges(cwd) {
   return request(`/api/workspace-changes?${params.toString()}`);
 }
 
+export async function requestWorkspaceGit(cwd) {
+  const params = new URLSearchParams({ cwd: String(cwd || "") });
+  return request(`/api/workspace-git?${params.toString()}`);
+}
+
+export async function requestWorkspaceGitCheckout(cwd, branch) {
+  return request("/api/workspace-git/checkout", {
+    method: "POST",
+    body: JSON.stringify({ cwd, branch })
+  });
+}
+
+export async function requestWorkspaceGitBranchCreate(cwd, branch) {
+  return request("/api/workspace-git/branches", {
+    method: "POST",
+    body: JSON.stringify({ cwd, branch, checkout: true })
+  });
+}
+
 export async function revertWorkspaceChanges(cwd, paths = []) {
   return request("/api/workspace-changes/revert", {
     method: "POST",
@@ -292,4 +311,25 @@ export async function requestThreadInputStream(provider, threadId, body, { onPay
       }
     }
   }
+}
+
+export async function requestThreadComposerState(provider, threadId) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    throw new Error("Thread id is required");
+  }
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state`);
+}
+
+export async function patchThreadComposerState(provider, threadId, patch = {}) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    throw new Error("Thread id is required");
+  }
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state`, {
+    method: "PATCH",
+    body: JSON.stringify(patch || {})
+  });
 }

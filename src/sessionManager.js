@@ -27,6 +27,11 @@ import {
   nowIso
 } from "./sessions/shared/text.js";
 import {
+  applyComposerOptionOverrides,
+  extractComposerOptions,
+  sessionRequiresJsonExec
+} from "./sessions/shared/composerOptions.js";
+import {
   buildCodexJsonExecArgs,
   enqueueRunnerInput,
   handleAppServerNotification,
@@ -84,6 +89,44 @@ function byUpdatedAtDesc(left, right) {
   return String(right?.updatedAt || "").localeCompare(String(left?.updatedAt || ""));
 }
 
+function readCodexModelsFromCache(filePath = "") {
+  const targetPath = String(filePath || "").trim();
+  if (!targetPath || !fs.existsSync(targetPath)) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(targetPath, "utf8"));
+    const models = Array.isArray(parsed?.models) ? parsed.models : Array.isArray(parsed) ? parsed : [];
+    const result = [];
+    const seen = new Set();
+    for (const model of models) {
+      const slug = String(model?.slug || "").trim();
+      const label = String(model?.display_name || slug).trim();
+      const visibility = String(model?.visibility || "").trim().toLowerCase();
+      if (!slug || seen.has(slug)) {
+        continue;
+      }
+      if (visibility && visibility !== "list") {
+        continue;
+      }
+      if (model?.supported_in_api === false) {
+        continue;
+      }
+      seen.add(slug);
+      result.push({
+        value: slug,
+        label: label || slug,
+        priority: Number.isFinite(Number(model?.priority)) ? Number(model.priority) : Number.MAX_SAFE_INTEGER
+      });
+    }
+    return result
+      .sort((left, right) => left.priority - right.priority || left.label.localeCompare(right.label))
+      .map(({ value, label }) => ({ value, label }));
+  } catch {
+    return [];
+  }
+}
+
 function isManuallyNamedSession(session) {
   const titleSource = String(session?.titleSource || "").trim().toLowerCase();
   return titleSource === "custom_name" || titleSource === "user_provided";
@@ -134,14 +177,19 @@ export class SessionManager {
   }
 
   providerCatalog() {
-    return [...this.providers.values()].map((provider) => ({
-      id: provider.id,
-      label: provider.label,
-      cliLabel: provider.cliLabel,
-      historyLabel: provider.historyLabel,
-      defaultModel: provider.defaultModel || "",
-      models: provider.models || []
-    }));
+    const codexCacheModels = readCodexModelsFromCache(this.config.codexModelsCachePath);
+    return [...this.providers.values()].map((provider) => {
+      const isCodex = provider.id === "codex";
+      const providerModels = isCodex && codexCacheModels.length ? codexCacheModels : provider.models || [];
+      return {
+        id: provider.id,
+        label: provider.label,
+        cliLabel: provider.cliLabel,
+        historyLabel: provider.historyLabel,
+        defaultModel: provider.defaultModel || "",
+        models: providerModels
+      };
+    });
   }
 
   getProvider(providerId = "codex") {
@@ -320,10 +368,21 @@ export class SessionManager {
     return this.getProvider(preferredProviderId || "codex");
   }
 
-  ensureLiveSessionForThread(threadId, { providerId = "", cwd = "", model = "", name = "" } = {}) {
+  ensureLiveSessionForThread(threadId, options = {}) {
     const targetThreadId = String(threadId || "").trim();
     if (!targetThreadId) {
       throw new Error("threadId is required");
+    }
+    const { providerId = "", cwd = "", model = "", name = "", reasoningEffort = "", permissionMode = "" } = options;
+    const composerOverrides = {};
+    if (Object.prototype.hasOwnProperty.call(options, "model")) {
+      composerOverrides.model = model;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, "reasoningEffort")) {
+      composerOverrides.reasoningEffort = reasoningEffort;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, "permissionMode")) {
+      composerOverrides.permissionMode = permissionMode;
     }
 
     const resolvedProvider = this.resolveProviderForThread(targetThreadId, providerId);
@@ -331,20 +390,32 @@ export class SessionManager {
       this.findLiveSessionByThreadId(targetThreadId, { providerId: resolvedProvider.id }) ||
       this.findLiveSessionByThreadId(targetThreadId);
     if (existing) {
+      this.updateSessionOptions(existing, composerOverrides);
       return existing;
     }
 
     const created = this.create({
       provider: resolvedProvider.id,
       cwd,
-      model,
+      ...composerOverrides,
       name,
       resumeSessionId: targetThreadId
     });
     return this.get(created.id);
   }
 
-  create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "" } = {}) {
+  preferredCodexRunnerMode({ resumeSessionId = "", permissionMode = "default" } = {}) {
+    return Boolean(
+      this.config.codexAppServerEnabled &&
+        this.appServerBridge &&
+        !String(resumeSessionId || "").trim() &&
+        !sessionRequiresJsonExec({ permissionMode })
+    )
+      ? "app_server"
+      : "json_exec";
+  }
+
+  create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "", reasoningEffort = "", permissionMode = "" } = {}) {
     const resolvedProvider = this.getProvider(provider);
     const id = crypto.randomUUID();
     const resolvedCwd = this.resolveCwd(cwd);
@@ -353,10 +424,12 @@ export class SessionManager {
       resolvedProvider.id === "codex" && !String(name || "").trim()
         ? ""
         : normalizeName(name, fallbackName);
+    const composerOptions = extractComposerOptions({ model, reasoningEffort, permissionMode });
     const spawnSpec = resolvedProvider.buildSpawnSpec({
       resumeSessionId: String(resumeSessionId || "").trim() || null,
       name: sessionName,
-      model: String(model || "").trim()
+      model: composerOptions.model,
+      permissionMode: composerOptions.permissionMode
     });
 
     if (resolvedProvider.id === "codex") {
@@ -367,7 +440,8 @@ export class SessionManager {
       const preferAppServer = Boolean(
         this.config.codexAppServerEnabled &&
           this.appServerBridge &&
-          !String(resumeSessionId || "").trim()
+          !String(resumeSessionId || "").trim() &&
+          !sessionRequiresJsonExec({ permissionMode: composerOptions.permissionMode })
       );
       const session = {
         id,
@@ -392,7 +466,9 @@ export class SessionManager {
         resumeSessionId: String(resumeSessionId || "").trim() || null,
         resumeBootstrapComplete: true,
         pendingResumeInput: "",
-        model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+        model: composerOptions.model || resolvedProvider.defaultModel || "",
+        reasoningEffort: composerOptions.reasoningEffort,
+        permissionMode: composerOptions.permissionMode,
         titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
         runnerMode: preferAppServer ? "app_server" : "json_exec",
         turnRunning: false,
@@ -458,6 +534,8 @@ export class SessionManager {
       resumeBootstrapComplete: !String(resumeSessionId || "").trim(),
       pendingResumeInput: "",
       model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+      reasoningEffort: composerOptions.reasoningEffort,
+      permissionMode: composerOptions.permissionMode,
       titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
       conversationState: createConversationState({
         sessionId: id,
@@ -483,6 +561,32 @@ export class SessionManager {
     this.seedConversationStateFromHistory(session, resolvedProvider);
     this.sessions.set(id, session);
     return this.serialize(session);
+  }
+
+  updateSessionOptions(target, input = {}) {
+    const session = typeof target === "string" ? this.get(target) : target;
+    if (!session) {
+      throw new Error(`Session not found: ${typeof target === "string" ? target : ""}`);
+    }
+
+    applyComposerOptionOverrides(session, input);
+    if (!String(session.model || "").trim()) {
+      session.model = this.getProvider(session.provider).defaultModel || "";
+    }
+    if (!String(session.reasoningEffort || "").trim()) {
+      session.reasoningEffort = "medium";
+    }
+    if (!String(session.permissionMode || "").trim()) {
+      session.permissionMode = "default";
+    }
+    if (session.provider === "codex") {
+      session.runnerMode = this.preferredCodexRunnerMode({
+        resumeSessionId: session.resumeSessionId,
+        permissionMode: session.permissionMode
+      });
+    }
+    session.updatedAt = nowIso();
+    return session;
   }
 
   pushSessionBuffer(session, text = "") {
@@ -1003,6 +1107,8 @@ export class SessionManager {
       inputPreview: session.inputPreview,
       resumeSessionId: session.resumeSessionId,
       model: session.model || "",
+      reasoningEffort: session.reasoningEffort || "medium",
+      permissionMode: session.permissionMode || "default",
       titleSource: session.titleSource || "",
       sessionType: session.sessionType || "main",
       parentThreadId: session.parentThreadId || "",
@@ -1240,7 +1346,8 @@ export class SessionManager {
     return provider.buildCommand({
       resumeSessionId: session.resumeSessionId,
       name: session.autoNamed ? "" : session.name,
-      model: session.model || ""
+      model: session.model || "",
+      permissionMode: session.permissionMode || "default"
     });
   }
 }

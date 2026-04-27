@@ -2,6 +2,24 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { applySessionInputEvents, normalizeSessionInputEvents, openSessionSseStream } from "../transport/index.js";
+import { readCodexDesktopDefaults } from "../sessions/shared/codexDesktopConfig.js";
+import { applyComposerOptionOverrides } from "../sessions/shared/composerOptions.js";
+import { CodexThreadStateStore } from "../sessions/state/CodexThreadStateStore.js";
+import { workspaceChangesInternals } from "./workspaceChanges.js";
+
+function extractSessionOptionOverrides(body = {}) {
+  const options = {};
+  if (Object.prototype.hasOwnProperty.call(body, "model")) {
+    options.model = body.model;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "reasoningEffort")) {
+    options.reasoningEffort = body.reasoningEffort;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "permissionMode")) {
+    options.permissionMode = body.permissionMode;
+  }
+  return options;
+}
 
 function hasStreamTurnInput(events = []) {
   return events.some((event) => {
@@ -22,6 +40,94 @@ function isTurnTerminalInSnapshot(session, turnId) {
     session?.threadSnapshot?.turns?.find((turn) => String(turn?.id || "") === targetTurnId)?.status || ""
   ).trim().toLowerCase();
   return status === "completed" || status === "failed" || status === "aborted" || status === "interrupted";
+}
+
+function emptyGitState(cwd = "") {
+  return {
+    available: false,
+    loading: false,
+    isGitRepo: false,
+    currentBranch: "",
+    dirty: false,
+    branches: [],
+    error: "",
+    cwd: String(cwd || "").trim()
+  };
+}
+
+function listComposerGitState(cwd = "") {
+  const normalizedCwd = String(cwd || "").trim();
+  if (!normalizedCwd) {
+    return emptyGitState("");
+  }
+  try {
+    const payload = workspaceChangesInternals.listGitBranches(normalizedCwd);
+    return {
+      available: true,
+      loading: false,
+      isGitRepo: Boolean(payload?.isGitRepo),
+      currentBranch: String(payload?.currentBranch || "").trim(),
+      dirty: Boolean(payload?.dirty),
+      branches: Array.isArray(payload?.branches) ? payload.branches : [],
+      error: "",
+      cwd: String(payload?.cwd || normalizedCwd).trim()
+    };
+  } catch (error) {
+    return {
+      ...emptyGitState(normalizedCwd),
+      error: error?.message || String(error)
+    };
+  }
+}
+
+function getCodexThreadStateStore(runtime) {
+  return new CodexThreadStateStore(runtime.config);
+}
+
+function buildThreadComposerState(runtime, providerId, threadId) {
+  const resolvedProviderId = String(providerId || "codex").trim().toLowerCase() || "codex";
+  const resolvedThreadId = String(threadId || "").trim();
+  if (!resolvedThreadId) {
+    throw new Error("threadId is required");
+  }
+
+  const codexDefaults = readCodexDesktopDefaults(runtime.config);
+  const threadState =
+    resolvedProviderId === "codex"
+      ? getCodexThreadStateStore(runtime).getThreadComposerState(resolvedThreadId)
+      : null;
+  const cwd = String(
+    threadState?.cwd ||
+      runtime.config.defaultCwd ||
+      ""
+  ).trim();
+
+  const model = String(
+    threadState?.model ||
+      codexDefaults.model ||
+      ""
+  ).trim();
+  const reasoningEffort = String(
+    threadState?.reasoningEffort ||
+      codexDefaults.reasoningEffort ||
+      "medium"
+  ).trim() || "medium";
+  const permissionMode = String(
+    threadState?.permissionMode ||
+      codexDefaults.permissionMode ||
+      "default"
+  ).trim() || "default";
+
+  return {
+    provider: resolvedProviderId,
+    threadId: resolvedThreadId,
+    model,
+    reasoningEffort,
+    permissionMode,
+    cwd,
+    git: listComposerGitState(cwd),
+    source: threadState ? "thread_state" : "defaults"
+  };
 }
 
 async function openInputStream(ctx, runtime, session, events) {
@@ -64,7 +170,7 @@ async function openInputStream(ctx, runtime, session, events) {
   }
 }
 
-function resolveThreadBackedInputSession(runtime, session, { providerId = "" } = {}) {
+function resolveThreadBackedInputSession(runtime, session, { providerId = "", model = "", reasoningEffort = "", permissionMode = "" } = {}) {
   if (!session) {
     return null;
   }
@@ -78,8 +184,10 @@ function resolveThreadBackedInputSession(runtime, session, { providerId = "" } =
   return runtime.sessionManager.ensureLiveSessionForThread(threadId, {
     providerId: String(providerId || session.provider || "").trim(),
     cwd: session.cwd,
-    model: session.model,
-    name: session.name
+    model: model || session.model,
+    name: session.name,
+    reasoningEffort: reasoningEffort || session.reasoningEffort,
+    permissionMode: permissionMode || session.permissionMode
   });
 }
 
@@ -177,6 +285,88 @@ export async function handleSessionRoute(ctx, runtime) {
     return true;
   }
 
+  if (ctx.path.startsWith("/api/threads/") && ctx.path.endsWith("/composer-state") && ctx.method === "GET") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+    const parts = ctx.path.split("/");
+    if (parts.length !== 6) {
+      runtime.json(ctx, 404, { error: "Not Found" });
+      return true;
+    }
+    try {
+      const providerId = decodeURIComponent(parts[3] || "").trim();
+      const threadId = decodeURIComponent(parts[4] || "").trim();
+      runtime.json(ctx, 200, buildThreadComposerState(runtime, providerId, threadId));
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err) });
+    }
+    return true;
+  }
+
+  if (ctx.path.startsWith("/api/threads/") && ctx.path.endsWith("/composer-state") && ctx.method === "PATCH") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+    const parts = ctx.path.split("/");
+    if (parts.length !== 6) {
+      runtime.json(ctx, 404, { error: "Not Found" });
+      return true;
+    }
+    try {
+      const providerId = decodeURIComponent(parts[3] || "").trim().toLowerCase();
+      const threadId = decodeURIComponent(parts[4] || "").trim();
+      if (providerId !== "codex") {
+        throw new Error("Only Codex thread composer state is supported");
+      }
+      if (!threadId) {
+        throw new Error("threadId is required");
+      }
+      const body = runtime.parseJson(await runtime.readBody(ctx.req));
+      const store = getCodexThreadStateStore(runtime);
+      const nextState = store.patchThreadComposerState(threadId, body || {});
+      if (!nextState) {
+        runtime.json(ctx, 404, { error: `Thread composer state not found: ${providerId}/${threadId}` });
+        return true;
+      }
+
+      const liveSession =
+        typeof runtime.sessionManager.findLiveSessionByThreadId === "function"
+          ? runtime.sessionManager.findLiveSessionByThreadId(threadId, { providerId })
+          : null;
+      if (liveSession) {
+        applyComposerOptionOverrides(liveSession, {
+          model: nextState.model,
+          reasoningEffort: nextState.reasoningEffort,
+          permissionMode: nextState.permissionMode
+        });
+        if (nextState.cwd) {
+          liveSession.cwd = nextState.cwd;
+        }
+      }
+
+      runtime.json(ctx, 200, {
+        provider: providerId,
+        threadId,
+        model: nextState.model || readCodexDesktopDefaults(runtime.config).model,
+        reasoningEffort: nextState.reasoningEffort || readCodexDesktopDefaults(runtime.config).reasoningEffort,
+        permissionMode: nextState.permissionMode || readCodexDesktopDefaults(runtime.config).permissionMode,
+        cwd: nextState.cwd || runtime.config.defaultCwd,
+        git: listComposerGitState(nextState.cwd || runtime.config.defaultCwd),
+        source: "thread_state"
+      });
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err) });
+    }
+    return true;
+  }
+
   if (ctx.path === "/api/archived-sessions" && ctx.method === "GET") {
     if (!runtime.requireAuthorized(ctx)) {
       return true;
@@ -255,17 +445,22 @@ export async function handleSessionRoute(ctx, runtime) {
     try {
       const body = runtime.parseJson(await runtime.readBody(ctx.req));
       const events = normalizeSessionInputEvents(body);
+      const optionOverrides = extractSessionOptionOverrides(body);
       if (!hasStreamTurnInput(events)) {
         runtime.json(ctx, 400, { error: "input-stream requires a non-empty input event" });
         return true;
       }
 
       const liveSession = resolveThreadBackedInputSession(runtime, compatibilitySession, {
-        providerId: String(compatibilitySession.provider || "").trim()
+        providerId: String(compatibilitySession.provider || "").trim(),
+        ...optionOverrides
       });
       if (!liveSession) {
         runtime.json(ctx, 404, { error: "Session not found" });
         return true;
+      }
+      if (typeof runtime.sessionManager.updateSessionOptions === "function") {
+        runtime.sessionManager.updateSessionOptions(liveSession, optionOverrides);
       }
 
       return await openInputStream(ctx, runtime, liveSession, events);
@@ -299,6 +494,7 @@ export async function handleSessionRoute(ctx, runtime) {
     try {
       const body = runtime.parseJson(await runtime.readBody(ctx.req));
       const events = normalizeSessionInputEvents(body);
+      const optionOverrides = extractSessionOptionOverrides(body);
       if (!hasStreamTurnInput(events)) {
         runtime.json(ctx, 400, { error: "input-stream requires a non-empty input event" });
         return true;
@@ -308,11 +504,16 @@ export async function handleSessionRoute(ctx, runtime) {
         providerId: String(body.provider || providerId || "").trim(),
         cwd: body.cwd,
         model: body.model,
-        name: body.name
+        name: body.name,
+        reasoningEffort: body.reasoningEffort,
+        permissionMode: body.permissionMode
       });
       if (!session) {
         runtime.json(ctx, 404, { error: "Session not found" });
         return true;
+      }
+      if (typeof runtime.sessionManager.updateSessionOptions === "function") {
+        runtime.sessionManager.updateSessionOptions(session, optionOverrides);
       }
 
       return await openInputStream(ctx, runtime, session, events);
