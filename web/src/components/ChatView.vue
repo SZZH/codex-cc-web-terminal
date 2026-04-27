@@ -53,6 +53,7 @@ const lightboxGesture = {
 let scrollAnimationFrame = 0;
 let scrollSettleTimer = 0;
 let streamResizeObserver = null;
+let streamMutationObserver = null;
 
 const chatShellStyle = computed(() => ({
   "--chat-vh": viewportHeight.value ? `${viewportHeight.value}px` : undefined,
@@ -390,6 +391,16 @@ function scrollToBottom(force = false) {
   });
 }
 
+function settleScrollToBottom(force = false) {
+  scrollToBottom(force);
+  if (typeof window === "undefined") {
+    return;
+  }
+  for (const delay of [60, 160, 360, 720]) {
+    window.setTimeout(() => scrollToBottom(force), delay);
+  }
+}
+
 function handleInput(event) {
   emit("update:draft", event.target.value);
   resizeComposer(event, { keepBottom: true });
@@ -579,17 +590,37 @@ function handleWindowKeydown(event) {
 }
 
 function observeMessageContentSize() {
-  if (typeof ResizeObserver === "undefined" || !messageListEl.value) {
+  const messageList = messageListEl.value;
+  if (!messageList) {
     return;
   }
-  streamResizeObserver?.disconnect();
-  streamResizeObserver = new ResizeObserver(() => {
-    if (isPinnedToBottom.value) {
-      scrollToBottom(true);
+
+  const keepBottomOnContentChange = () => {
+    if (isPinnedToBottom.value || isNearBottom(messageList, BOTTOM_THRESHOLD * 3)) {
+      settleScrollToBottom(true);
     }
-  });
-  for (const child of messageListEl.value.children) {
-    streamResizeObserver.observe(child);
+  };
+
+  if (typeof ResizeObserver !== "undefined") {
+    streamResizeObserver?.disconnect();
+    streamResizeObserver = new ResizeObserver(keepBottomOnContentChange);
+    streamResizeObserver.observe(messageList);
+    for (const child of messageList.children) {
+      streamResizeObserver.observe(child);
+    }
+  }
+
+  if (typeof MutationObserver !== "undefined") {
+    streamMutationObserver?.disconnect();
+    streamMutationObserver = new MutationObserver(() => {
+      observeMessageContentSize();
+      keepBottomOnContentChange();
+    });
+    streamMutationObserver.observe(messageList, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
   }
 }
 
@@ -613,7 +644,7 @@ watch(
   () => {
     isPinnedToBottom.value = true;
     observeMessageContentSize();
-    scrollToBottom(true);
+    settleScrollToBottom(true);
   },
   { flush: "post", immediate: true }
 );
@@ -638,7 +669,7 @@ onMounted(() => {
   }
   syncViewportMetrics();
   observeMessageContentSize();
-  scrollToBottom(true);
+  settleScrollToBottom(true);
   resizeComposer(composerEl.value, { keepBottom: true });
 });
 
@@ -652,6 +683,7 @@ onBeforeUnmount(() => {
     window.clearTimeout?.(scrollSettleTimer);
   }
   streamResizeObserver?.disconnect();
+  streamMutationObserver?.disconnect();
 });
 </script>
 
