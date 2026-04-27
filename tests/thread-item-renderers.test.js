@@ -107,6 +107,43 @@ test("thread item renderer summarizes process counts by type", () => {
   assert.match(summary.label, /工具 1/);
 });
 
+test("thread view model collapses process segments for terminal turns", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-history",
+        completedAt: "2026-04-27T12:00:00.000Z",
+        items: [
+          { id: "cmd-1", kind: "CommandExecution", status: "completed", summary: "npm test" },
+          { id: "msg-1", kind: "AgentMessage", text: "完成" }
+        ]
+      },
+      {
+        id: "turn-running",
+        status: "inProgress",
+        items: [
+          { id: "cmd-2", kind: "CommandExecution", status: "completed", summary: "npm run dev" }
+        ]
+      },
+      {
+        id: "turn-completed",
+        status: "completed",
+        items: [
+          { id: "cmd-3", kind: "CommandExecution", status: "completed", summary: "npm run build" }
+        ]
+      }
+    ]
+  });
+
+  const historyProcess = viewModel.turns[0].segments.find((segment) => segment.kind === "process");
+  const runningProcess = viewModel.turns[1].segments.find((segment) => segment.kind === "process");
+  const completedProcess = viewModel.turns[2].segments.find((segment) => segment.kind === "process");
+
+  assert.equal(historyProcess.defaultCollapsed, true);
+  assert.equal(runningProcess.defaultCollapsed, false);
+  assert.equal(completedProcess.defaultCollapsed, true);
+});
+
 test("thread view model keeps workspace changes anchored to the file-change turn", () => {
   const viewModel = buildThreadViewModel({
     turns: [

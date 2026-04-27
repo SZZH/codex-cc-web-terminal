@@ -138,6 +138,11 @@ function createSegment(kind, items = [], turn = {}, index = 0) {
   };
 }
 
+function isTerminalTurn(turn = {}) {
+  const status = String(turn?.status || "").trim().toLowerCase();
+  return Boolean(turn?.completedAt) || ["completed", "failed", "aborted"].includes(status);
+}
+
 function applySegmentCollapseDefaults(segments = [], turn = {}) {
   const hasPrimary = segments.some((segment) => segment.kind === "primary");
   return segments.map((segment, index) => {
@@ -147,7 +152,7 @@ function applySegmentCollapseDefaults(segments = [], turn = {}) {
     const hasPrimaryAfter = segments.slice(index + 1).some((candidate) => candidate.kind === "primary");
     const processSummary = summarizeProcessItems(segment.items);
     const defaultCollapsed =
-      String(turn?.status || "").trim() === "completed"
+      isTerminalTurn(turn)
         ? true
         : hasPrimary
           ? hasPrimaryAfter || segments.slice(0, index).some((candidate) => candidate.kind === "primary")
