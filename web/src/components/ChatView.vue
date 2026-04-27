@@ -34,6 +34,7 @@ const composerEl = ref(null);
 const viewportHeight = ref(0);
 const keyboardInset = ref(0);
 const isPinnedToBottom = ref(true);
+const shouldAutoStickToBottom = ref(true);
 const isTouchDevice = ref(false);
 const lightboxImage = ref(null);
 const lightboxScale = ref(1);
@@ -51,6 +52,8 @@ const lightboxGesture = {
   startMidpointY: 0
 };
 let scrollAnimationFrame = 0;
+let initialScrollTimer = 0;
+let autoScrollFrame = 0;
 let streamResizeObserver = null;
 let streamMutationObserver = null;
 
@@ -365,14 +368,16 @@ function scrollToBottom(force = false) {
     if (!el) {
       return;
     }
-    if (!force && !isPinnedToBottom.value) {
+    if (!force && !shouldAutoStickToBottom.value && !isPinnedToBottom.value) {
       return;
     }
 
     const applyScroll = () => {
+      autoScrollFrame = 2;
       el.scrollTop = el.scrollHeight;
       messageBottomEl.value?.scrollIntoView({ block: "end" });
       isPinnedToBottom.value = true;
+      shouldAutoStickToBottom.value = true;
     };
 
     applyScroll();
@@ -387,6 +392,18 @@ function scrollToBottom(force = false) {
 
 function settleScrollToBottom(force = false) {
   scrollToBottom(force);
+}
+
+function settleInitialScrollToBottom() {
+  settleScrollToBottom(true);
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.clearTimeout?.(initialScrollTimer);
+  initialScrollTimer = window.setTimeout(() => {
+    shouldAutoStickToBottom.value = true;
+    settleScrollToBottom(true);
+  }, 260);
 }
 
 function handleInput(event) {
@@ -422,7 +439,18 @@ function handlePrimaryAction() {
 }
 
 function handleStreamScroll(event) {
-  isPinnedToBottom.value = isNearBottom(event.target);
+  const nearBottom = isNearBottom(event.target);
+  if (nearBottom) {
+    isPinnedToBottom.value = true;
+    shouldAutoStickToBottom.value = true;
+    return;
+  }
+  if (autoScrollFrame > 0) {
+    autoScrollFrame -= 1;
+    return;
+  }
+  isPinnedToBottom.value = false;
+  shouldAutoStickToBottom.value = false;
 }
 
 function openLightboxImage(url, alt = "image") {
@@ -584,7 +612,7 @@ function observeMessageContentSize() {
   }
 
   const keepBottomOnContentChange = () => {
-    if (isPinnedToBottom.value || isNearBottom(messageList, BOTTOM_THRESHOLD * 3)) {
+    if (shouldAutoStickToBottom.value || isPinnedToBottom.value || isNearBottom(messageList, BOTTOM_THRESHOLD * 3)) {
       settleScrollToBottom(true);
     }
   };
@@ -631,8 +659,9 @@ watch(
   () => `${props.sessionKey}::${props.openToken}`,
   () => {
     isPinnedToBottom.value = true;
+    shouldAutoStickToBottom.value = true;
     observeMessageContentSize();
-    settleScrollToBottom(true);
+    settleInitialScrollToBottom();
   },
   { flush: "post", immediate: true }
 );
@@ -668,6 +697,8 @@ onBeforeUnmount(() => {
     window.visualViewport?.removeEventListener("resize", handleViewportChange);
     window.visualViewport?.removeEventListener("scroll", handleViewportChange);
     window.cancelAnimationFrame?.(scrollAnimationFrame);
+    window.clearTimeout?.(initialScrollTimer);
+    autoScrollFrame = 0;
   }
   streamResizeObserver?.disconnect();
   streamMutationObserver?.disconnect();
@@ -752,6 +783,9 @@ onBeforeUnmount(() => {
 .chat-shell {
   height: var(--chat-vh, 100dvh);
   min-height: var(--chat-vh, 100dvh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background:
     radial-gradient(circle at top, rgba(255, 255, 255, 0.5), transparent 34%),
     linear-gradient(180deg, rgba(248, 244, 239, 0.98) 0%, rgba(243, 237, 231, 0.95) 100%),
@@ -830,15 +864,17 @@ onBeforeUnmount(() => {
 }
 
 .chat-screen {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  min-height: calc(100dvh - 72px);
+  min-height: 0;
   min-width: 0;
   overflow-x: hidden;
 }
 
 .message-stream {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
