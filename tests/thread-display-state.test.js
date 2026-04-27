@@ -219,6 +219,64 @@ test("display state keeps persisted historical base while appending same-thread 
   assert.equal(snapshot.turns[1].items[0].text, "继续追问");
 });
 
+test("display state maps user image payload into thread items for history rendering", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    liveConversation: {
+      turns: [
+        {
+          id: "turn-images",
+          user: {
+            text: "帮我看下这张图",
+            ts: "2026-04-22T00:00:03.000Z",
+            content: [
+              { type: "input_text", text: "帮我看下这张图" },
+              { type: "input_image", image_url: "data:image/png;base64,abc", alt: "示例图" }
+            ]
+          },
+          assistant: { status: "completed", body: [] }
+        }
+      ]
+    },
+    threadId: "thread-images",
+    liveSessionMeta: { resumeSessionId: "thread-images" },
+    threadMeta: { resumeSessionId: "thread-images" }
+  });
+
+  const userItem = snapshot.turns[0].items[0];
+  assert.equal(userItem.kind, "UserMessage");
+  assert.equal(userItem.payload.content.length, 2);
+  assert.equal(userItem.payload.content[1].type, "input_image");
+  assert.equal(userItem.payload.content[1].image_url, "data:image/png;base64,abc");
+});
+
+test("display state maps assistant image body blocks into image items", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    liveConversation: {
+      turns: [
+        {
+          id: "turn-assistant-image",
+          user: { text: "生成一张图", ts: "2026-04-22T00:00:03.000Z" },
+          assistant: {
+            status: "completed",
+            body: [
+              { id: "body-image-1", kind: "image", payload: { url: "/api/files/demo.png", alt: "结果图" } },
+              { id: "body-text-1", kind: "markdown", text: "图已经生成好了" }
+            ]
+          }
+        }
+      ]
+    },
+    threadId: "thread-assistant-image",
+    liveSessionMeta: { resumeSessionId: "thread-assistant-image" },
+    threadMeta: { resumeSessionId: "thread-assistant-image" }
+  });
+
+  assert.equal(snapshot.turns[0].items[1].kind, "ImageView");
+  assert.equal(snapshot.turns[0].items[1].payload.url, "/api/files/demo.png");
+  assert.equal(snapshot.turns[0].items[2].kind, "AgentMessage");
+  assert.equal(snapshot.turns[0].items[2].text, "图已经生成好了");
+});
+
 test("display state contract: same-thread continuation keeps runtime assistant text visible without refresh while preserving a single live turn", () => {
   const snapshot = buildDisplayedThreadSnapshot({
     persistedSnapshot: {

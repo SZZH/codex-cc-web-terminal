@@ -5,6 +5,7 @@ import path from "node:path";
 import pty from "node-pty";
 
 import { HistoricalSessionService } from "./sessions/history/HistoricalSessionService.js";
+import { CodexSidebarService } from "./sessions/history/CodexSidebarService.js";
 import {
   createTurnCompletedDelta,
   createTurnCreatedDelta,
@@ -49,6 +50,11 @@ function normalizeName(value, fallback) {
   return text || fallback;
 }
 
+function isManuallyNamedSession(session) {
+  const titleSource = String(session?.titleSource || "").trim().toLowerCase();
+  return titleSource === "custom_name" || titleSource === "user_provided";
+}
+
 function buildThreadProjection(session) {
   const projection = createLegacyThreadProjection({
     threadId: String(session?.resumeSessionId || session?.threadSnapshot?.threadId || session?.id || ""),
@@ -80,6 +86,7 @@ export class SessionManager {
     this.sessions = new Map();
     this.providers = new Map(buildProviders(config).map((provider) => [provider.id, provider]));
     this.historyService = new HistoricalSessionService(config);
+    this.codexSidebarService = new CodexSidebarService(config);
 
     if (this.appServerBridge) {
       this.appServerBridge.on("notification", (msg) => this.handleAppServerNotification(msg));
@@ -134,17 +141,16 @@ export class SessionManager {
 
   listAll() {
     const liveSessions = this.listLiveSessions();
-    const liveByResumeId = new Set(
-      liveSessions.map((session) => this.resumeKey(session.provider, session.resumeSessionId)).filter(Boolean)
-    );
-    const historySessions = this.listHistoricalSessions({ archived: false }).filter((session) => {
-      return !liveByResumeId.has(this.resumeKey(session.provider, session.resumeSessionId));
-    });
+    const historySessions = this.listHistoricalSessions({ archived: false });
     return [...liveSessions, ...historySessions].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   }
 
   listArchived() {
     return this.listHistoricalSessions({ archived: true });
+  }
+
+  listProjectGroups() {
+    return this.codexSidebarService.listProjectGroups();
   }
 
   get(id) {
@@ -271,7 +277,10 @@ export class SessionManager {
     const id = crypto.randomUUID();
     const resolvedCwd = this.resolveCwd(cwd);
     const fallbackName = `${resolvedProvider.fallbackPrefix}-${this.sessions.size + 1}`;
-    const sessionName = normalizeName(name, fallbackName);
+    const sessionName =
+      resolvedProvider.id === "codex" && !String(name || "").trim()
+        ? ""
+        : normalizeName(name, fallbackName);
     const spawnSpec = resolvedProvider.buildSpawnSpec({
       resumeSessionId: String(resumeSessionId || "").trim() || null,
       name: sessionName,
@@ -847,6 +856,7 @@ export class SessionManager {
 
     session.name = normalizeName(name, session.fallbackName || session.name);
     session.autoNamed = false;
+    session.titleSource = "custom_name";
     session.updatedAt = nowIso();
     this.persistSessionName(session);
     return this.serialize(session);
@@ -1102,7 +1112,7 @@ export class SessionManager {
   }
 
   persistSessionName(session) {
-    if (!session || session.autoNamed) {
+    if (!session || session.autoNamed || !isManuallyNamedSession(session)) {
       return false;
     }
 
@@ -1126,7 +1136,7 @@ export class SessionManager {
   }
 
   scheduleDeferredNamePersistence(session) {
-    if (!session || session.autoNamed || session.resumeSessionId) {
+    if (!session || session.autoNamed || session.resumeSessionId || !isManuallyNamedSession(session)) {
       return;
     }
 
@@ -1137,7 +1147,8 @@ export class SessionManager {
       name: session.name,
       createdAt: session.createdAt,
       autoNamed: false,
-      resumeSessionId: null
+      resumeSessionId: null,
+      titleSource: session.titleSource || ""
     };
 
     let attempts = 0;

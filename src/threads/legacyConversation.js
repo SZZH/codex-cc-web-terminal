@@ -135,7 +135,10 @@ export function deriveConversationStateFromThreadSnapshot(snapshot, { sessionId 
         ? {
             id: String(userItem.id || ""),
             text: String(userItem.text || userItem.summary || ""),
-            ts: toIso(userItem.updatedAt || userItem.createdAt)
+            ts: toIso(userItem.updatedAt || userItem.createdAt),
+            content: clone(userItem.payload?.content || []),
+            images: clone(userItem.payload?.images || []),
+            local_images: clone(userItem.payload?.local_images || [])
           }
         : null,
       assistant: {
@@ -161,6 +164,16 @@ export function deriveConversationStateFromThreadSnapshot(snapshot, { sessionId 
 }
 
 function mapConversationBodyItem(block = {}) {
+  if (String(block.kind || "").trim().toLowerCase() === "image") {
+    return createThreadItem({
+      id: String(block.id || `body:${Math.random().toString(16).slice(2)}`),
+      kind: THREAD_ITEM_KIND.IMAGE_VIEW,
+      createdAt: toIso(block.ts),
+      updatedAt: toIso(block.ts),
+      summary: String(block.payload?.alt || "image"),
+      payload: clone(block.payload || {})
+    });
+  }
   return createThreadItem({
     id: String(block.id || `body:${Math.random().toString(16).slice(2)}`),
     kind: THREAD_ITEM_KIND.AGENT_MESSAGE,
@@ -211,7 +224,12 @@ export function deriveThreadSnapshotFromConversationState(conversationState, { t
           createdAt: toIso(turn.user.ts),
           updatedAt: toIso(turn.user.ts),
           text: String(turn.user.text || ""),
-          summary: String(turn.user.text || "")
+          summary: String(turn.user.text || ""),
+          payload: {
+            content: clone(turn.user.content || []),
+            images: clone(turn.user.images || []),
+            local_images: clone(turn.user.local_images || [])
+          }
         })
       );
     }

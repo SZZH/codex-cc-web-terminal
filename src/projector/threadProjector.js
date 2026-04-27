@@ -67,10 +67,15 @@ function materializeOverlay(turn, overlay, completedAt) {
 function upsertUserMessage(turn, event) {
   const id = `user:${turn.id}`;
   const text = String(event.payload?.text ?? "");
+  const content = Array.isArray(event.payload?.content) ? JSON.parse(JSON.stringify(event.payload.content)) : [];
   const existing = turn.items.find((item) => item.id === id);
   if (existing) {
     existing.text = text;
     existing.completedAt = event.ts;
+    existing.payload = {
+      ...(existing.payload || {}),
+      content
+    };
     return existing;
   }
 
@@ -79,7 +84,10 @@ function upsertUserMessage(turn, event) {
     id,
     text,
     createdAt: event.ts,
-    completedAt: event.ts
+    completedAt: event.ts,
+    payload: {
+      content
+    }
   };
   turn.items.unshift(created);
   return created;

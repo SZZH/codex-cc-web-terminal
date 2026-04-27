@@ -239,7 +239,7 @@ function contentImageItems(content) {
       continue;
     }
     const imageUrl = String(item.image_url || item.url || item.path || "").trim();
-    if ((item.type === "input_image" || item.type === "image" || item.type === "output_image") && imageUrl) {
+    if ((item.type === "input_image" || item.type === "image" || item.type === "output_image" || item.type === "local_image") && imageUrl) {
       items.push({
         url: imageUrl,
         alt: String(item.alt || item.name || "image").trim() || "image"
@@ -253,6 +253,33 @@ function contentImageItems(content) {
   return items;
 }
 
+function extractImagePathCandidatesFromText(text) {
+  const source = String(text || "");
+  if (!source) {
+    return [];
+  }
+
+  const matches = [
+    ...source.matchAll(/`((?:\/|[A-Za-z]:[\\/])[^\n`]*?\.(?:png|jpe?g|gif|webp|bmp|svg))`/gi),
+    ...source.matchAll(/((?:\/|[A-Za-z]:[\\/])\S+?\.(?:png|jpe?g|gif|webp|bmp|svg))/gi)
+  ];
+
+  const seen = new Set();
+  const results = [];
+  for (const match of matches) {
+    const candidate = String(match?.[1] || "").trim().replace(/[),.;!?]+$/g, "");
+    if (!candidate || seen.has(candidate) || !isRenderableImageUrl(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
+    results.push({
+      url: candidate,
+      alt: "image"
+    });
+  }
+  return results;
+}
+
 function isRenderableImageUrl(url) {
   const value = String(url || "").trim();
   if (!value) {
@@ -261,7 +288,9 @@ function isRenderableImageUrl(url) {
   return (
     /^data:image\//i.test(value) ||
     /^https?:\/\//i.test(value) ||
+    /^file:\/\//i.test(value) ||
     /^blob:/i.test(value) ||
+    /^(?:[A-Za-z]:[\\/]|\/)/.test(value) ||
     value.startsWith("/uploads/") ||
     value.startsWith("/api/")
   );
@@ -309,6 +338,16 @@ function extractImagePayloadItems(payload) {
 
   if (payload.message?.role === "user" && Array.isArray(payload.message?.content)) {
     images.push(...contentImageItems(payload.message.content));
+  }
+
+  const textCandidates = [
+    payload.text,
+    payload.message,
+    payload.summary,
+    typeof payload.content === "string" ? payload.content : ""
+  ];
+  for (const candidate of textCandidates) {
+    images.push(...extractImagePathCandidatesFromText(candidate));
   }
 
   const seen = new Set();

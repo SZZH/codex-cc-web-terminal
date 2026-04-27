@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { execFileSync } from "node:child_process";
 
 import { SessionManager } from "../src/sessionManager.js";
+import { CodexSidebarService } from "../src/sessions/history/CodexSidebarService.js";
 import { createConversationState } from "../src/sessions/conversation/state.js";
 import { createEmptyConversationState, applyDelta } from "../src/sessions/normalize/turnState.js";
 import { createTurnCreatedDelta, normalizeRecordToDeltas } from "../src/sessions/normalize/turnDeltas.js";
@@ -274,6 +276,26 @@ test("rename persists custom names for resumable sessions", () => {
 
   const payload = JSON.parse(fs.readFileSync(path.join(config.dataDir, "session-names.json"), "utf8"));
   assert.equal(payload["codex:thread-rename-1"], "新的会话标题");
+
+  const metaPayload = JSON.parse(fs.readFileSync(path.join(config.dataDir, "session-name-meta.json"), "utf8"));
+  assert.equal(metaPayload["codex:thread-rename-1"].source, "manual");
+});
+
+test("auto-generated first-user-input titles do not persist as custom names", () => {
+  const { manager, config } = createManager();
+  const session = manager.create({
+    provider: "codex",
+    cwd: process.cwd(),
+    resumeSessionId: "thread-auto-title-1"
+  });
+  const live = manager.get(session.id);
+
+  live.name = "回复：你好";
+  live.titleSource = "first_user_input";
+  live.autoNamed = false;
+
+  assert.equal(manager.persistSessionName(live), false);
+  assert.equal(fs.existsSync(path.join(config.dataDir, "session-names.json")), false);
 });
 
 test("findRunningLiveSessionByResume returns the latest running live session", async () => {
@@ -299,13 +321,14 @@ test("findRunningLiveSessionByResume returns the latest running live session", a
 test("historical sessions can be listed, archived, restored and deleted", () => {
   const rootDir = createTempDir();
   const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
-  const config = createBaseConfig(rootDir, { codexSessionsDir });
+  const codexArchivedSessionsDir = path.join(rootDir, ".codex", "archived_sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir, codexArchivedSessionsDir });
   const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
 
-  const sessionIndexPath = path.join(path.dirname(codexSessionsDir), "session_index.jsonl");
+  const sessionIndexPath = path.join(rootDir, ".codex", "session_index.jsonl");
   writeJsonl(sessionIndexPath, [{ id: "thread-h1", thread_name: "Indexed Codex Thread" }]);
 
-  const historyFile = path.join(codexSessionsDir, "project-a", "thread-h1.jsonl");
+  const historyFile = path.join(codexArchivedSessionsDir, "project-a", "thread-h1.jsonl");
   writeJsonl(historyFile, [
     {
       type: "session_meta",
@@ -355,6 +378,300 @@ test("historical sessions can be listed, archived, restored and deleted", () => 
 
   assert.equal(manager.deleteHistoricalSession("codex", "thread-h1"), true);
   assert.equal(fs.existsSync(historyFile), false);
+});
+
+test("codex historical list reflects sessions without filtering subagent or non-indexed items", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const codexArchivedSessionsDir = path.join(rootDir, ".codex", "archived_sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir, codexArchivedSessionsDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  writeJsonl(path.join(rootDir, ".codex", "session_index.jsonl"), [
+    { id: "thread-main-1", thread_name: "主线程标题" },
+    { id: "thread-subagent-1", thread_name: "子线程标题" }
+  ]);
+
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "24", "thread-main-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-main-1", cwd: rootDir },
+      timestamp: "2026-04-24T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "主线程问题" },
+      timestamp: "2026-04-24T10:00:01.000Z"
+    }
+  ]);
+
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "24", "thread-subagent-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: {
+        id: "thread-subagent-1",
+        cwd: rootDir,
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: "thread-main-1",
+              agent_nickname: "Worker",
+              agent_role: "worker"
+            }
+          }
+        }
+      },
+      timestamp: "2026-04-24T10:00:02.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "子线程问题" },
+      timestamp: "2026-04-24T10:00:03.000Z"
+    }
+  ]);
+
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "24", "thread-live-only.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-live-only", cwd: rootDir },
+      timestamp: "2026-04-24T10:00:04.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "live 目录里的线程不该出现在历史列表" },
+      timestamp: "2026-04-24T10:00:05.000Z"
+    }
+  ]);
+
+  const sessions = manager.listHistoricalSessions();
+
+  assert.deepEqual(
+    [...sessions.map((session) => session.resumeSessionId)].sort(),
+    ["thread-live-only", "thread-main-1", "thread-subagent-1"]
+  );
+  assert.equal(sessions.find((session) => session.resumeSessionId === "thread-main-1")?.name, "主线程标题");
+  assert.equal(sessions.find((session) => session.resumeSessionId === "thread-subagent-1")?.name, "子线程标题");
+  assert.equal(sessions.find((session) => session.resumeSessionId === "thread-live-only")?.name, "");
+});
+
+test("codex historical list includes both sessions and archived sources when present", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const codexArchivedSessionsDir = path.join(rootDir, ".codex", "archived_sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir, codexArchivedSessionsDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  writeJsonl(path.join(rootDir, ".codex", "session_index.jsonl"), [
+    { id: "thread-old-1", thread_name: "旧线程", updated_at: "2026-04-24T10:00:00.000Z" },
+    { id: "thread-new-1", thread_name: "新线程", updated_at: "2026-04-24T11:00:00.000Z" }
+  ]);
+
+  writeJsonl(path.join(codexArchivedSessionsDir, "2026", "04", "24", "thread-old-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-old-1", cwd: rootDir },
+      timestamp: "2026-04-24T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "旧线程问题" },
+      timestamp: "2026-04-24T10:00:01.000Z"
+    }
+  ]);
+
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "24", "thread-new-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-new-1", cwd: rootDir },
+      timestamp: "2026-04-24T11:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "新线程问题" },
+      timestamp: "2026-04-24T11:00:01.000Z"
+    }
+  ]);
+
+  const sessions = manager.listHistoricalSessions();
+
+  assert.deepEqual(sessions.map((session) => session.resumeSessionId), ["thread-new-1", "thread-old-1"]);
+  assert.equal(sessions[0].name, "新线程");
+  assert.equal(sessions[1].name, "旧线程");
+});
+
+test("codex historical cache refreshes when a nested session file is added", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  writeJsonl(path.join(rootDir, ".codex", "session_index.jsonl"), [
+    { id: "thread-before-1", thread_name: "缓存前线程" },
+    { id: "thread-after-1", thread_name: "缓存后线程" }
+  ]);
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "24", "thread-before-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-before-1", cwd: rootDir },
+      timestamp: "2026-04-24T10:00:00.000Z"
+    }
+  ]);
+
+  assert.equal(manager.listHistoricalSessions().length, 1);
+
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "27", "thread-after-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-after-1", cwd: rootDir },
+      timestamp: "2026-04-27T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "新建线程问题" },
+      timestamp: "2026-04-27T10:00:01.000Z"
+    }
+  ]);
+
+  const sessions = manager.listHistoricalSessions();
+  assert.deepEqual(
+    [...sessions.map((session) => session.resumeSessionId)].sort(),
+    ["thread-after-1", "thread-before-1"]
+  );
+  assert.equal(manager.getHistoricalMessages("codex", "thread-after-1").messages.length, 1);
+});
+
+test("codex historical list keeps stale sessions instead of applying a recency cutoff", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const config = createBaseConfig(rootDir, { codexSessionsDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  writeJsonl(path.join(rootDir, ".codex", "session_index.jsonl"), [
+    { id: "thread-fresh-1", thread_name: "近期线程", updated_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString() },
+    { id: "thread-stale-1", thread_name: "过期线程", updated_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString() }
+  ]);
+
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "24", "thread-fresh-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-fresh-1", cwd: rootDir },
+      timestamp: "2026-04-24T10:00:00.000Z"
+    }
+  ]);
+  writeJsonl(path.join(codexSessionsDir, "2026", "04", "24", "thread-stale-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-stale-1", cwd: rootDir },
+      timestamp: "2026-04-24T10:00:00.000Z"
+    }
+  ]);
+
+  const sessions = manager.listHistoricalSessions();
+  assert.deepEqual(sessions.map((session) => session.resumeSessionId), ["thread-fresh-1", "thread-stale-1"]);
+});
+
+test("legacy low-signal custom names do not override real historical titles", () => {
+  const rootDir = createTempDir();
+  const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
+  const codexArchivedSessionsDir = path.join(rootDir, ".codex", "archived_sessions");
+  const dataDir = path.join(rootDir, "data");
+  const config = createBaseConfig(rootDir, { codexSessionsDir, codexArchivedSessionsDir, dataDir });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  fs.writeFileSync(
+    path.join(dataDir, "session-names.json"),
+    JSON.stringify(
+      {
+        "codex:thread-legacy-name-1": "回复：你好"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  writeJsonl(path.join(rootDir, ".codex", "session_index.jsonl"), [
+    { id: "thread-legacy-name-1", thread_name: "发现一个标题错位问题，帮我确认真实历史。", updated_at: "2026-04-13T10:00:01.000Z" }
+  ]);
+
+  const historyFile = path.join(codexArchivedSessionsDir, "project-a", "thread-legacy-name-1.jsonl");
+  writeJsonl(historyFile, [
+    {
+      type: "session_meta",
+      payload: {
+        id: "thread-legacy-name-1",
+        cwd: rootDir
+      },
+      timestamp: "2026-04-13T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        message: "发现一个标题错位问题，帮我确认真实历史。"
+      },
+      timestamp: "2026-04-13T10:00:01.000Z"
+    }
+  ]);
+
+  const reloadedManager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+  const historySessions = reloadedManager.listHistoricalSessions();
+
+  assert.equal(historySessions.length, 1);
+  assert.equal(historySessions[0].name, "发现一个标题错位问题，帮我确认真实历史。");
+  assert.equal(historySessions[0].titleSource, "codex_session_index");
+});
+
+test("codex list view prefers canonical thread titles over local custom names", () => {
+  const rootDir = createTempDir();
+  const codexArchivedSessionsDir = path.join(rootDir, ".codex", "archived_sessions");
+  const dataDir = path.join(rootDir, "data");
+  const config = createBaseConfig(rootDir, { codexArchivedSessionsDir, dataDir });
+
+  fs.writeFileSync(
+    path.join(dataDir, "session-names.json"),
+    JSON.stringify(
+      {
+        "codex:thread-canonical-1": "我自己改过的标题"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(dataDir, "session-name-meta.json"),
+    JSON.stringify(
+      {
+        "codex:thread-canonical-1": { source: "manual", updatedAt: "2026-04-24T10:00:00.000Z" }
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  writeJsonl(path.join(rootDir, ".codex", "session_index.jsonl"), [
+    { id: "thread-canonical-1", thread_name: "Codex 真标题", updated_at: "2026-04-24T10:00:00.000Z" }
+  ]);
+  writeJsonl(path.join(codexArchivedSessionsDir, "2026", "04", "24", "thread-canonical-1.jsonl"), [
+    {
+      type: "session_meta",
+      payload: { id: "thread-canonical-1", cwd: rootDir },
+      timestamp: "2026-04-24T10:00:00.000Z"
+    },
+    {
+      type: "event_msg",
+      payload: { type: "user_message", message: "随便一条问题" },
+      timestamp: "2026-04-24T10:00:01.000Z"
+    }
+  ]);
+
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+  const sessions = manager.listHistoricalSessions();
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].name, "Codex 真标题");
+  assert.equal(sessions[0].titleSource, "codex_session_index");
 });
 
 test("conversation history seeding does not leak turns between empty and non-empty sessions", () => {
@@ -408,7 +725,7 @@ test("conversation history seeding does not leak turns between empty and non-emp
   assert.equal(emptyState.threadId, "thread-empty");
 });
 
-test("listAll deduplicates historical sessions shadowed by live resumable sessions", () => {
+test("listAll keeps both live and persisted entries for the same resumable thread", () => {
   const rootDir = createTempDir();
   const codexSessionsDir = path.join(rootDir, ".codex", "sessions");
   const config = createBaseConfig(rootDir, { codexSessionsDir });
@@ -426,8 +743,117 @@ test("listAll deduplicates historical sessions shadowed by live resumable sessio
 
   manager.create({ provider: "codex", cwd: rootDir, resumeSessionId: "thread-shadow", name: "Live Shadow" });
   const all = manager.listAll().filter((item) => String(item.resumeSessionId || "") === "thread-shadow");
-  assert.equal(all.length, 1);
-  assert.equal(all[0].kind, "live");
+  assert.equal(all.length, 2);
+  assert.deepEqual(
+    [...all.map((item) => item.kind)].sort(),
+    ["history", "live"]
+  );
+});
+
+test("codex sidebar keeps all non-archived threads and empty saved projects", () => {
+  const rootDir = createTempDir();
+  const codexDir = path.join(rootDir, ".codex");
+  const globalStatePath = path.join(codexDir, ".codex-global-state.json");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  fs.mkdirSync(codexDir, { recursive: true });
+
+  fs.writeFileSync(
+    globalStatePath,
+    JSON.stringify(
+      {
+        "project-order": [
+          "/workspace/project-a",
+          "/workspace/project-b",
+          "/workspace/project-c",
+          "/workspace/project-d"
+        ],
+        "electron-saved-workspace-roots": [
+          "/workspace/project-a",
+          "/workspace/project-b",
+          "/workspace/project-c",
+          "/workspace/project-d"
+        ],
+        "electron-persisted-atom-state": {
+          "sidebar-collapsed-groups": {
+            "/workspace/project-b": true
+          }
+        }
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const oldSec = nowSec - 9 * 24 * 60 * 60;
+  const recentSec = nowSec - 2 * 60 * 60;
+
+  const sqliteInit = `
+    create table threads (
+      id text primary key,
+      rollout_path text not null,
+      created_at integer not null,
+      updated_at integer not null,
+      source text not null,
+      model_provider text not null,
+      cwd text not null,
+      title text not null,
+      sandbox_policy text not null,
+      approval_mode text not null,
+      tokens_used integer not null default 0,
+      has_user_event integer not null default 0,
+      archived integer not null default 0,
+      archived_at integer,
+      git_sha text,
+      git_branch text,
+      git_origin_url text,
+      cli_version text not null default '',
+      first_user_message text not null default '',
+      agent_nickname text,
+      agent_role text,
+      memory_mode text not null default 'enabled',
+      model text,
+      reasoning_effort text,
+      agent_path text,
+      created_at_ms integer,
+      updated_at_ms integer
+    );
+    insert into threads values
+    ('thread-front-1','','${recentSec}','${recentSec}','vscode','openai','/workspace/project-a','回复在吗','danger','full',0,1,0,null,null,null,null,'','','','','enabled',null,null,null,null,null),
+    ('thread-front-sub','','${recentSec}','${recentSec}','{"subagent":{"thread_spawn":{"parent_thread_id":"thread-front-1"}}}','openai','/workspace/project-a','子线程','danger','full',0,1,0,null,null,null,null,'','','','','enabled',null,null,null,null,null),
+    ('thread-sub2-1','','${recentSec}','${recentSec}','vscode','openai','/workspace/project-d','改为透传','danger','full',0,1,0,null,null,null,null,'','','','','enabled',null,null,null,null,null),
+    ('thread-auto-old','','${oldSec}','${oldSec}','vscode','openai','/workspace/project-b','旧 project-b 线程','danger','full',0,1,0,null,null,null,null,'','','','','enabled',null,null,null,null,null),
+    ('thread-ai-old','','${oldSec}','${oldSec}','vscode','openai','/workspace/project-c','旧 ai 线程','danger','full',0,1,0,null,null,null,null,'','','','','enabled',null,null,null,null,null);
+  `;
+
+  execFileSync("sqlite3", [stateDbPath, sqliteInit], { stdio: "ignore" });
+
+  const service = new CodexSidebarService({
+    home: rootDir,
+    codexGlobalStatePath: globalStatePath,
+    codexStateDbPath: stateDbPath
+  });
+  const groups = service.listProjectGroups();
+
+  assert.deepEqual(groups.map((group) => group.name), [
+    "project-a",
+    "project-b",
+    "project-c",
+    "project-d"
+  ]);
+  assert.equal(groups[0].sessions.length, 2);
+  assert.deepEqual(
+    groups[0].sessions.map((session) => session.name),
+    ["回复在吗", "子线程"]
+  );
+  assert.equal(groups[1].sessions.length, 1);
+  assert.equal(groups[1].collapsed, true);
+  assert.equal(groups[1].sessions[0].name, "旧 project-b 线程");
+  assert.equal(groups[2].sessions.length, 1);
+  assert.equal(groups[2].sessions[0].name, "旧 ai 线程");
+  assert.equal(groups[3].sessions.length, 1);
+  assert.equal(groups[3].sessions[0].name, "改为透传");
 });
 
 test("historical payload does not get overridden by a poorer live conversation with a higher version", () => {

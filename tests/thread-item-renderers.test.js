@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { normalizeImageUrl } from "../web/src/lib/image-url.js";
 import { normalizeThreadItem, summarizeProcessItems } from "../web/src/lib/thread-item-renderers.js";
 
 test("thread item renderer normalizes process items with explicit type title and status label", () => {
@@ -32,6 +33,61 @@ test("thread item renderer keeps command process body in code-friendly raw form"
   assert.equal(item.category, "process");
   assert.match(item.body, /npm run check/);
   assert.match(item.body, /node --version/);
+});
+
+test("thread item renderer extracts image payload for structured image items", () => {
+  const item = normalizeThreadItem({
+    id: "img-1",
+    kind: "ImageGeneration",
+    payload: {
+      url: "https://example.com/demo.png",
+      alt: "demo image"
+    }
+  });
+
+  assert.equal(item.imageUrl, "https://example.com/demo.png");
+  assert.equal(item.imageAlt, "demo image");
+  assert.equal(item.body, "");
+});
+
+test("thread item renderer extracts user input images from nested content payloads", () => {
+  const item = normalizeThreadItem({
+    id: "user-1",
+    kind: "UserMessage",
+    text: "看下这张图",
+    payload: {
+      content: [
+        { type: "input_text", text: "看下这张图" },
+        { type: "input_image", image_url: "https://example.com/input-a.png", alt: "截图 A" },
+        { type: "local_image", path: "/api/files/input-b.png", name: "截图 B" }
+      ]
+    }
+  });
+
+  assert.equal(item.category, "user");
+  assert.equal(item.imageUrl, "https://example.com/input-a.png");
+  assert.equal(item.imageAlt, "截图 A");
+  assert.equal(item.imageItems.length, 2);
+  assert.deepEqual(
+    item.imageItems.map((image) => image.url),
+    ["https://example.com/input-a.png", "/api/files/input-b.png"]
+  );
+  assert.match(item.body, /看下这张图/);
+});
+
+test("image url normalization proxies absolute local image paths through backend route", () => {
+  assert.equal(
+    normalizeImageUrl("/Users/demo/Desktop/example.png"),
+    "/api/local-file-image?path=%2FUsers%2Fdemo%2FDesktop%2Fexample.png"
+  );
+  assert.equal(
+    normalizeImageUrl("file:///Users/demo/Desktop/example.png"),
+    "/api/local-file-image?path=%2FUsers%2Fdemo%2FDesktop%2Fexample.png"
+  );
+  assert.equal(
+    normalizeImageUrl("C:\\Users\\demo\\Desktop\\example.png"),
+    "/api/local-file-image?path=C%3A%5CUsers%5Cdemo%5CDesktop%5Cexample.png"
+  );
 });
 
 test("thread item renderer summarizes process counts by type", () => {

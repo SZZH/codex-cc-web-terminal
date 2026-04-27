@@ -4,8 +4,6 @@ import path from "node:path";
 import {
   parseHistoricalFile,
   extractHistoricalImageMessagesFromFile,
-  isSystemTemporaryCwd,
-  summarizeHistoricalSession,
   walkJsonlFiles
 } from "./historicalParsing.js";
 import { buildConversationStateFromHistory } from "../conversation/state.js";
@@ -13,27 +11,14 @@ import { CONVERSATION_PROTOCOL_VERSION } from "../conversation/protocol.js";
 import { nowIso } from "../shared/text.js";
 import { buildThreadSnapshotFromFile, deriveConversationStateFromThreadSnapshot } from "../../threads/index.js";
 
+const CODEX_PROJECT_LIST_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
 function readJsonFile(filePath, fallbackValue) {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch {
     return fallbackValue;
   }
-}
-
-function formatShortTimestamp(value, timezone) {
-  const formatter = new Intl.DateTimeFormat("en-AU", {
-    timeZone: String(timezone || "UTC"),
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    timeZoneName: "short"
-  });
-  const parts = formatter.formatToParts(new Date(value));
-  const get = (type) => parts.find((part) => part.type === type)?.value || "00";
-  return `${get("month")}-${get("day")} ${get("hour")}:${get("minute")} ${get("timeZoneName")}`;
 }
 
 function customNameKey(providerId, resumeSessionId) {
@@ -52,12 +37,30 @@ function normalizeCustomNameKey(key) {
   return text.includes(":") ? text : customNameKey("codex", text);
 }
 
+function isLowSignalLegacyCustomName(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return true;
+  }
+
+  if (/^回复[:：]?\s*/.test(text) && text.length <= 16) {
+    return true;
+  }
+
+  if (/^(hi|hello|你好|哈哈|1|ok)$/i.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
 export class HistoricalSessionService {
   constructor(config) {
     this.config = config;
     this.customNamesPath = path.join(this.config.dataDir, "session-names.json");
+    this.customNameMetaPath = path.join(this.config.dataDir, "session-name-meta.json");
     this.archivedSessionsPath = path.join(this.config.dataDir, "archived-sessions.json");
-    this.codexSessionIndexPath = path.join(path.dirname(this.config.codexSessionsDir), "session_index.jsonl");
+    this.codexSessionIndexPath = this.config.codexSessionIndexPath || path.join(this.config.home, ".codex", "session_index.jsonl");
     this.codexSessionIndexCache = { mtimeMs: -1, size: -1, byId: new Map() };
     this.providerEntriesCache = new Map();
     this.historicalMessagesCache = new Map();
@@ -65,6 +68,11 @@ export class HistoricalSessionService {
       Object.entries(readJsonFile(this.customNamesPath, {}))
         .map(([key, value]) => [normalizeCustomNameKey(key), value])
         .filter((entry) => entry[0] && entry[1])
+    );
+    this.customNameMeta = new Map(
+      Object.entries(readJsonFile(this.customNameMetaPath, {}))
+        .map(([key, value]) => [normalizeCustomNameKey(key), value])
+        .filter((entry) => entry[0] && entry[1] && typeof entry[1] === "object")
     );
     this.archivedSessions = new Map(
       Object.entries(readJsonFile(this.archivedSessionsPath, {}))
@@ -80,7 +88,16 @@ export class HistoricalSessionService {
       return "";
     }
     this.ensureCodexSessionIndexCache();
-    return String(this.codexSessionIndexCache.byId.get(id) || "").trim();
+    return String(this.codexSessionIndexCache.byId.get(id)?.threadName || "").trim();
+  }
+
+  getCodexThreadUpdatedAt(resumeSessionId) {
+    const id = String(resumeSessionId || "").trim();
+    if (!id) {
+      return "";
+    }
+    this.ensureCodexSessionIndexCache();
+    return String(this.codexSessionIndexCache.byId.get(id)?.updatedAt || "").trim();
   }
 
   hasCodexSessionIndexEntry(resumeSessionId) {
@@ -107,8 +124,9 @@ export class HistoricalSessionService {
             const record = JSON.parse(line);
             const recordId = String(record?.id || "").trim();
             const threadName = String(record?.thread_name || "").trim();
+            const updatedAt = String(record?.updated_at || "").trim();
             if (recordId && threadName) {
-              byId.set(recordId, threadName);
+              byId.set(recordId, { threadName, updatedAt });
             }
           } catch {
             // Ignore malformed rows.
@@ -123,18 +141,23 @@ export class HistoricalSessionService {
 
   listHistoricalSessions(providers, { archived = null } = {}) {
     return [...providers]
-      .flatMap((provider) => this.listHistoricalSessionsForProvider(provider, { archived }))
+      .flatMap((provider) => this.listHistoricalSessionsForProvider(provider, { archived, canonicalTitles: true, listMode: true }))
       .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   }
 
-  listHistoricalSessionsForProvider(provider, { archived = null } = {}) {
+  listHistoricalSessionsForProvider(
+    provider,
+    { archived = null, includeSubagents = true, canonicalTitles = false, listMode = false } = {}
+  ) {
     const byResumeId = new Map();
     for (const entry of this.scanHistoricalSessionsForProvider(provider)) {
       const entryArchived = this.isArchived(provider.id, entry.resumeSessionId);
       if (archived !== null && entryArchived !== archived) {
         continue;
       }
-      const session = this.buildHistoricalSession(provider, entry, entryArchived ? "archived" : "history");
+      const session = this.buildHistoricalSession(provider, entry, entryArchived ? "archived" : "history", {
+        canonicalTitle: canonicalTitles && provider.id === "codex"
+      });
       const existing = byResumeId.get(entry.resumeSessionId);
       if (!existing || existing.updatedAt < session.updatedAt) {
         byResumeId.set(entry.resumeSessionId, session);
@@ -146,20 +169,17 @@ export class HistoricalSessionService {
   scanHistoricalSessionsForProvider(provider) {
     const providerCacheKey = String(provider?.id || "").trim();
     try {
-      const dirStat = fs.statSync(provider.sessionsDir);
+      const sourceDirs = this.getProviderHistorySourceDirs(provider, { includeArchived: true });
+      const sourceSignature = this.buildHistorySourceSignature(sourceDirs);
       const cached = this.providerEntriesCache.get(providerCacheKey);
-      if (
-        cached &&
-        cached.mtimeMs === dirStat.mtimeMs &&
-        cached.sessionsDir === provider.sessionsDir
-      ) {
+      if (cached && cached.sourceSignature === sourceSignature) {
         return cached.entries;
       }
     } catch {
       // Ignore cache lookup failures and rescan below.
     }
 
-    const files = walkJsonlFiles(provider.sessionsDir);
+    const files = this.getProviderHistorySourceDirs(provider, { includeArchived: true }).flatMap((dirPath) => walkJsonlFiles(dirPath));
     const entries = [];
 
     for (const filePath of files) {
@@ -172,14 +192,6 @@ export class HistoricalSessionService {
         }
         const isCodexCliSession =
           /codex_cli/i.test(String(parsed.originator || "")) || /^cli$/i.test(String(parsed.sourceType || ""));
-        if (provider.id === "codex") {
-          const inIndex = this.hasCodexSessionIndexEntry(id);
-          const keepByTemp = isSystemTemporaryCwd(parsed.cwd);
-          const keepByCli = isCodexCliSession;
-          if (!inIndex && !keepByTemp && !keepByCli) {
-            continue;
-          }
-        }
         const indexedTitle = provider.id === "codex" ? this.getCodexThreadName(id) : "";
         const parsedTitle = String(parsed.title || "").trim();
         const effectiveTitle = String(indexedTitle || parsedTitle).trim();
@@ -199,23 +211,81 @@ export class HistoricalSessionService {
           sessionType: parsed.sessionType === "subagent" ? "subagent" : "main",
           parentThreadId: String(parsed.parentThreadId || "").trim(),
           agentRole: String(parsed.agentRole || "").trim(),
-          agentNickname: String(parsed.agentNickname || "").trim()
+          agentNickname: String(parsed.agentNickname || "").trim(),
+          indexed: Boolean(indexedTitle),
+          indexedUpdatedAt: provider.id === "codex" ? this.getCodexThreadUpdatedAt(id) : "",
+          sourceRoot: filePath.startsWith(String(provider.sessionsDir || "")) ? "sessions" : "archived"
         });
       } catch {
         // Ignore malformed or unreadable session files.
       }
     }
     try {
-      const dirStat = fs.statSync(provider.sessionsDir);
+      const sourceSignature = this.buildHistorySourceSignature(this.getProviderHistorySourceDirs(provider, { includeArchived: true }));
       this.providerEntriesCache.set(providerCacheKey, {
-        sessionsDir: provider.sessionsDir,
-        mtimeMs: dirStat.mtimeMs,
+        sourceSignature,
         entries
       });
     } catch {
       // Ignore cache population failures.
     }
     return entries;
+  }
+
+  getProviderHistorySourceDirs(provider, { includeArchived = false } = {}) {
+    const dirs = [provider.sessionsDir];
+    if (includeArchived && provider.id === "codex" && provider.historyDir && provider.historyDir !== provider.sessionsDir) {
+      dirs.push(provider.sessionsDir);
+      dirs.push(provider.historyDir);
+    }
+    return [...new Set(dirs.map((dirPath) => String(dirPath || "").trim()).filter(Boolean))];
+  }
+
+  buildHistorySourceSignature(sourceDirs) {
+    return sourceDirs
+      .map((dirPath) => {
+        const parts = [];
+        const queue = [dirPath];
+        while (queue.length) {
+          const current = queue.pop();
+          let stat;
+          try {
+            stat = fs.statSync(current);
+          } catch {
+            parts.push(`${current}:missing`);
+            continue;
+          }
+
+          parts.push(`${current}:${stat.mtimeMs}:${stat.size}`);
+          if (!stat.isDirectory()) {
+            continue;
+          }
+
+          let entries = [];
+          try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+          } catch {
+            continue;
+          }
+
+          for (const entry of entries) {
+            const fullPath = path.join(current, entry.name);
+            if (entry.isDirectory() || (entry.isFile() && fullPath.endsWith(".jsonl"))) {
+              queue.push(fullPath);
+            }
+          }
+        }
+        return parts.sort().join(",");
+      })
+      .join("|");
+  }
+
+  isRecentCodexProjectListEntry(entry) {
+    const updatedAt = Date.parse(String(entry?.indexedUpdatedAt || entry?.stat?.mtime || ""));
+    if (!Number.isFinite(updatedAt)) {
+      return false;
+    }
+    return Date.now() - updatedAt <= CODEX_PROJECT_LIST_MAX_AGE_MS;
   }
 
   buildHistoricalTruthBundle(provider, entry) {
@@ -315,8 +385,8 @@ export class HistoricalSessionService {
     return {
       session: historicalSession,
       messages,
-      turns: conversation.turns || [],
-      backgroundAgents: conversation.backgroundAgents || [],
+      turns: conversationState.turns || [],
+      backgroundAgents: conversationState.backgroundAgents || [],
       threadSnapshot,
       liveOverlay: null,
       conversation: conversationState,
@@ -324,30 +394,23 @@ export class HistoricalSessionService {
     };
   }
 
-  buildHistoricalSession(provider, entry, kind = "history") {
-    const fallbackSavedName = `Saved ${path.basename(entry.cwd || this.config.defaultCwd)} ${formatShortTimestamp(
-      entry.stat.mtime,
-      this.config.timezone
-    )}`;
-    const summary = summarizeHistoricalSession(entry, fallbackSavedName);
-    const customName = this.getCustomName(provider.id, entry.resumeSessionId);
-    const finalName = customName || summary.title;
-    const finalTitleSource = customName ? "custom_name" : summary.titleSource;
+  buildHistoricalSession(provider, entry, kind = "history", { canonicalTitle = false } = {}) {
+    const rawName = String(entry.title || "").trim();
     return {
       id: `history:${provider.id}:${entry.resumeSessionId}`,
       provider: provider.id,
       providerLabel: provider.label,
       cliLabel: provider.cliLabel,
-      name: finalName,
-      titleSource: finalTitleSource,
+      name: rawName,
+      titleSource: rawName ? (entry.titleSource || "") : "",
       cwd: entry.cwd,
       kind,
       status: kind === "archived" ? "archived" : "saved",
       createdAt: entry.stat.birthtime.toISOString(),
-      updatedAt: entry.stat.mtime.toISOString(),
+      updatedAt: String(entry.indexedUpdatedAt || "").trim() || entry.stat.mtime.toISOString(),
       exitCode: null,
       autoNamed: false,
-      inputPreview: summary.inputPreview,
+      inputPreview: "",
       resumeSessionId: entry.resumeSessionId,
       archivedAt: this.getArchivedAt(provider.id, entry.resumeSessionId),
       sessionType: entry.sessionType === "subagent" ? "subagent" : "main",
@@ -389,6 +452,13 @@ export class HistoricalSessionService {
     fs.writeFileSync(this.customNamesPath, JSON.stringify(payload, null, 2), "utf8");
   }
 
+  saveCustomNameMeta() {
+    const payload = Object.fromEntries(
+      [...this.customNameMeta.entries()].sort((left, right) => left[0].localeCompare(right[0]))
+    );
+    fs.writeFileSync(this.customNameMetaPath, JSON.stringify(payload, null, 2), "utf8");
+  }
+
   saveArchivedSessions() {
     const payload = Object.fromEntries(
       [...this.archivedSessions.entries()].sort((left, right) => left[0].localeCompare(right[0]))
@@ -397,7 +467,22 @@ export class HistoricalSessionService {
   }
 
   getCustomName(providerId, resumeSessionId) {
-    return this.customNames.get(customNameKey(providerId, resumeSessionId)) || null;
+    const key = customNameKey(providerId, resumeSessionId);
+    const value = String(this.customNames.get(key) || "").trim();
+    if (!value) {
+      return null;
+    }
+
+    const meta = this.customNameMeta.get(key) || null;
+    if (meta?.source === "manual") {
+      return value;
+    }
+
+    if (isLowSignalLegacyCustomName(value)) {
+      return null;
+    }
+
+    return value;
   }
 
   setCustomName(providerId, resumeSessionId, name) {
@@ -405,14 +490,24 @@ export class HistoricalSessionService {
     const value = String(name || "").trim();
     if (!key.endsWith(":") && value) {
       this.customNames.set(key, value);
+      this.customNameMeta.set(key, {
+        source: "manual",
+        updatedAt: nowIso()
+      });
       this.saveCustomNames();
+      this.saveCustomNameMeta();
     }
   }
 
   removeCustomName(providerId, resumeSessionId) {
     const key = customNameKey(providerId, resumeSessionId);
-    if (this.customNames.delete(key)) {
+    const removedName = this.customNames.delete(key);
+    const removedMeta = this.customNameMeta.delete(key);
+    if (removedName) {
       this.saveCustomNames();
+    }
+    if (removedMeta) {
+      this.saveCustomNameMeta();
     }
   }
 
@@ -438,7 +533,10 @@ export class HistoricalSessionService {
 
   getHistoricalSession(provider, resumeSessionId, { archived = null } = {}) {
     return (
-      this.listHistoricalSessionsForProvider(provider, { archived }).find(
+      this.listHistoricalSessionsForProvider(provider, {
+        archived,
+        includeSubagents: true
+      }).find(
         (session) => session.resumeSessionId === String(resumeSessionId || "").trim()
       ) || null
     );

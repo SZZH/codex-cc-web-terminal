@@ -19,10 +19,13 @@ const suppressToggleUntil = ref(0);
 function buildInitialExpandedSet(groups, activeSessionId) {
   const next = new Set();
   const activeGroup = groups.find((group) => group.sessions.some((session) => session.id === activeSessionId));
-  if (activeGroup?.name) {
+  if (activeGroup?.name && !activeGroup?.collapsed) {
     next.add(activeGroup.name);
   }
   for (const group of groups.slice(0, activeGroup ? 2 : 3)) {
+    if (group?.collapsed) {
+      continue;
+    }
     next.add(group.name);
   }
   return next;
@@ -63,7 +66,7 @@ function groupSubtitle(group) {
   const count = group.sessions.length;
   const latest = group.sessions[0]?.updatedAt;
   const latestText = latest ? props.formatRelativeTime(latest) : "";
-  return latestText ? `最近 ${latestText}` : count ? `${count} 个会话` : "暂无更新时间";
+  return latestText ? `最近 ${latestText}` : count ? `${count} 个会话` : "";
 }
 
 function closeMenu() {
@@ -167,6 +170,7 @@ onBeforeUnmount(() => {
           <span class="session-group-toggle" :class="{ expanded: isExpanded(group.name) }" aria-hidden="true">⌄</span>
         </button>
         <div v-show="isExpanded(group.name)" class="session-group-body">
+          <p v-if="!group.sessions.length" class="session-row-placeholder">暂无对话</p>
           <button
             v-for="session in group.sessions"
             :key="session.id"
@@ -176,7 +180,7 @@ onBeforeUnmount(() => {
             @click="emit('open', session)"
           >
             <div class="session-row-body">
-              <p class="session-row-title">{{ session.displayTitle }}</p>
+              <p class="session-row-title">{{ session.displayTitle || "暂无对话" }}</p>
               <time class="session-row-time">{{ formatRelativeTime(session.updatedAt) }}</time>
             </div>
           </button>
@@ -429,6 +433,14 @@ onBeforeUnmount(() => {
     background-color 0.16s ease,
     border-color 0.16s ease,
     box-shadow 0.16s ease;
+}
+
+.session-row-placeholder {
+  margin: 0;
+  padding: 2px 12px 6px;
+  color: rgba(162, 149, 138, 0.96);
+  font-size: 14px;
+  line-height: 1.4;
 }
 
 .session-row:hover {

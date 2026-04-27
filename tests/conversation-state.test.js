@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   applyConversationDeltas,
+  buildConversationStateFromThreadSnapshot,
   buildConversationStateFromHistory,
   createConversationState
 } from "../src/sessions/conversation/state.js";
@@ -111,4 +112,35 @@ test("conversation delta payload emits versioned delta entries", () => {
   assert.equal(payload.thread.continuation.sessionId, "session-1");
   assert.equal(payload.deltas.length, 1);
   assert.equal(payload.deltas[0].version, 2);
+});
+
+test("thread snapshot -> conversation preserves user image payload", () => {
+  const conversation = buildConversationStateFromThreadSnapshot({
+    threadId: "thread-images",
+    turns: [
+      {
+        id: "turn-1",
+        status: "completed",
+        items: [
+          {
+            id: "user-1",
+            kind: "UserMessage",
+            text: "看这张图",
+            payload: {
+              content: [
+                { type: "input_text", text: "看这张图" },
+                { type: "input_image", image_url: "data:image/png;base64,abc", alt: "截图" }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(conversation.turns.length, 1);
+  assert.equal(conversation.turns[0].user.text, "看这张图");
+  assert.equal(conversation.turns[0].user.content.length, 2);
+  assert.equal(conversation.turns[0].user.content[1].type, "input_image");
+  assert.equal(conversation.turns[0].user.content[1].image_url, "data:image/png;base64,abc");
 });

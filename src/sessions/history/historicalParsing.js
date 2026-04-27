@@ -17,6 +17,42 @@ import {
 } from "./historicalText.js";
 import { createTurnCompletedDelta, createTurnCreatedDelta, normalizeRecordToDeltas } from "../normalize/turnDeltas.js";
 
+function buildUserContentFromRecord(record = {}) {
+  const payload = record?.payload && typeof record.payload === "object" ? record.payload : {};
+  if (Array.isArray(payload.content) && payload.content.length) {
+    return payload.content;
+  }
+
+  const content = [];
+  const text = String(payload.message || "").trim();
+  if (text) {
+    content.push({ type: "input_text", text });
+  }
+  for (const image of Array.isArray(payload.images) ? payload.images : []) {
+    const imageUrl = String(image?.image_url || image?.url || "").trim();
+    if (!imageUrl) {
+      continue;
+    }
+    content.push({
+      type: "input_image",
+      image_url: imageUrl,
+      alt: String(image?.alt || image?.name || "image").trim() || "image"
+    });
+  }
+  for (const image of Array.isArray(payload.local_images) ? payload.local_images : []) {
+    const path = String(image?.path || image?.url || "").trim();
+    if (!path) {
+      continue;
+    }
+    content.push({
+      type: "local_image",
+      path,
+      name: String(image?.name || image?.alt || "image").trim() || "image"
+    });
+  }
+  return content;
+}
+
 function basenameWithoutExtension(filePath) {
   return path.basename(filePath, path.extname(filePath));
 }
@@ -139,16 +175,25 @@ export function parseHistoricalFile(filePath) {
 
 export function summarizeHistoricalSession(entry, fallbackSavedName) {
   const canonicalTitle = String(entry.title || "").trim();
+  const derivedTitle =
+    extractHistoricalTitleCandidate(entry.firstUserMessage || "") ||
+    extractHistoricalTitleCandidate(entry.firstInput || "") ||
+    extractHistoricalTitleCandidate(entry.fallbackInput || "");
+  const effectiveTitle = canonicalTitle || derivedTitle || fallbackSavedName;
   return {
-    title: canonicalTitle || fallbackSavedName,
-    titleSource: canonicalTitle ? (entry.titleSource || "session_meta") : "fallback_saved_name",
+    title: effectiveTitle,
+    titleSource: canonicalTitle
+      ? (entry.titleSource || "session_meta")
+      : derivedTitle
+        ? "first_user_input"
+        : "fallback_saved_name",
     inputPreview:
       extractHistoricalSummaryCandidate(
         entry.messages || [],
-        canonicalTitle || fallbackSavedName,
+        effectiveTitle,
         entry.firstUserMessage || entry.firstInput || entry.fallbackInput || ""
       ) ||
-      extractHistoricalTitleCandidate(canonicalTitle) ||
+      extractHistoricalTitleCandidate(effectiveTitle) ||
       entry.firstInput ||
       entry.fallbackInput ||
       "",
@@ -195,7 +240,22 @@ export function buildHistoricalConversationFromFile(filePath) {
       }
       turnIndex += 1;
       activeTurnId = `history-turn-${turnIndex}`;
-      Object.assign(state, applyDelta(state, createTurnCreatedDelta(activeTurnId, String(record?.payload?.message || "").trim(), timestamp)));
+      Object.assign(
+        state,
+        applyDelta(
+          state,
+          createTurnCreatedDelta(
+            activeTurnId,
+            {
+              text: String(record?.payload?.message || "").trim(),
+              content: buildUserContentFromRecord(record),
+              images: Array.isArray(record?.payload?.images) ? record.payload.images : [],
+              local_images: Array.isArray(record?.payload?.local_images) ? record.payload.local_images : []
+            },
+            timestamp
+          )
+        )
+      );
       continue;
     }
     if (activeTurnId && (isTurnCompletedRecord || isTurnFailedRecord || isTurnInterruptedRecord)) {

@@ -1,3 +1,5 @@
+import { isRenderableImageUrl, normalizeImageUrl } from "./image-url.js";
+
 function makeId(prefix = "part") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -8,20 +10,6 @@ function asText(value) {
 
 function safeObject(value) {
   return value && typeof value === "object" ? value : {};
-}
-
-function isRenderableImageUrl(url) {
-  const value = String(url || "").trim();
-  if (!value) {
-    return false;
-  }
-  return (
-    /^data:image\//i.test(value) ||
-    /^https?:\/\//i.test(value) ||
-    /^blob:/i.test(value) ||
-    value.startsWith("/uploads/") ||
-    value.startsWith("/api/")
-  );
 }
 
 function normalizeKind(value) {
@@ -180,7 +168,7 @@ export function normalizeMessagePartEvent(payload, sessionId = "") {
         role,
         partType: "image",
         payload: {
-          url: asText(part.url),
+          url: normalizeImageUrl(part.url),
           alt: asText(part.alt) || "image"
         },
         ts,

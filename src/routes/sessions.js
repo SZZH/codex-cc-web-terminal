@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import { applySessionInputEvents, normalizeSessionInputEvents, openSessionSseStream } from "../transport/index.js";
 
 function hasStreamTurnInput(events = []) {
@@ -81,12 +84,49 @@ function resolveThreadBackedInputSession(runtime, session, { providerId = "" } =
 }
 
 export async function handleSessionRoute(ctx, runtime) {
+  if (ctx.path === "/api/local-file-image" && ctx.method === "GET") {
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+
+    try {
+      const url = new URL(ctx.url, "http://localhost");
+      const requestedPath = String(url.searchParams.get("path") || "").trim();
+      const filePath = requestedPath
+        ? path.normalize(path.isAbsolute(requestedPath) ? requestedPath : path.resolve(requestedPath))
+        : "";
+
+      if (!filePath) {
+        runtime.json(ctx, 400, { error: "Missing image path" });
+        return true;
+      }
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        runtime.json(ctx, 404, { error: "Image file not found" });
+        return true;
+      }
+
+      const contentType = runtime.contentTypeForFile(filePath);
+      if (!String(contentType || "").startsWith("image/")) {
+        runtime.json(ctx, 400, { error: "Only image files are supported" });
+        return true;
+      }
+
+      runtime.serveFile(ctx, filePath, contentType);
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err) });
+    }
+    return true;
+  }
+
   if (ctx.path === "/api/sessions" && ctx.method === "GET") {
     if (!runtime.requireAuthorized(ctx)) {
       return true;
     }
 
-    runtime.json(ctx, 200, { sessions: runtime.sessionManager.listAll() });
+    runtime.json(ctx, 200, {
+      sessions: runtime.sessionManager.listAll(),
+      projectGroups: runtime.sessionManager.listProjectGroups()
+    });
     return true;
   }
 

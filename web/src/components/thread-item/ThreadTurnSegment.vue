@@ -31,14 +31,12 @@ watch(
       </button>
 
       <div v-if="!collapsed" class="turn-process-items">
-        <div class="turn-process-fade turn-process-fade-top" aria-hidden="true"></div>
         <ThreadItemRenderer
           v-for="item in segment.items"
           :key="item.id"
           :item="item"
           :assistant-name="assistantName"
         />
-        <div class="turn-process-fade turn-process-fade-bottom" aria-hidden="true"></div>
       </div>
     </div>
 

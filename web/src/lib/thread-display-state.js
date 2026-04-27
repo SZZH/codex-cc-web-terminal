@@ -17,19 +17,46 @@ function collectAssistantBodyText(turn = {}) {
 function mapConversationTurnToThreadTurn(turn = {}) {
   const items = [];
   const userText = String(turn?.user?.text || "").trim();
-  if (userText) {
+  const userPayload = {
+    content: Array.isArray(turn?.user?.content) ? JSON.parse(JSON.stringify(turn.user.content)) : [],
+    images: Array.isArray(turn?.user?.images) ? JSON.parse(JSON.stringify(turn.user.images)) : [],
+    local_images: Array.isArray(turn?.user?.local_images) ? JSON.parse(JSON.stringify(turn.user.local_images)) : []
+  };
+  if (userText || userPayload.content.length || userPayload.images.length || userPayload.local_images.length) {
     items.push({
       id: `${turn.id || "turn"}-user`,
       kind: "UserMessage",
       text: userText,
-      status: "completed"
+      status: "completed",
+      payload: userPayload
     });
   }
 
-  const assistantText = collectAssistantBodyText(turn);
+  const assistantBody = Array.isArray(turn?.assistant?.body) ? turn.assistant.body : [];
+  let assistantText = "";
+  let assistantTextIndex = 0;
+  for (const block of assistantBody) {
+    const blockKind = String(block?.kind || "markdown").trim().toLowerCase();
+    if (blockKind === "image" && String(block?.payload?.url || "").trim()) {
+      items.push({
+        id: String(block?.id || `${turn.id || "turn"}-assistant-image-${items.length}`),
+        kind: "ImageView",
+        status: String(turn?.assistant?.status || "completed"),
+        payload: JSON.parse(JSON.stringify(block?.payload || {})),
+        summary: String(block?.payload?.alt || "image")
+      });
+      continue;
+    }
+    const text = String(block?.text || "").trim();
+    if (!text) {
+      continue;
+    }
+    assistantText = assistantText ? `${assistantText}\n\n${text}` : text;
+    assistantTextIndex += 1;
+  }
   if (assistantText) {
     items.push({
-      id: `${turn.id || "turn"}-assistant`,
+      id: `${turn.id || "turn"}-assistant-${assistantTextIndex || "body"}`,
       kind: "AgentMessage",
       text: assistantText,
       status: String(turn?.assistant?.status || "completed")
@@ -141,7 +168,16 @@ function mergeTurnItems(existingItems = [], incomingItems = []) {
       id: String(existing?.id || incoming?.id || ""),
       kind: existing?.kind || incoming?.kind,
       text: shouldReplaceText ? incomingText || existingText : existingText || incomingText,
-      status: turnStatusRank(incoming?.status) > turnStatusRank(existing?.status) ? incoming?.status : existing?.status
+      status: turnStatusRank(incoming?.status) > turnStatusRank(existing?.status) ? incoming?.status : existing?.status,
+      payload: {
+        ...(existing?.payload || {}),
+        ...(incoming?.payload || {})
+      },
+      meta: {
+        ...(existing?.meta || {}),
+        ...(incoming?.meta || {})
+      },
+      summary: String(incoming?.summary || existing?.summary || "").trim() || null
     };
   }
   return nextItems;

@@ -12,6 +12,19 @@
   --accent: #8b7f73;
   --user-bg: #d9cec3;
   --user-text: #ffffff;
+  --process-panel: linear-gradient(180deg, rgba(255, 253, 250, 0.96), rgba(247, 242, 236, 0.94));
+  --process-border: rgba(216, 206, 197, 0.96);
+  --process-strong-border: rgba(205, 193, 182, 0.96);
+  --process-code-bg: linear-gradient(180deg, #f7f2ec 0%, #f2ece5 100%);
+  --process-code-border: rgba(210, 200, 190, 0.96);
+  --process-code-text: #65594f;
+  --process-code-muted: #9c9085;
+  --process-text: #7a6d62;
+  --process-text-soft: #918478;
+  --process-pill-text: #76695f;
+  --process-status-text: #96897d;
+  --process-shell-text: #73675d;
+  --process-shell-icon: #9a8f84;
 }
 
 * { box-sizing: border-box; }
