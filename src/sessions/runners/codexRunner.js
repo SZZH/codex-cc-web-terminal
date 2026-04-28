@@ -209,6 +209,7 @@ export function handleAppServerTurnResult(manager, session, result) {
 
 export function buildCodexJsonExecArgs(manager, session, prompt) {
   const args = ["exec"];
+  const isResume = Boolean(String(session.resumeSessionId || "").trim());
   if (session.resumeSessionId) {
     args.push("resume", "--all", session.resumeSessionId);
   }
@@ -220,7 +221,9 @@ export function buildCodexJsonExecArgs(manager, session, prompt) {
   if (manager.config.codexProfile) {
     args.push("--profile", manager.config.codexProfile);
   }
-  args.push(...buildCodexPermissionArgs(session.permissionMode || "default", manager.config));
+  if (!isResume) {
+    args.push(...buildCodexPermissionArgs(session.permissionMode || "default", manager.config));
+  }
   if (Array.isArray(manager.config.codexExtraArgs) && manager.config.codexExtraArgs.length > 0) {
     args.push(...manager.config.codexExtraArgs);
   }

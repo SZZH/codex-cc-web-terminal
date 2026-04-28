@@ -1,10 +1,11 @@
 <script setup>
+import { computed } from "vue";
 import {
   PERMISSION_MODE_OPTIONS,
   REASONING_EFFORT_OPTIONS
 } from "../../lib/composer.js";
 
-defineProps({
+const props = defineProps({
   models: { type: Array, default: () => [] },
   composerOptions: { type: Object, required: true },
   gitState: { type: Object, required: true },
@@ -12,10 +13,14 @@ defineProps({
   showPermissionMode: Boolean
 });
 
+const activePermissionOption = computed(() =>
+  PERMISSION_MODE_OPTIONS.find((option) => option.value === props.composerOptions.permissionMode) ||
+  PERMISSION_MODE_OPTIONS[0]
+);
+
 defineEmits([
   "select-model",
   "select-reasoning",
-  "select-permission",
   "open-git"
 ]);
 </script>
@@ -59,24 +64,10 @@ defineEmits([
 
     <section v-if="showPermissionMode" class="settings-group">
       <header class="settings-heading">Codex 权限</header>
-      <div class="permission-list">
-        <button
-          v-for="option in PERMISSION_MODE_OPTIONS"
-          :key="option.value"
-          class="permission-card"
-          :class="{ active: composerOptions.permissionMode === option.value }"
-          type="button"
-          :disabled="disabled"
-          @click="$emit('select-permission', option.value)"
-        >
-          <span class="permission-copy">
-            <span class="permission-title">{{ option.label }}</span>
-            <span class="permission-desc">{{ option.description }}</span>
-          </span>
-          <span class="permission-check" aria-hidden="true">
-            {{ composerOptions.permissionMode === option.value ? "✓" : "" }}
-          </span>
-        </button>
+      <div class="permission-display" aria-live="polite">
+        <span class="permission-display-label">当前权限</span>
+        <span class="permission-display-value">{{ activePermissionOption.label }}</span>
+        <span class="permission-display-desc">{{ activePermissionOption.description }}</span>
       </div>
     </section>
 
@@ -152,18 +143,12 @@ defineEmits([
   color: #3d342d;
 }
 
-.permission-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.permission-card,
+.permission-display,
 .git-entry {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   width: 100%;
   padding: 12px 14px;
   text-align: left;
@@ -172,12 +157,13 @@ defineEmits([
   background: rgba(250, 245, 239, 0.88);
 }
 
-.permission-card.active {
-  border-color: rgba(173, 155, 140, 0.96);
-  background: rgba(239, 230, 221, 0.95);
+.git-entry {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
-.permission-copy,
 .git-copy {
   min-width: 0;
   display: flex;
@@ -185,23 +171,23 @@ defineEmits([
   gap: 3px;
 }
 
-.permission-title,
+.permission-display-label {
+  font-size: 12px;
+  line-height: 1.35;
+  color: #8a7b6f;
+}
+
+.permission-display-value,
 .git-desc {
   font-size: 14px;
   line-height: 1.35;
   color: #3f342d;
 }
 
-.permission-desc {
+.permission-display-desc {
   font-size: 12px;
   line-height: 1.45;
   color: #8a7b6f;
-}
-
-.permission-check {
-  flex: 0 0 auto;
-  font-size: 12px;
-  color: #8e7b6b;
 }
 
 .git-entry:disabled {

@@ -335,32 +335,32 @@ export async function handleSessionRoute(ctx, runtime) {
         runtime.json(ctx, 404, { error: `Thread composer state not found: ${providerId}/${threadId}` });
         return true;
       }
+      const nextComposerState = buildThreadComposerState(runtime, providerId, threadId);
 
       const liveSession =
         typeof runtime.sessionManager.findLiveSessionByThreadId === "function"
           ? runtime.sessionManager.findLiveSessionByThreadId(threadId, { providerId })
           : null;
       if (liveSession) {
-        applyComposerOptionOverrides(liveSession, {
-          model: nextState.model,
-          reasoningEffort: nextState.reasoningEffort,
-          permissionMode: nextState.permissionMode
-        });
+        if (typeof runtime.sessionManager.updateSessionOptions === "function") {
+          runtime.sessionManager.updateSessionOptions(liveSession, {
+            model: nextComposerState.model,
+            reasoningEffort: nextComposerState.reasoningEffort,
+            permissionMode: nextComposerState.permissionMode
+          });
+        } else {
+          applyComposerOptionOverrides(liveSession, {
+            model: nextComposerState.model,
+            reasoningEffort: nextComposerState.reasoningEffort,
+            permissionMode: nextComposerState.permissionMode
+          });
+        }
         if (nextState.cwd) {
           liveSession.cwd = nextState.cwd;
         }
       }
 
-      runtime.json(ctx, 200, {
-        provider: providerId,
-        threadId,
-        model: nextState.model || readCodexDesktopDefaults(runtime.config).model,
-        reasoningEffort: nextState.reasoningEffort || readCodexDesktopDefaults(runtime.config).reasoningEffort,
-        permissionMode: nextState.permissionMode || readCodexDesktopDefaults(runtime.config).permissionMode,
-        cwd: nextState.cwd || runtime.config.defaultCwd,
-        git: listComposerGitState(nextState.cwd || runtime.config.defaultCwd),
-        source: "thread_state"
-      });
+      runtime.json(ctx, 200, nextComposerState);
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }

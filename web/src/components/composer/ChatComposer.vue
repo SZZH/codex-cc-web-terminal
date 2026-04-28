@@ -239,7 +239,6 @@ defineExpose({
           :show-permission-mode="showPermissionMode"
           @select-model="updateComposerOptions({ model: $event })"
           @select-reasoning="updateComposerOptions({ reasoningEffort: $event })"
-          @select-permission="updateComposerOptions({ permissionMode: $event })"
           @open-git="togglePopover('git')"
         />
       </ComposerPopover>

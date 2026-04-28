@@ -66,6 +66,7 @@ export function buildProviders(config) {
   const codexArgs = ({ resumeSessionId, model, permissionMode }) => {
     const args = [];
     const selectedModel = selectModel(model, config.codexModel);
+    const isResume = Boolean(String(resumeSessionId || "").trim());
     if (resumeSessionId) {
       args.push("resume", "--all", resumeSessionId);
     }
@@ -78,7 +79,9 @@ export function buildProviders(config) {
     if (config.codexNoAltScreen) {
       args.push("--no-alt-screen");
     }
-    args.push(...buildCodexPermissionArgs(permissionMode || "default", config));
+    if (!isResume) {
+      args.push(...buildCodexPermissionArgs(permissionMode || "default", config));
+    }
     if (config.codexExtraArgs.length > 0) {
       args.push(...config.codexExtraArgs);
     }

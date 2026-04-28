@@ -233,6 +233,102 @@ test("buildCodexJsonExecArgs maps permissionMode without guessing reasoning flag
   assert.ok(!fullAccessArgs.some((arg) => String(arg).includes("reason")));
 });
 
+test("buildCodexJsonExecArgs does not inject permission flags for resumed sessions", () => {
+  const { manager } = createManager({ codexFullAccess: true });
+  const resumedSession = manager.get(
+    manager.create({
+      provider: "codex",
+      cwd: process.cwd(),
+      resumeSessionId: "thread-1",
+      permissionMode: "auto-review"
+    }).id
+  );
+
+  const resumedArgs = manager.buildCodexJsonExecArgs(resumedSession, "hello");
+
+  assert.ok(resumedArgs.includes("resume"));
+  assert.ok(!resumedArgs.includes("--sandbox"));
+  assert.ok(!resumedArgs.includes("--ask-for-approval"));
+  assert.ok(!resumedArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+});
+
+test("codex resumed session inherits model, reasoning effort, permission and cwd from thread state when omitted", () => {
+  const rootDir = createTempDir();
+  const codexDir = path.join(rootDir, ".codex");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const workspaceRoot = path.join(rootDir, "workspace", "project-a");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      `
+        create table threads (
+          id text primary key,
+          rollout_path text not null,
+          created_at integer not null,
+          updated_at integer not null,
+          source text not null,
+          model_provider text not null,
+          cwd text not null,
+          title text not null,
+          sandbox_policy text not null,
+          approval_mode text not null,
+          tokens_used integer not null default 0,
+          has_user_event integer not null default 0,
+          archived integer not null default 0,
+          archived_at integer,
+          git_sha text,
+          git_branch text,
+          git_origin_url text,
+          cli_version text not null default '',
+          first_user_message text not null default '',
+          agent_nickname text,
+          agent_role text,
+          memory_mode text not null default 'enabled',
+          model text,
+          reasoning_effort text,
+          agent_path text,
+          created_at_ms integer,
+          updated_at_ms integer
+        );
+        insert into threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+          sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
+          cli_version, first_user_message, memory_mode, model, reasoning_effort, created_at_ms, updated_at_ms
+        ) values (
+          'thread-resume-config', '', 1714200000, 1714200000, 'vscode', 'openai', '${workspaceRoot}',
+          'Resume Config Thread', '{"type":"workspace-write"}', 'on-request', 0, 0, 0, 'main',
+          '', '', 'enabled', 'gpt-5.4', 'xhigh', 1714200000000, 1714200000000
+        );
+      `
+    ],
+    { stdio: "ignore" }
+  );
+
+  const config = createBaseConfig(rootDir, {
+    codexStateDbPath: stateDbPath
+  });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  const created = manager.create({
+    provider: "codex",
+    resumeSessionId: "thread-resume-config"
+  });
+  const live = manager.get(created.id);
+
+  assert.equal(created.cwd, workspaceRoot);
+  assert.equal(created.model, "gpt-5.4");
+  assert.equal(created.reasoningEffort, "xhigh");
+  assert.equal(created.permissionMode, "auto-review");
+  assert.equal(live.cwd, workspaceRoot);
+  assert.equal(live.model, "gpt-5.4");
+  assert.equal(live.reasoningEffort, "xhigh");
+  assert.equal(live.permissionMode, "auto-review");
+  assert.equal(live.runnerMode, "json_exec");
+});
+
 test("codex live session auto-renames and streams app-server replies", async () => {
   const { manager, bridge } = createManager();
   const session = manager.create({ provider: "codex", cwd: process.cwd() });

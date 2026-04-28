@@ -1153,6 +1153,211 @@ test("thread composer-state patch updates sqlite-backed thread state and live se
   assert.equal(sessionManager.get("session-1").model, "gpt-5.4");
   assert.equal(sessionManager.get("session-1").reasoningEffort, "medium");
   assert.equal(sessionManager.get("session-1").permissionMode, "auto-review");
+  assert.deepEqual(sessionManager.calls.updateSessionOptions, [
+    {
+      id: "session-1",
+      model: "gpt-5.4",
+      reasoningEffort: "medium",
+      permissionMode: "auto-review"
+    }
+  ]);
+});
+
+test("thread composer-state patch writes default permission to the Codex thread state", async (t) => {
+  const rootDir = createTempDir();
+  const codexDir = path.join(rootDir, ".codex");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const sessionManager = createSessionManagerStub();
+  fs.mkdirSync(codexDir, { recursive: true });
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      [
+        createCodexThreadsTableSql(),
+        `insert into threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+          sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
+          cli_version, first_user_message, memory_mode, model, reasoning_effort, created_at_ms, updated_at_ms
+        ) values (
+          'thread-1', '', 1714200000, 1714200000, 'vscode', 'openai', '${process.cwd()}',
+          'Thread One', '{"type":"danger-full-access"}', 'never', 0, 0, 0, 'feature/old-branch',
+          '', '', 'enabled', 'gpt-5.5', 'low', 1714200000000, 1714200000000
+        );`
+      ].join("\n")
+    ],
+    { stdio: "ignore" }
+  );
+  sessionManager.findLiveSessionByThreadId = () => sessionManager.get("session-1");
+
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      codexStateDbPath: stateDbPath
+    }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(
+    `${server.baseUrl}/api/threads/codex/${encodeURIComponent("thread-1")}/composer-state`,
+    {
+      method: "PATCH",
+      headers: {
+        cookie: cookies,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        permissionMode: "default"
+      })
+    }
+  );
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.permissionMode, "default");
+  assert.equal(sessionManager.get("session-1").permissionMode, "default");
+
+  const row = execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      "select sandbox_policy, approval_mode from threads where id='thread-1';"
+    ],
+    { encoding: "utf8" }
+  ).trim();
+  assert.equal(row, `{"type":"read-only"}|default`);
+});
+
+test("thread composer-state patch does not call app-server resume for state sync", async (t) => {
+  const rootDir = createTempDir();
+  const codexDir = path.join(rootDir, ".codex");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const sessionManager = createSessionManagerStub();
+  let runtimeSyncCalled = false;
+  sessionManager.appServerBridge = {
+    updateThreadComposerState() {
+      runtimeSyncCalled = true;
+      throw new Error("app-server resume should not be used for composer-state persistence");
+    }
+  };
+  fs.mkdirSync(codexDir, { recursive: true });
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      [
+        createCodexThreadsTableSql(),
+        `insert into threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+          sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
+          cli_version, first_user_message, memory_mode, model, reasoning_effort, created_at_ms, updated_at_ms
+        ) values (
+          'thread-1', '', 1714200000, 1714200000, 'vscode', 'openai', '${process.cwd()}',
+          'Thread One', '{"type":"read-only"}', 'default', 0, 0, 0, 'feature/old-branch',
+          '', '', 'enabled', 'gpt-5.5', 'high', 1714200000000, 1714200000000
+        );`
+      ].join("\n")
+    ],
+    { stdio: "ignore" }
+  );
+
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      codexStateDbPath: stateDbPath
+    }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(
+    `${server.baseUrl}/api/threads/codex/${encodeURIComponent("thread-1")}/composer-state`,
+    {
+      method: "PATCH",
+      headers: {
+        cookie: cookies,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        reasoningEffort: "low",
+        permissionMode: "full-access"
+      }),
+      signal: AbortSignal.timeout(1000)
+    }
+  );
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.model, "gpt-5.4");
+  assert.equal(payload.reasoningEffort, "low");
+  assert.equal(payload.permissionMode, "full-access");
+  assert.equal(runtimeSyncCalled, false);
+});
+
+test("session create resumes Codex thread with sqlite-backed permission state when options are omitted", async (t) => {
+  const rootDir = createTempDir();
+  const codexDir = path.join(rootDir, ".codex");
+  const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const workspaceRoot = path.join(rootDir, "workspace", "resume-thread");
+  const sessionManager = createSessionManagerStub();
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      [
+        createCodexThreadsTableSql(),
+        `insert into threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+          sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
+          cli_version, first_user_message, memory_mode, model, reasoning_effort, created_at_ms, updated_at_ms
+        ) values (
+          'thread-resume-config', '', 1714200000, 1714200000, 'vscode', 'openai', '${workspaceRoot}',
+          'Resume Config Thread', '{"type":"danger-full-access"}', 'never', 0, 0, 0, 'feature/resume-thread',
+          '', '', 'enabled', 'gpt-5.4', 'low', 1714200000000, 1714200000000
+        );`
+      ].join("\n")
+    ],
+    { stdio: "ignore" }
+  );
+
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      codexStateDbPath: stateDbPath
+    }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST",
+    headers: {
+      cookie: cookies,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      provider: "codex",
+      resumeSessionId: "thread-resume-config"
+    })
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(payload.session.resumeSessionId, "thread-resume-config");
+  assert.equal(payload.session.cwd, workspaceRoot);
+  assert.equal(payload.session.model, "gpt-5.4");
+  assert.equal(payload.session.reasoningEffort, "low");
+  assert.equal(payload.session.permissionMode, "full-access");
 });
 
 test("single-thread model contract: history conversation route returns the persisted thread snapshot only, without live continuation turns", async (t) => {
@@ -1385,7 +1590,7 @@ test("history messages route falls back to live continuation when historical ses
   assert.equal(payload.messages.length, 0);
 });
 
-test("history messages route prefers live continuation over stale persisted snapshot when both exist", async (t) => {
+test("history messages route merges live continuation without dropping historical turns", async (t) => {
   const sessionManager = createSessionManagerStub();
   sessionManager.getThreadSnapshotBundle = (provider, resumeSessionId) => ({
     session: {
@@ -1529,9 +1734,115 @@ test("history messages route prefers live continuation over stale persisted snap
 
   assert.equal(response.status, 200);
   assert.equal(payload.session.id, "session-live-fresh");
-  assert.equal(payload.threadSnapshot.turns[0].id, "turn-fresh");
-  assert.equal(payload.threadSnapshot.turns[0].items[1].text, "新回答");
-  assert.equal(payload.conversation.turns[0].assistant.body[0].text, "新回答");
+  assert.deepEqual(
+    payload.threadSnapshot.turns.map((turn) => turn.id),
+    ["turn-stale", "turn-fresh"]
+  );
+  assert.deepEqual(
+    payload.conversation.turns.map((turn) => turn.id),
+    ["turn-stale", "turn-fresh"]
+  );
+  assert.equal(payload.threadSnapshot.turns[0].items[1].text, "旧回答");
+  assert.equal(payload.threadSnapshot.turns[1].items[1].text, "新回答");
+  assert.equal(payload.conversation.turns[0].assistant.body[0].text, "旧回答");
+  assert.equal(payload.conversation.turns[1].assistant.body[0].text, "新回答");
+});
+
+test("history messages route keeps historical middle turns when live continuation is partial", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const makeConversationTurn = (id, userText, assistantText) => ({
+    id,
+    user: { id: `u-${id}`, text: userText, ts: new Date().toISOString() },
+    assistant: {
+      body: [{ id: `body-${id}`, kind: "markdown", text: assistantText, payload: {}, ts: new Date().toISOString() }],
+      process: [],
+      status: "completed",
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString()
+    }
+  });
+  const makeThreadTurn = (id, userText, assistantText) => ({
+    id,
+    items: [
+      { id: `u-${id}`, kind: "UserMessage", text: userText },
+      { id: `a-${id}`, kind: "AgentMessage", text: assistantText }
+    ],
+    status: "completed"
+  });
+
+  sessionManager.getThreadSnapshotBundle = () => ({});
+  sessionManager.getHistoricalMessages = (provider, resumeSessionId) => ({
+    session: { id: `history:${provider}:${resumeSessionId}`, kind: "history", provider, resumeSessionId },
+    messages: [],
+    turns: [],
+    backgroundAgents: [],
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        makeThreadTurn("turn-before", "前一问", "前一答"),
+        makeThreadTurn("turn-middle", "中间问", "中间答"),
+        makeThreadTurn("turn-after", "后一问", "后一答")
+      ]
+    },
+    conversation: {
+      sessionId: `history:${provider}:${resumeSessionId}`,
+      threadId: resumeSessionId,
+      version: 3,
+      status: "completed",
+      turns: [
+        makeConversationTurn("turn-before", "前一问", "前一答"),
+        makeConversationTurn("turn-middle", "中间问", "中间答"),
+        makeConversationTurn("turn-after", "后一问", "后一答")
+      ],
+      backgroundAgents: []
+    },
+    conversationSnapshot: null
+  });
+  sessionManager.getThreadContinuationRuntime = (provider, resumeSessionId) => ({
+    session: { id: "session-live-partial", kind: "live", provider, resumeSessionId },
+    conversation: {
+      sessionId: "session-live-partial",
+      threadId: resumeSessionId,
+      version: 4,
+      status: "completed",
+      turns: [
+        makeConversationTurn("turn-before", "前一问", "前一答"),
+        makeConversationTurn("turn-after", "后一问", "后一答")
+      ],
+      backgroundAgents: []
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        makeThreadTurn("turn-before", "前一问", "前一答"),
+        makeThreadTurn("turn-after", "后一问", "后一答")
+      ]
+    },
+    liveOverlay: null
+  });
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/history-messages?provider=codex&resumeSessionId=thread-1`, {
+    headers: { cookie: cookies }
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    payload.conversation.turns.map((turn) => turn.id),
+    ["turn-before", "turn-middle", "turn-after"]
+  );
+  assert.deepEqual(
+    payload.threadSnapshot.turns.map((turn) => turn.id),
+    ["turn-before", "turn-middle", "turn-after"]
+  );
+  assert.equal(payload.conversation.turns[1].user.text, "中间问");
+  assert.equal(payload.conversation.turns[1].assistant.body[0].text, "中间答");
 });
 
 test("history messages interface strips IAB wrapper from authoritative turns and thread snapshot", async (t) => {
