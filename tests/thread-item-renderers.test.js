@@ -107,6 +107,29 @@ test("thread item renderer summarizes process counts by type", () => {
   assert.match(summary.label, /工具 1/);
 });
 
+test("thread item renderer marks historical dump command output as diagnostic dump", () => {
+  const item = normalizeThreadItem({
+    id: "cmd-dump-1",
+    kind: "CommandExecution",
+    status: "completed",
+    summary: "exec_command",
+    text: [
+      "Command: curl http://localhost:3210/api/history-messages?provider=codex&resumeSessionId=abc",
+      "{",
+      '  "session": "history:codex:abc",',
+      '  "conversation.turns": [',
+      '    { "role": "user", "text": "提交代码" },',
+      '    { "role": "assistant", "text": "已提交，commit 是 e949854" }',
+      "  ]",
+      "}",
+      "/Users/demo/.codex/sessions/2026/04/28/rollout-2026-04-28T00-38-22-abc.jsonl"
+    ].join("\n")
+  });
+
+  assert.equal(item.isDiagnosticDump, true);
+  assert.equal(item.summary, "会话历史调试输出");
+});
+
 test("thread view model collapses process segments for terminal turns", () => {
   const viewModel = buildThreadViewModel({
     turns: [
@@ -142,6 +165,41 @@ test("thread view model collapses process segments for terminal turns", () => {
   assert.equal(historyProcess.defaultCollapsed, true);
   assert.equal(runningProcess.defaultCollapsed, false);
   assert.equal(completedProcess.defaultCollapsed, true);
+});
+
+test("thread view model collapses process segments that contain diagnostic dumps", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-diagnostic",
+        status: "inProgress",
+        items: [
+          {
+            id: "cmd-dump-2",
+            kind: "CommandExecution",
+            status: "completed",
+            summary: "exec_command",
+            text: [
+              "Command: node dump-history.js",
+              "{",
+              '  "threadSnapshot": {',
+              '    "turns": [',
+              '      { "kind": "UserMessage", "text": "提交代码" },',
+              '      { "kind": "AgentMessage", "text": "已提交，commit 是 e949854" }',
+              "    ]",
+              "  }",
+              "}"
+            ].join("\n")
+          }
+        ]
+      }
+    ]
+  });
+
+  const processSegment = viewModel.turns[0].segments.find((segment) => segment.kind === "process");
+  assert.equal(processSegment.hasDiagnosticDump, true);
+  assert.equal(processSegment.defaultCollapsed, true);
+  assert.match(processSegment.processSummary.label, /调试输出 1/);
 });
 
 test("thread view model keeps workspace changes anchored to the file-change turn", () => {

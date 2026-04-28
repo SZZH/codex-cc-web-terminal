@@ -4,6 +4,14 @@ import { buildEventPartFromItem } from "../history/historicalPayloads.js";
 import { extractAgentTextFromItem, extractTurnItems, isAgentMessageType, normalizeSymbolToken, nowIso } from "../shared/text.js";
 import { buildCodexPermissionArgs } from "../shared/composerOptions.js";
 
+const STDERR_NOISE_PATTERNS = [
+  /codex_core_plugins?::manifest:/i,
+  /ignoring interface\.defaultPrompt:/i,
+  /prompt must be at most 128 characters/i,
+  /maximum of 3 prompts is supported/i,
+  /\[MODULE_TYPELESS_PACKAGE_JSON]/i
+];
+
 function emitNoReplyFallback(manager, session) {
   if (!session || session.turnNoReplyNotified) {
     return;
@@ -75,6 +83,39 @@ function summarizeNotification(msg) {
   } catch {
     return String(msg || "").slice(0, 2000);
   }
+}
+
+export function summarizeRelevantStderr(stderr = "") {
+  const lines = String(stderr || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !STDERR_NOISE_PATTERNS.some((pattern) => pattern.test(line)));
+
+  return lines
+    .join(" ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 220);
+}
+
+function buildJsonExecFailurePresentation(code, stderr = "") {
+  const concise = summarizeRelevantStderr(stderr);
+  if (!concise) {
+    return {
+      text: `Codex 执行未完成（exit=${code}），请重试。`,
+      summary: `Codex 执行未完成（exit=${code}）`,
+      rawType: "status",
+      payload: { message: "" }
+    };
+  }
+  return {
+    text: `Codex 执行失败（exit=${code}）：${concise}`,
+    summary: `Codex 执行失败（exit=${code}）：${concise}`,
+    rawType: "error",
+    payload: { message: concise }
+  };
 }
 
 export function enqueueRunnerInput(manager, session, data) {
@@ -350,32 +391,29 @@ export function startJsonExecRun(manager, session) {
     session.runningProcess = null;
     session.updatedAt = nowIso();
     if (code && code !== 0) {
-      const concise = String(stderrBuffer || "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 220);
+      const failure = buildJsonExecFailurePresentation(code, stderrBuffer);
       manager.broadcast(session, {
         type: "message_part",
         role: "system",
-        part: { type: "text", text: concise ? `Codex 执行失败（exit=${code}）：${concise}` : `Codex 执行失败（exit=${code}）` },
+        part: { type: "text", text: failure.text },
         phase: "final",
         timestamp: nowIso()
       });
       manager.applyConversationRecord(session, {
         type: "message_part",
         role: "system",
-        part: { type: "event", rawType: "error", summary: concise ? `Codex 执行失败（exit=${code}）：${concise}` : `Codex 执行失败（exit=${code}）`, payload: { message: concise } },
+        part: {
+          type: "event",
+          rawType: failure.rawType,
+          summary: failure.summary,
+          payload: failure.payload
+        },
         phase: "final",
         timestamp: nowIso()
       });
       manager.finalizeConversationTurn(session, "failed", session.updatedAt);
     } else if (!emittedAssistant) {
-      const concise = String(stderrBuffer || "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 220);
+      const concise = summarizeRelevantStderr(stderrBuffer);
       manager.broadcast(session, {
         type: "message_part",
         role: "system",

@@ -151,8 +151,11 @@ function applySegmentCollapseDefaults(segments = [], turn = {}) {
     }
     const hasPrimaryAfter = segments.slice(index + 1).some((candidate) => candidate.kind === "primary");
     const processSummary = summarizeProcessItems(segment.items);
+    const hasDiagnosticDump = segment.items.some((item) => item.isDiagnosticDump);
     const defaultCollapsed =
-      isTerminalTurn(turn)
+      hasDiagnosticDump
+        ? true
+        : isTerminalTurn(turn)
         ? true
         : hasPrimary
           ? hasPrimaryAfter || segments.slice(0, index).some((candidate) => candidate.kind === "primary")
@@ -160,7 +163,8 @@ function applySegmentCollapseDefaults(segments = [], turn = {}) {
     return {
       ...segment,
       processSummary,
-      defaultCollapsed
+      defaultCollapsed,
+      hasDiagnosticDump
     };
   });
 }

@@ -11,6 +11,7 @@ import { createConversationState } from "../src/sessions/conversation/state.js";
 import { createEmptyConversationState, applyDelta } from "../src/sessions/normalize/turnState.js";
 import { createTurnCreatedDelta, normalizeRecordToDeltas } from "../src/sessions/normalize/turnDeltas.js";
 import { deriveThreadSnapshotFromConversationState } from "../src/threads/index.js";
+import { summarizeRelevantStderr } from "../src/sessions/runners/codexRunner.js";
 import { createBaseConfig, createTempDir, waitForMicrotasks } from "./helpers/backendTestUtils.js";
 
 class AppServerBridgeStub extends EventEmitter {
@@ -250,6 +251,35 @@ test("buildCodexJsonExecArgs does not inject permission flags for resumed sessio
   assert.ok(!resumedArgs.includes("--sandbox"));
   assert.ok(!resumedArgs.includes("--ask-for-approval"));
   assert.ok(!resumedArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+});
+
+test("summarizeRelevantStderr drops plugin startup warning noise", () => {
+  const stderr = [
+    "2026-04-28T10:05:12.798623Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt: prompt must be at most 128 characters",
+    "2026-04-28T10:05:12.798700Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt: maximum of 3 prompts is supported"
+  ].join("\n");
+
+  assert.equal(summarizeRelevantStderr(stderr), "");
+});
+
+test("summarizeRelevantStderr keeps real fatal stderr lines", () => {
+  const stderr = [
+    "2026-04-28T10:05:12.798623Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt: prompt must be at most 128 characters",
+    "fatal: unexpected EOF while parsing"
+  ].join("\n");
+
+  assert.equal(summarizeRelevantStderr(stderr), "fatal: unexpected EOF while parsing");
+});
+
+test("json_exec warning-only stderr should not be surfaced as hard failure detail", () => {
+  const stderr = [
+    "2026-04-28T10:05:12.798623Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt: prompt must be at most 128 characters",
+    "2026-04-28T10:05:12.798700Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt: maximum of 3 prompts is supported"
+  ].join("\n");
+
+  const concise = summarizeRelevantStderr(stderr);
+  const text = concise ? `Codex 执行失败（exit=1）：${concise}` : "Codex 执行未完成（exit=1），请重试。";
+  assert.equal(text, "Codex 执行未完成（exit=1），请重试。");
 });
 
 test("codex resumed session inherits model, reasoning effort, permission and cwd from thread state when omitted", () => {
