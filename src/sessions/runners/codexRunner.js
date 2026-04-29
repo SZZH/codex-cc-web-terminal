@@ -12,7 +12,7 @@ const STDERR_NOISE_PATTERNS = [
   /\[MODULE_TYPELESS_PACKAGE_JSON]/i
 ];
 
-function emitNoReplyFallback(manager, session) {
+function emitNoReplyFallback(manager, session, turnId = "") {
   if (!session || session.turnNoReplyNotified) {
     return;
   }
@@ -24,13 +24,36 @@ function emitNoReplyFallback(manager, session) {
     phase: "final",
     timestamp: nowIso()
   });
+  const targetTurnId = String(turnId || session.currentTurnId || session.threadSnapshot?.activeTurnId || session.conversationState?.activeTurnId || "").trim();
   manager.applyConversationRecord(session, {
     type: "message_part",
     role: "system",
     part: { type: "event", rawType: "system", summary: "本轮未返回可展示文本。", payload: { message: "本轮未返回可展示文本。" } },
     phase: "final",
     timestamp: nowIso()
-  });
+  }, { turnId: targetTurnId });
+  const targetTurn = Array.isArray(session.threadSnapshot?.turns)
+    ? session.threadSnapshot.turns.find((item) => String(item?.id || "").trim() === targetTurnId)
+    : null;
+  if (targetTurn) {
+    targetTurn.items ||= [];
+    if (!targetTurn.items.some((item) => String(item?.id || "") === `no-reply:${targetTurnId}`)) {
+      targetTurn.items.push({
+        id: `no-reply:${targetTurnId}`,
+        kind: "SystemEvent",
+        status: "completed",
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        source: "session_manager",
+        summary: "本轮未返回可展示文本。",
+        text: "本轮未返回可展示文本。",
+        payload: { message: "本轮未返回可展示文本。" },
+        meta: {}
+      });
+      manager.syncConversationStateFromThreadSnapshot(session);
+      manager.broadcastConversationSnapshot(session);
+    }
+  }
 }
 
 function normalizeAppServerErrorMessage(error = {}) {
@@ -40,6 +63,15 @@ function normalizeAppServerErrorMessage(error = {}) {
     return `${primary} ${extra}`.trim();
   }
   return primary || extra || "未知错误";
+}
+
+function normalizeTurnResultStatus(result = {}) {
+  return normalizeSymbolToken(result?.turn?.status || result?.status || "");
+}
+
+function normalizeTurnResultError(result = {}) {
+  const error = result?.turn?.error || result?.error || null;
+  return error && typeof error === "object" ? error : null;
 }
 
 function emitAppServerError(manager, session, error = {}, timestamp = nowIso()) {
@@ -117,9 +149,9 @@ function schedulePendingTurnCompletion(manager, session, params = {}, { status =
   if (!manager || !session) {
     return;
   }
+  const explicitTurnId = String(params?.turnId || params?.turn_id || params?.turn?.id || "").trim();
   const turnId = String(
-    params?.turnId ||
-      params?.turn_id ||
+    explicitTurnId ||
       session.currentTurnId ||
       session.threadSnapshot?.activeTurnId ||
       session.conversationState?.activeTurnId ||
@@ -129,37 +161,64 @@ function schedulePendingTurnCompletion(manager, session, params = {}, { status =
     return;
   }
   clearPendingTurnCompletion(session);
+  const completeTurn = () => {
+    session.pendingTurnCompletion = null;
+    const completedAt = nowIso();
+    session.updatedAt = completedAt;
+    const knownExplicitTurn = !explicitTurnId || manager.hasConversationTurn?.(session, turnId);
+    const completesActiveTurn =
+      !explicitTurnId ||
+      [session.currentTurnId, session.activePendingTurnId, session.threadSnapshot?.activeTurnId, session.conversationState?.activeTurnId]
+        .map((value) => String(value || "").trim())
+        .includes(turnId);
+
+    if (explicitTurnId && !knownExplicitTurn) {
+      broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
+        type: status === "failed" || error ? "turn.failed" : "turn.completed",
+        status: status === "failed" || error ? "failed" : "completed",
+        error: status === "failed" || error ? error || { message: "turn failed" } : null
+      });
+      manager.scheduleConversationHistoryResync(session);
+      manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
+      return;
+    }
+
+    if (completesActiveTurn) {
+      session.turnRunning = false;
+    }
+    const finalizeOptions = explicitTurnId ? { turnId } : {};
+    if (status === "failed" || error) {
+      broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
+        type: "turn.failed",
+        status: "failed",
+        error: error || { message: "turn failed" }
+      });
+      emitAppServerError(manager, session, error || { message: "turn failed" }, completedAt);
+      manager.finalizeConversationTurn(session, "failed", completedAt, finalizeOptions);
+    } else {
+      const shouldEmitNoReplyFallback = !session.turnHadVisibleOutput;
+      broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
+        type: "turn.completed",
+        status: "completed"
+      });
+      const finalized = manager.finalizeConversationTurn(session, "completed", completedAt, finalizeOptions);
+      if (finalized && shouldEmitNoReplyFallback) {
+        emitNoReplyFallback(manager, session, turnId);
+      }
+    }
+    manager.scheduleConversationHistoryResync(session);
+    manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
+    startAppServerTurn(manager, session);
+  };
+  if (Number(delayMs) <= 0) {
+    completeTurn();
+    return;
+  }
   session.pendingTurnCompletion = {
     turnId,
     status,
     error,
-    timer: setTimeout(() => {
-      session.pendingTurnCompletion = null;
-      const completedAt = nowIso();
-      session.turnRunning = false;
-      session.updatedAt = completedAt;
-      if (status === "failed" || error) {
-        broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
-          type: "turn.failed",
-          status: "failed",
-          error: error || { message: "turn failed" }
-        });
-        emitAppServerError(manager, session, error || { message: "turn failed" }, completedAt);
-        manager.finalizeConversationTurn(session, "failed", completedAt);
-      } else {
-        if (!session.turnHadVisibleOutput) {
-          emitNoReplyFallback(manager, session);
-        }
-        broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
-          type: "turn.completed",
-          status: "completed"
-        });
-        manager.finalizeConversationTurn(session, "completed", completedAt);
-      }
-      manager.scheduleConversationHistoryResync(session);
-      manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
-      startAppServerTurn(manager, session);
-    }, Math.max(0, Number(delayMs) || 0))
+    timer: setTimeout(completeTurn, Math.max(0, Number(delayMs) || 0))
   };
   session.pendingTurnCompletion.timer.unref?.();
 }
@@ -207,6 +266,43 @@ function resolveSessionTurnId(session, params = {}) {
     session.conversationState?.activeTurnId ||
     ""
   ).trim();
+}
+
+function resolveAppServerTurnId(manager, session, params = {}) {
+  const serverTurnId = String(params?.turnId || params?.turn_id || params?.turn?.id || params?.item?.turnId || "").trim();
+  if (!serverTurnId) {
+    return { turnId: "", clientTurnId: "", aliasSource: "" };
+  }
+
+  const activePendingTurnId = String(session?.activePendingTurnId || "").trim();
+  const currentTurnId = String(session?.currentTurnId || "").trim();
+  const pendingLocalTurnIds = session?.pendingLocalTurnIds instanceof Set ? session.pendingLocalTurnIds : new Set();
+  if (activePendingTurnId && activePendingTurnId === currentTurnId && pendingLocalTurnIds.has(activePendingTurnId)) {
+    if (activePendingTurnId !== serverTurnId && session?.turnRunning) {
+      const bound = manager.bindConversationTurnAlias?.(session, activePendingTurnId, serverTurnId, {
+        source: "active-pending-turn"
+      });
+      return bound ? { turnId: serverTurnId, clientTurnId: activePendingTurnId, aliasSource: "active-pending-turn" } : { turnId: "", clientTurnId: "", aliasSource: "" };
+    }
+  }
+  return { turnId: serverTurnId, clientTurnId: "", aliasSource: "" };
+}
+
+function applyAppServerConversationRecord(manager, session, params = {}, record = null) {
+  const resolved = resolveAppServerTurnId(manager, session, params);
+  if (!resolved.turnId || !record) {
+    return false;
+  }
+  manager.applyConversationRecord(
+    session,
+    {
+      ...record,
+      clientTurnId: resolved.clientTurnId,
+      aliasSource: resolved.aliasSource
+    },
+    { turnId: resolved.turnId }
+  );
+  return true;
 }
 
 function broadcastTypedEvent(manager, session, payload = null) {
@@ -339,6 +435,26 @@ function broadcastTypedProcess(manager, session, params = {}, {
     payload: payload || params,
     ts,
     phase
+  });
+}
+
+function applyTypedProcessToConversation(manager, session, params = {}, processEvent = null) {
+  if (!processEvent?.summary) {
+    return false;
+  }
+  const partType = String(processEvent.processType || "event").includes("tool") ? "tool" : "event";
+  return applyAppServerConversationRecord(manager, session, params, {
+    type: "message_part",
+    role: "assistant",
+    part: {
+      type: partType,
+      rawType: processEvent.processType || "event",
+      summary: String(processEvent.summary || ""),
+      text: String(processEvent.summary || ""),
+      payload: processEvent.payload || params
+    },
+    phase: processEvent.phase || "completed",
+    timestamp: nowIso()
   });
 }
 
@@ -645,7 +761,9 @@ export async function startAppServerTurn(manager, session) {
   }
   const prompt = session.queuedInputs.shift();
   session.currentTurnId = session.queuedTurnIds.shift() || session.currentTurnId || "";
+  session.activePendingTurnId = session.currentTurnId || "";
   if (!prompt) {
+    session.activePendingTurnId = "";
     return;
   }
   session.turnRunning = true;
@@ -655,7 +773,24 @@ export async function startAppServerTurn(manager, session) {
   manager.updateConversationTurnStatus(session, "running", session.updatedAt);
   try {
     const result = await manager.appServerBridge.startTurn(session, prompt);
-    handleAppServerTurnResult(manager, session, result);
+    const hadOutput = handleAppServerTurnResult(manager, session, result);
+    const resultStatus = normalizeTurnResultStatus(result);
+    const resultError = normalizeTurnResultError(result);
+    if (resultStatus === "inprogress" || resultStatus === "running") {
+      return;
+    }
+    if (resultStatus === "failed" || resultError) {
+      schedulePendingTurnCompletion(manager, session, result?.turn ? { turn: result.turn } : {}, {
+        status: "failed",
+        error: resultError || { message: "turn failed" },
+        delayMs: 0
+      });
+      return;
+    }
+    schedulePendingTurnCompletion(manager, session, result?.turn ? { turn: result.turn } : {}, {
+      status: "completed",
+      delayMs: hadOutput ? 0 : 1200
+    });
   } catch (error) {
     session.turnRunning = false;
     session.updatedAt = nowIso();
@@ -820,7 +955,9 @@ export function startJsonExecRun(manager, session) {
   }
   const prompt = session.queuedInputs.shift();
   session.currentTurnId = session.queuedTurnIds.shift() || session.currentTurnId || "";
+  session.activePendingTurnId = session.currentTurnId || "";
   if (!prompt) {
+    session.activePendingTurnId = "";
     return;
   }
 
@@ -951,6 +1088,36 @@ export function handleAppServerNotification(manager, msg) {
       extendPendingTurnCompletion(manager, session, params);
     }
     const directEvent = classifyTypedDirectEventFromNotification(method, normalizedMethod, params);
+    if (directEvent?.type === "turn.started") {
+      const resolved = resolveAppServerTurnId(manager, session, params);
+      if (resolved.turnId) {
+        manager.applyConversationDeltas(session, [
+          {
+            kind: "turn_status_changed",
+            turnId: resolved.turnId,
+            clientTurnId: resolved.clientTurnId,
+            aliasSource: resolved.aliasSource,
+            status: "running",
+            timestamp: nowIso()
+          }
+        ]);
+      }
+    }
+    if (directEvent?.type === "message.completed") {
+      const item = params?.item || directEvent.payload || {};
+      if (!applyAppServerConversationRecord(manager, session, params, {
+        type: "item.completed",
+        item,
+        timestamp: nowIso()
+      })) {
+        continue;
+      }
+    }
+    if (String(directEvent?.type || "").startsWith("reasoning.")) {
+      if (!applyTypedProcessToConversation(manager, session, params, directEvent)) {
+        continue;
+      }
+    }
     if (broadcastTypedStructuredEvent(manager, session, params, directEvent)) {
       if (directEvent?.type === "thread.status.updated") {
         manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
@@ -958,11 +1125,21 @@ export function handleAppServerNotification(manager, msg) {
       continue;
     }
     const processEvent = classifyTypedProcessFromNotification(method, normalizedMethod, params);
-    if (String(processEvent?.type || "").startsWith("reasoning.") && broadcastTypedStructuredEvent(manager, session, params, processEvent)) {
-      continue;
+    if (String(processEvent?.type || "").startsWith("reasoning.")) {
+      if (!applyTypedProcessToConversation(manager, session, params, processEvent)) {
+        continue;
+      }
+      if (broadcastTypedStructuredEvent(manager, session, params, processEvent)) {
+        continue;
+      }
     }
-    if (processEvent?.summary && broadcastTypedProcess(manager, session, params, processEvent)) {
-      continue;
+    if (processEvent?.summary) {
+      if (!applyTypedProcessToConversation(manager, session, params, processEvent)) {
+        continue;
+      }
+      if (broadcastTypedProcess(manager, session, params, processEvent)) {
+        continue;
+      }
     }
     if (method === "item/agentMessage/delta" || normalizedMethod === "itemagentmessagedelta") {
       const delta = String(params?.delta || "");
@@ -971,9 +1148,20 @@ export function handleAppServerNotification(manager, msg) {
       }
       const itemId = String(params?.itemId || params?.item_id || "").trim();
       const typedKind = itemId ? session.activeTypedItems?.get(itemId) : "";
-      session.turnHadVisibleOutput = true;
-      manager.pushSessionBuffer(session, delta);
       if (typedKind === "reasoning") {
+        const applied = applyTypedProcessToConversation(manager, session, params, {
+          type: "reasoning.delta",
+          processType: "reasoning",
+          processId: itemId || "reasoning",
+          summary: delta,
+          payload: params,
+          phase: "streaming"
+        });
+        if (!applied) {
+          continue;
+        }
+        session.turnHadVisibleOutput = true;
+        manager.pushSessionBuffer(session, delta);
         broadcastTypedStructuredEvent(manager, session, params, {
           type: "reasoning.delta",
           processId: itemId || "reasoning",
@@ -982,19 +1170,24 @@ export function handleAppServerNotification(manager, msg) {
           phase: "streaming"
         });
       } else {
+        const applied = applyAppServerConversationRecord(manager, session, params, {
+          type: "message_part",
+          role: "assistant",
+          part: { type: "text", text: delta, format: "markdown" },
+          phase: "streaming",
+          timestamp: nowIso()
+        });
+        if (!applied) {
+          continue;
+        }
+        session.turnHadVisibleOutput = true;
+        manager.pushSessionBuffer(session, delta);
         broadcastTypedMessage(manager, session, params, {
           type: "message.delta",
           text: delta,
           phase: "streaming"
         });
       }
-      manager.applyConversationRecord(session, {
-        type: "message_part",
-        role: "assistant",
-        part: { type: "text", text: delta, format: "markdown" },
-        phase: "streaming",
-        timestamp: nowIso()
-      });
       continue;
     }
     if (method === "item/completed" || normalizedMethod === "itemcompleted") {
@@ -1013,12 +1206,21 @@ export function handleAppServerNotification(manager, msg) {
             phase: "final",
             timestamp: nowIso()
           });
-          manager.applyConversationRecord(session, {
+          if (!applyAppServerConversationRecord(manager, session, params, {
             type: "item.completed",
             item,
             timestamp: nowIso()
-          });
+          })) {
+            continue;
+          }
         }
+        continue;
+      }
+      if (!applyAppServerConversationRecord(manager, session, params, {
+        type: "item.completed",
+        item,
+        timestamp: nowIso()
+      })) {
         continue;
       }
       session.turnHadVisibleOutput = true;
@@ -1027,11 +1229,6 @@ export function handleAppServerNotification(manager, msg) {
         type: "message.completed",
         text,
         phase: "final"
-      });
-      manager.applyConversationRecord(session, {
-        type: "item.completed",
-        item,
-        timestamp: nowIso()
       });
       continue;
     }
@@ -1043,15 +1240,26 @@ export function handleAppServerNotification(manager, msg) {
       const turn = params?.turn || {};
       const turnStatus = normalizeSymbolToken(turn?.status || "");
       const turnError = turn?.error && typeof turn.error === "object" ? turn.error : null;
+      const resolved = resolveAppServerTurnId(manager, session, params);
+      const completionParams = resolved.turnId
+        ? {
+            ...params,
+            turnId: resolved.turnId,
+            clientTurnId: resolved.clientTurnId,
+            aliasSource: resolved.aliasSource
+          }
+        : params;
       if (turnStatus === "failed" || turnError) {
-        schedulePendingTurnCompletion(manager, session, params, {
+        schedulePendingTurnCompletion(manager, session, completionParams, {
           status: "failed",
-          error: turnError || { message: "turn failed" }
+          error: turnError || { message: "turn failed" },
+          delayMs: 0
         });
         continue;
       }
-      schedulePendingTurnCompletion(manager, session, params, {
-        status: "completed"
+      schedulePendingTurnCompletion(manager, session, completionParams, {
+        status: "completed",
+        delayMs: 0
       });
       continue;
     }

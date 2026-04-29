@@ -28,6 +28,7 @@ import {
   buildLegacyConversationSnapshotPayload
 } from "./sessions/conversation/protocol.js";
 import {
+  applyConversationDeltas as applyConversationStateDeltas,
   buildConversationStateFromThreadSnapshot,
   createConversationState
 } from "./sessions/conversation/state.js";
@@ -492,6 +493,8 @@ export class SessionManager {
         runningProcess: null,
         queuedInputs: [],
         queuedTurnIds: [],
+        pendingLocalTurnIds: new Set(),
+        activePendingTurnId: "",
         conversationState: createConversationState({
           sessionId: id,
           threadId: normalizedResumeSessionId,
@@ -503,6 +506,8 @@ export class SessionManager {
         threadProjection: null,
         currentTurnId: "",
         activeTypedItems: new Map(),
+        turnIdAliases: new Map(),
+        turnAliasSources: new Map(),
         sessionType: "main",
         parentThreadId: "",
         agentRole: "",
@@ -564,7 +569,11 @@ export class SessionManager {
       threadProjection: null,
       currentTurnId: "",
       activeTypedItems: new Map(),
+      turnIdAliases: new Map(),
+      turnAliasSources: new Map(),
       queuedTurnIds: [],
+      pendingLocalTurnIds: new Set(),
+      activePendingTurnId: "",
       sessionType: "main",
       parentThreadId: "",
       agentRole: "",
@@ -791,11 +800,18 @@ export class SessionManager {
     if (!session) {
       return [];
     }
-    this.syncConversationStateFromThreadSnapshot(session);
+    const previous = createConversationState(session.conversationState);
+    const normalizedDeltas = (Array.isArray(deltas) ? deltas : []).filter(Boolean);
+    const { state, applied } = applyConversationStateDeltas(previous, normalizedDeltas);
+    session.conversationState = createConversationState({
+      ...state,
+      sessionId: String(session.id || state.sessionId || ""),
+      threadId: String(session.resumeSessionId || state.threadId || "")
+    });
     if (shouldBroadcast) {
-      this.broadcastConversationSnapshot(session);
+      this.broadcastConversationDelta(session, applied);
     }
-    return [];
+    return applied;
   }
 
   broadcastDerivedConversationDelta(session, previousState = null) {
@@ -832,7 +848,10 @@ export class SessionManager {
     const turnId = `${session.id}-turn-${Date.now()}-${session.turnSequence}-${suffix}`;
     if (activate) {
       session.currentTurnId = turnId;
+      session.activePendingTurnId = turnId;
     }
+    session.pendingLocalTurnIds ||= new Set();
+    session.pendingLocalTurnIds.add(turnId);
     const previous = createConversationState(session.conversationState);
     this.applyThreadRawRecord(
       session,
@@ -851,21 +870,130 @@ export class SessionManager {
     return turnId;
   }
 
+  bindConversationTurnAlias(session, clientTurnId = "", serverTurnId = "", { source = "unknown" } = {}) {
+    const clientId = String(clientTurnId || "").trim();
+    const serverId = String(serverTurnId || "").trim();
+    if (!session || !clientId || !serverId) {
+      return false;
+    }
+    if (clientId === serverId) {
+      return true;
+    }
+
+    session.turnIdAliases ||= new Map();
+    session.turnAliasSources ||= new Map();
+    const existingServer = session.turnIdAliases.get(clientId);
+    const existingClient = [...session.turnIdAliases.entries()].find(
+      ([leftClientId, rightServerId]) => rightServerId === serverId && leftClientId !== clientId
+    )?.[0];
+    if ((existingServer && existingServer !== serverId) || existingClient) {
+      console.warn(
+        `[conversation] turn alias conflict sessionId=${session.id || ""} clientTurnId=${clientId} serverTurnId=${serverId}`
+      );
+      return false;
+    }
+
+    session.turnIdAliases.set(clientId, serverId);
+    session.turnAliasSources.set(`${clientId}->${serverId}`, String(source || "unknown"));
+    session.pendingLocalTurnIds?.delete(clientId);
+    session.pendingLocalTurnIds?.add(serverId);
+
+    const renameTurns = (turns = []) =>
+      (Array.isArray(turns) ? turns : []).map((turn) =>
+        String(turn?.id || "").trim() === clientId
+          ? {
+              ...turn,
+              id: serverId
+            }
+          : turn
+      );
+
+    if (session.threadSnapshot) {
+      session.threadSnapshot = {
+        ...session.threadSnapshot,
+        activeTurnId: String(session.threadSnapshot.activeTurnId || "") === clientId ? serverId : session.threadSnapshot.activeTurnId,
+        turns: renameTurns(session.threadSnapshot.turns)
+      };
+      buildThreadProjection(session);
+      syncProjectedThreadState(session, { previousSnapshot: session.threadSnapshot });
+    }
+
+    if (session.conversationState) {
+      session.conversationState = createConversationState({
+        ...session.conversationState,
+        activeTurnId: String(session.conversationState.activeTurnId || "") === clientId ? serverId : session.conversationState.activeTurnId,
+        turns: renameTurns(session.conversationState.turns)
+      });
+    }
+
+    if (String(session.currentTurnId || "") === clientId) {
+      session.currentTurnId = serverId;
+    }
+    if (String(session.activePendingTurnId || "") === clientId) {
+      session.activePendingTurnId = serverId;
+    }
+    session.queuedTurnIds = (Array.isArray(session.queuedTurnIds) ? session.queuedTurnIds : []).map((turnId) =>
+      String(turnId || "") === clientId ? serverId : turnId
+    );
+    return true;
+  }
+
   applyConversationRecord(session, record, { turnId = session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || "" } = {}) {
     if (!session || !turnId) {
       return [];
     }
     const previous = createConversationState(session.conversationState);
+    const explicitDeltas = normalizeRecordToDeltas(record, { turnId }).map((delta) => ({
+      ...delta,
+      sessionId: String(session.id || ""),
+      threadId: String(session.resumeSessionId || session.conversationState?.threadId || ""),
+      clientTurnId: String(record?.clientTurnId || ""),
+      aliasSource: String(record?.aliasSource || "")
+    }));
     this.applyThreadRawRecord(session, record, { turnId });
-    this.broadcastDerivedConversationDelta(session, previous);
+    this.syncConversationStateFromThreadSnapshot(session);
+    if (explicitDeltas.length) {
+      const after = createConversationState(session.conversationState);
+      const finalVersion = Math.max(after.version, previous.version + explicitDeltas.length);
+      const applied = explicitDeltas.map((delta, index) => ({
+        delta,
+        fromVersion: previous.version + index,
+        toVersion: index === explicitDeltas.length - 1 ? finalVersion : previous.version + index + 1,
+        timestamp: delta.timestamp || delta.block?.ts || delta.event?.ts || record?.timestamp || after.updatedAt
+      }));
+      this.broadcastConversationDelta(session, applied);
+    } else {
+      this.broadcastDerivedConversationDelta(session, previous);
+    }
     this.broadcastConversationSnapshot(session);
-    return [];
+    return explicitDeltas;
   }
 
-  finalizeConversationTurn(session, status = "completed", timestamp = nowIso()) {
-    const targetTurnId = String(session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || "");
+  hasConversationTurn(session, turnId = "") {
+    const targetTurnId = String(turnId || "").trim();
+    if (!session || !targetTurnId) {
+      return false;
+    }
+    return Boolean(
+      (Array.isArray(session.threadSnapshot?.turns) &&
+        session.threadSnapshot.turns.some((turn) => String(turn?.id || "").trim() === targetTurnId)) ||
+        (Array.isArray(session.conversationState?.turns) &&
+          session.conversationState.turns.some((turn) => String(turn?.id || "").trim() === targetTurnId))
+    );
+  }
+
+  finalizeConversationTurn(session, status = "completed", timestamp = nowIso(), options = {}) {
+    const hasExplicitTurnId = Object.prototype.hasOwnProperty.call(options || {}, "turnId");
+    const targetTurnId = String(
+      hasExplicitTurnId
+        ? options?.turnId || ""
+        : session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || ""
+    ).trim();
     if (!targetTurnId) {
-      return;
+      return false;
+    }
+    if (hasExplicitTurnId && !this.hasConversationTurn(session, targetTurnId)) {
+      return false;
     }
     const previous = createConversationState(session.conversationState);
     this.applyThreadRawRecord(
@@ -880,9 +1008,16 @@ export class SessionManager {
       },
       { turnId: targetTurnId }
     );
-    session.currentTurnId = "";
+    if (String(session.currentTurnId || "").trim() === targetTurnId) {
+      session.currentTurnId = "";
+    }
+    if (String(session.activePendingTurnId || "").trim() === targetTurnId) {
+      session.activePendingTurnId = "";
+    }
+    session.pendingLocalTurnIds?.delete(targetTurnId);
     this.broadcastDerivedConversationDelta(session, previous);
     this.broadcastConversationSnapshot(session);
+    return true;
   }
 
   updateConversationTurnStatus(session, status = "running", timestamp = nowIso()) {

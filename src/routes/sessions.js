@@ -30,18 +30,6 @@ function hasStreamTurnInput(events = []) {
   });
 }
 
-function isTurnTerminalInSnapshot(session, turnId) {
-  const targetTurnId = String(turnId || "").trim();
-  if (!session || !targetTurnId) {
-    return false;
-  }
-
-  const status = String(
-    session?.threadSnapshot?.turns?.find((turn) => String(turn?.id || "") === targetTurnId)?.status || ""
-  ).trim().toLowerCase();
-  return status === "completed" || status === "failed" || status === "aborted" || status === "interrupted";
-}
-
 async function openInputStream(ctx, runtime, session, events) {
   let stream = null;
   try {
@@ -67,9 +55,6 @@ async function openInputStream(ctx, runtime, session, events) {
     const liveSession = runtime.sessionManager.get(session.id) || session;
     const trackedTurnId = String(lastInputTurnId || liveSession.currentTurnId || "").trim();
     stream.setTrackedTurnId(trackedTurnId);
-    if (isTurnTerminalInSnapshot(liveSession, trackedTurnId)) {
-      stream.close();
-    }
     return true;
   } catch (err) {
     if (!ctx.res.headersSent) {

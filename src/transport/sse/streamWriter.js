@@ -7,6 +7,8 @@ function normalizeTypedTransportPayload(payload = {}) {
   const typedEvents = new Set([
     "thread.snapshot",
     "thread.overlay",
+    "conversation.snapshot",
+    "conversation.delta",
     "canonical.event",
     "keepalive",
     "error",
@@ -37,6 +39,14 @@ function normalizeTypedTransportPayload(payload = {}) {
       event: SSE_TRANSPORT_EVENTS.SNAPSHOT,
       payload,
       id: payload.version || undefined
+    };
+  }
+
+  if (type === "conversation.snapshot" || type === "conversation.delta") {
+    return {
+      event: type,
+      payload,
+      id: payload.toVersion || payload.version || payload?.conversation?.version || undefined
     };
   }
 

@@ -200,6 +200,15 @@ async function requestConversationSnapshotBySessionId(sessionId) {
   return request(`/api/sessions/${encodeURIComponent(id)}/conversation`);
 }
 
+async function requestConversationSnapshotByThread(provider, threadId) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    return null;
+  }
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/conversation`);
+}
+
 function clearSubmitFallbackTimer() {
   if (submitFallbackTimer) {
     window.clearTimeout(submitFallbackTimer);
@@ -305,67 +314,6 @@ function buildSubmissionText(text) {
     fragments.push(trimmedText);
   }
   return fragments.join("\n\n").trim();
-}
-
-function isAssistantTurnTerminal(turn = null) {
-  const normalized = String(turn?.assistant?.status || turn?.status || "").trim().toLowerCase();
-  return normalized === "completed" || normalized === "failed" || normalized === "aborted" || normalized === "interrupted";
-}
-
-async function waitForHistoricalReply({
-  provider,
-  resumeSessionId,
-  liveSessionId,
-  baselineTurnCount = 0,
-  timeoutMs = 30000,
-  intervalMs = 800
-} = {}) {
-  const targetProvider = String(provider || "").trim().toLowerCase();
-  const targetResumeSessionId = String(resumeSessionId || "").trim();
-  if (!targetProvider || !targetResumeSessionId) {
-    return false;
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const hydrated = await hydrateSession(
-      {
-        id: `history:${targetProvider}:${targetResumeSessionId}`,
-        kind: "thread",
-        status: "saved",
-        provider: targetProvider,
-        resumeSessionId: targetResumeSessionId,
-        name: state.threadView.meta?.displayTitle || state.liveView.sessionMeta?.displayTitle || "会话",
-        cwd: state.threadView.meta?.cwd || state.liveView.sessionMeta?.cwd || ""
-      },
-      { includeMessages: true, forceRefresh: true, silent: true }
-    );
-
-    if (hydrated) {
-      const conversation = buildConversationStateFromPayload(hydrated.conversation || {}, {
-        sessionId: liveSessionId || state.liveView.sessionId,
-        threadId: targetResumeSessionId,
-        turns: hydrated.turns || [],
-        backgroundAgents: hydrated.backgroundAgents || []
-      });
-      setConversation(conversation, { force: true });
-      setThreadSnapshot(hydrated.threadSnapshot || null);
-      setLiveOverlay(hydrated.liveOverlay || null);
-
-      const lastTurn = Array.isArray(conversation?.turns) ? conversation.turns.at(-1) : null;
-      const hasAssistantText = Array.isArray(lastTurn?.assistant?.body)
-        ? lastTurn.assistant.body.some((part) => String(part?.text || "").trim())
-        : false;
-      const progressed = Number(conversation?.turns?.length || 0) > Number(baselineTurnCount || 0);
-      if (progressed && hasAssistantText && isAssistantTurnTerminal(lastTurn)) {
-        return true;
-      }
-    }
-
-    await wait(intervalMs);
-  }
-
-  return false;
 }
 
 const composerRuntime = createComposerRuntimeController({
@@ -687,37 +635,16 @@ async function submitInput() {
     setStatus("等待 Codex 回复…");
     state.liveView.activeInputStream = true;
     if (targetThreadId) {
-      const streamAbortController = new AbortController();
-      const streamPromise = requestThreadInputStream(
+      await requestThreadInputStream(
         targetProvider,
         targetThreadId,
         requestBody,
         {
-          signal: streamAbortController.signal,
           onPayload(payload) {
             handleLivePayload(payload);
           }
         }
-      )
-        .then(() => "stream")
-        .catch((error) => {
-          if (streamAbortController.signal.aborted) {
-            return "aborted";
-          }
-          throw error;
-        });
-
-      const historyFallbackPromise = waitForHistoricalReply({
-        provider: targetProvider,
-        resumeSessionId: targetThreadId,
-        liveSessionId,
-        baselineTurnCount: Array.isArray(state.liveView.conversation?.turns) ? state.liveView.conversation.turns.length : 0
-      }).then((found) => (found ? "history" : "timeout"));
-
-      const winner = await Promise.race([streamPromise, historyFallbackPromise]);
-      if (winner === "history") {
-        streamAbortController.abort();
-      }
+      );
     } else {
       await requestSessionInputStream(
         liveSessionId,
@@ -729,7 +656,9 @@ async function submitInput() {
         }
       );
     }
-    const finalPayload = await requestConversationSnapshotBySessionId(liveSessionId);
+    const finalPayload = targetThreadId
+      ? await requestConversationSnapshotByThread(targetProvider, targetThreadId)
+      : await requestConversationSnapshotBySessionId(liveSessionId);
     if (finalPayload) {
       handleLivePayload(finalPayload);
     }

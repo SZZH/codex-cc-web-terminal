@@ -283,6 +283,9 @@ export function createLiveSessionRuntimeController({
   function handleLivePayload(payload, deps = {}) {
     const { activeThreadId, detectSystemFailureText, isDisposableAssistantFragment } = deps;
     if (payload.type === "message.delta" || payload.type === "message.completed") {
+      if (state.liveView.hasReducerConversationDelta) {
+        return;
+      }
       const text = String(payload?.text || "").trim();
       const turnId = String(payload?.turnId || "").trim();
       if (text && turnId) {
@@ -309,6 +312,9 @@ export function createLiveSessionRuntimeController({
     }
 
     if (payload.type === "process.started" || payload.type === "process.delta" || payload.type === "process.completed") {
+      if (state.liveView.hasReducerConversationDelta) {
+        return;
+      }
       const turnId = String(payload?.turnId || "").trim();
       const summary = String(payload?.summary || "").trim();
       if (turnId && summary) {
@@ -329,6 +335,16 @@ export function createLiveSessionRuntimeController({
     }
 
     if (payload.type === "turn.completed") {
+      if (state.liveView.hasReducerConversationDelta) {
+        const turnId = String(payload?.turnId || "").trim();
+        const activeTurn = (Array.isArray(state.liveView.conversation?.turns) ? state.liveView.conversation.turns : []).find(
+          (turn) => String(turn?.id || "").trim() === turnId
+        );
+        if (activeTurn && (isTerminalTurnStatus(activeTurn?.assistant?.status) || isTerminalTurnStatus(payload?.status))) {
+          settleAuthoritativeInputState();
+        }
+        return;
+      }
       const turnId = String(payload?.turnId || "").trim();
       if (turnId) {
         const nextConversation = threadRuntime.mergeConversationPatch(state.liveView.conversation, {
@@ -425,6 +441,9 @@ export function createLiveSessionRuntimeController({
     if (payload.type === "thread.overlay") {
       stopHistorySyncLoop?.();
       threadRuntime.setLiveOverlay(payload);
+      if (state.liveView.hasReducerConversationDelta) {
+        return;
+      }
       const hasTypedConversation =
         Array.isArray(state.liveView.conversation?.turns) &&
         state.liveView.conversation.turns.some((turn) => {
@@ -505,11 +524,13 @@ export function createLiveSessionRuntimeController({
       if (applied) {
         state.liveView.hasConversationSnapshot = true;
       }
+      state.liveView.hasReducerConversationDelta = true;
       return;
     }
 
     if (payload.type === "conversation.delta") {
       clearPendingReplyStatus();
+      const previousActiveTurnId = String(state.liveView.conversation?.activeTurnId || "").trim();
       const applied = applyConversationDeltaPayload(state.liveView.conversation, payload);
       const updated = threadRuntime.setConversation(applied.conversation, {
         fallbackMessages: threadRuntime.collectConversationFallbackMessages(state.liveView.messages)
@@ -525,6 +546,18 @@ export function createLiveSessionRuntimeController({
       if (updated) {
         state.liveView.hasConversationSnapshot = true;
         state.liveView.hasConversationDelta = true;
+      }
+      state.liveView.hasReducerConversationDelta = true;
+      const terminalDeltaTurnId = (Array.isArray(payload?.deltas) ? payload.deltas : [])
+        .filter((delta) => delta?.kind === "turn_completed" || delta?.kind === "turn_status_changed")
+        .reverse()
+        .find((delta) => isTerminalTurnStatus(delta?.status))?.turnId;
+      const trackedTurnId = String(terminalDeltaTurnId || previousActiveTurnId || applied.conversation?.activeTurnId || "").trim();
+      const trackedTurn = (Array.isArray(applied.conversation?.turns) ? applied.conversation.turns : []).find(
+        (turn) => String(turn?.id || "").trim() === trackedTurnId
+      );
+      if (isTerminalTurnStatus(trackedTurn?.assistant?.status)) {
+        settleAuthoritativeInputState();
       }
       return;
     }
@@ -621,6 +654,7 @@ export function createLiveSessionRuntimeController({
     state.liveView.streamBuffer = "";
     state.liveView.hasConversationSnapshot = false;
     state.liveView.hasConversationDelta = false;
+    state.liveView.hasReducerConversationDelta = false;
     state.liveView.muteSocketLifecycleStatus = false;
     const socket = new WebSocket(resolveWsUrl(sessionId));
     state.liveView.socket = socket;

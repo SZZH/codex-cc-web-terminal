@@ -544,6 +544,60 @@ test("codex live session auto-renames and streams app-server replies", async () 
   assert.equal(live.titleSource, "first_user_input");
   assert.match(live.buffer, /reply:整理一个回归测试计划/);
   assert.ok(sentPayloads.some((payload) => payload.type === "message_part"));
+  assert.equal(live.turnRunning, false);
+  assert.equal(live.conversationState.turns[0].assistant.status, "completed");
+  assert.ok(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "conversation.delta" &&
+        (payload.deltas || []).some(
+          (delta) =>
+            delta.kind === "conversation_replaced" &&
+            delta.conversation?.turns?.some((turn) => turn.assistant?.status === "completed")
+        )
+    )
+  );
+});
+
+test("app-server synchronous completed result finalizes the turn without waiting for completion notification", async () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd() });
+  const live = manager.get(session.id);
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  manager.write(session.id, "同步完成路径");
+  await waitForMicrotasks();
+
+  assert.equal(live.turnRunning, false);
+  assert.equal(live.currentTurnId, "");
+  assert.equal(live.conversationState.turns.length, 1);
+  assert.equal(live.conversationState.turns[0].assistant.status, "completed");
+  assert.match(live.conversationState.turns[0].assistant.body[0].text, /reply:同步完成路径/);
+  assert.ok(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "turn.completed" &&
+        payload.status === "completed"
+    )
+  );
+  assert.ok(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "conversation.delta" &&
+        (payload.deltas || []).some(
+          (delta) =>
+            delta.kind === "conversation_replaced" &&
+            delta.conversation?.turns?.some((turn) => turn.assistant?.status === "completed")
+        )
+    )
+  );
 });
 
 test("codex live session emits a fallback message when app-server returns no visible output", async () => {
@@ -615,6 +669,7 @@ test("app-server failed turn surfaces the real error instead of no-reply fallbac
   });
 
   live.currentTurnId = manager.createConversationTurn(live, "触发失败", "2026-04-14T00:00:00.000Z");
+  live.turnRunning = true;
   manager.handleAppServerNotification({
     method: "turn/completed",
     params: {
@@ -631,8 +686,8 @@ test("app-server failed turn surfaces the real error instead of no-reply fallbac
   });
 
   const failedTurn = live.conversationState.turns[0];
-  assert.equal(failedTurn.assistant.process.length, 1);
-  assert.match(failedTurn.assistant.process[0].summary, /502 Bad Gateway/);
+  assert.equal(failedTurn.id, "turn-failed-1");
+  assert.equal(failedTurn.assistant.status, "failed");
   assert.ok(
     sentPayloads.some(
       (payload) =>
@@ -826,10 +881,170 @@ test("app-server message delta notifications emit typed message events directly"
   });
 
   assert.ok(sentPayloads.some((payload) => payload.type === "message.delta" && payload.text === "第一段增量"));
+  assert.ok(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "conversation.delta" &&
+        payload.deltas?.some(
+          (delta) =>
+            delta.kind === "body_appended" &&
+            delta.turnId === live.currentTurnId &&
+            delta.block?.mergeMode === "stream_append" &&
+            delta.block?.text === "第一段增量"
+        )
+    )
+  );
+});
+
+test("app-server message delta without a server turn id does not write conversation.delta to the current turn", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-missing-turn-id-events" });
+  const live = manager.get(session.id);
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  live.currentTurnId = manager.createConversationTurn(live, "测试缺 turnId", "2026-04-29T00:00:00.000Z");
+  live.turnRunning = true;
+
+  manager.handleAppServerNotification({
+    method: "item/agentMessage/delta",
+    params: {
+      threadId: "thread-missing-turn-id-events",
+      delta: "不能写到 current turn"
+    }
+  });
+
+  assert.equal(live.conversationState.turns[0].assistant.body.length, 0);
+  assert.equal(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "conversation.delta" &&
+        payload.deltas?.some(
+          (delta) =>
+            delta.kind === "body_appended" &&
+            delta.turnId === live.currentTurnId &&
+            delta.block?.text === "不能写到 current turn"
+        )
+    ),
+    false
+  );
+});
+
+test("app-server turn completion with unaliased server turn id does not finalize the current local turn", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-unaliased-completion" });
+  const live = manager.get(session.id);
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const localTurnId = manager.createConversationTurn(live, "本地 pending turn", "2026-04-29T00:00:00.000Z");
+  live.currentTurnId = localTurnId;
+  live.activePendingTurnId = "";
+  live.turnRunning = true;
+
+  manager.handleAppServerNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-unaliased-completion",
+      turn: {
+        id: "server-turn-not-yet-known",
+        status: "completed",
+        error: null
+      }
+    }
+  });
+
+  assert.equal(live.currentTurnId, localTurnId);
+  assert.equal(live.turnRunning, true);
+  assert.equal(live.conversationState.turns.length, 1);
+  assert.equal(live.conversationState.turns[0].id, localTurnId);
+  assert.equal(live.conversationState.turns[0].assistant.status, "running");
+  assert.equal(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "conversation.delta" &&
+        payload.deltas?.some((delta) => delta.kind === "turn_completed" && delta.turnId === localTurnId)
+    ),
+    false
+  );
+  assert.ok(sentPayloads.some((payload) => payload.type === "turn.completed" && payload.turnId === "server-turn-not-yet-known"));
+});
+
+test("app-server real turn id aliases the active pending local turn before conversation deltas are applied", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-alias-events" });
+  const live = manager.get(session.id);
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const localTurnId = manager.createConversationTurn(live, "测试真实 turnId", "2026-04-29T00:00:00.000Z");
+  live.turnRunning = true;
+  live.currentTurnId = localTurnId;
+
+  manager.handleAppServerNotification({
+    method: "item/agentMessage/delta",
+    params: {
+      threadId: "thread-alias-events",
+      turnId: "server-turn-alias-1",
+      delta: "真实 turn 增量"
+    }
+  });
+
+  assert.equal(live.currentTurnId, "server-turn-alias-1");
+  assert.deepEqual(live.conversationState.turns.map((turn) => turn.id), ["server-turn-alias-1"]);
+  assert.equal(live.conversationState.turns[0].user.text, "测试真实 turnId");
+  assert.ok(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "conversation.delta" &&
+        payload.deltas?.some(
+          (delta) =>
+            delta.kind === "body_appended" &&
+            delta.turnId === "server-turn-alias-1" &&
+            delta.clientTurnId === localTurnId &&
+            delta.aliasSource === "active-pending-turn" &&
+            delta.block?.text === "真实 turn 增量"
+        )
+    )
+  );
 });
 
 test("queued codex turns do not rebind currentTurnId before the running turn finishes", async () => {
-  const { manager } = createManager();
+  class InProgressAppServerBridgeStub extends EventEmitter {
+    async startTurn(session) {
+      session.resumeSessionId ||= "thread-queue-bind-events";
+      return {
+        turn: {
+          id: "turn-queue-running",
+          items: [],
+          status: "inProgress",
+          error: null
+        }
+      };
+    }
+  }
+
+  const rootDir = createTempDir();
+  const config = createBaseConfig(rootDir);
+  const manager = new SessionManager(config, { appServerBridge: new InProgressAppServerBridgeStub() });
   const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-queue-bind-events" });
   const live = manager.get(session.id);
 

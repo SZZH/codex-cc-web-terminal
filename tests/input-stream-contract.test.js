@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 import { createSseStreamWriter } from "../src/transport/index.js";
+import { openSessionSseStream } from "../src/transport/sse/sessionStream.js";
 import { requestSessionInputStream } from "../web/src/lib/api.js";
 import { login, startTestServer } from "./helpers/backendTestUtils.js";
 import { normalizeSessionInputEvents, applySessionInputEvents } from "../src/transport/index.js";
@@ -159,9 +160,10 @@ test("input-stream contract: thread-scoped SSE keeps resume threadId on streamed
   await reader.cancel().catch(() => {});
 
   const frames = parseSseFrames(buffer);
-  const snapshotFrame = frames.find((frame) => frame.event === "thread.snapshot");
+  const snapshotFrame = frames.find((frame) => frame.event === "conversation.snapshot");
   assert.ok(snapshotFrame);
   assert.equal(snapshotFrame.payload.threadId, liveSession.resumeSessionId);
+  assert.equal(snapshotFrame.payload.type, "conversation.snapshot");
   assert.deepEqual(writes, [{ id: liveSession.id, data: "继续这个 thread\n" }]);
 });
 
@@ -279,7 +281,7 @@ test("input-stream contract: session-scoped route delegates to thread-backed liv
   assert.deepEqual(attachCalls, [resolvedLiveSession.id]);
 });
 
-test("input-stream contract: route tracks the turn id returned by write() so fast terminal snapshots can close the stream", async (t) => {
+test("input-stream contract: route streams conversation.snapshot without using terminal snapshots as stream completion", async (t) => {
   const liveSession = {
     id: "session-close-1",
     provider: "codex",
@@ -401,25 +403,43 @@ test("input-stream contract: route tracks the turn id returned by write() so fas
   });
 
   assert.equal(response.status, 200);
-  const text = await Promise.race([
-    response.text(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for input-stream to close")), 1000))
-  ]);
-  const frames = parseSseFrames(text);
-  assert.ok(frames.some((frame) => frame.event === "thread.snapshot" && frame.payload?.version === 2));
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (!buffer.includes("version\":2") || !buffer.includes("event: keepalive")) {
+    const { value, done } = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for terminal conversation snapshot")), 1000))
+    ]);
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+  }
+  await reader.cancel().catch(() => {});
+  const frames = parseSseFrames(buffer);
+  assert.ok(frames.some((frame) => frame.event === "conversation.snapshot" && frame.payload?.conversation?.version === 2));
+  assert.ok(frames.some((frame) => frame.event === "keepalive"));
 });
 
-test("input-stream contract: typed completed thread.snapshot closes the SSE stream for the tracked turn after a short terminal drain window", async () => {
+test("input-stream contract: openSessionSseStream emits conversation.delta directly and closes after tracked turn completion", async () => {
   const liveSession = {
-    id: "session-close-typed-1",
+    id: "session-conversation-delta-1",
     provider: "codex",
-    resumeSessionId: "thread-close-typed-1",
-    currentTurnId: "turn-close-typed-1",
+    resumeSessionId: "thread-conversation-delta-1",
+    currentTurnId: "turn-conversation-delta-1",
     clients: new Set(),
     threadSnapshot: {
-      threadId: "thread-close-typed-1",
-      activeTurnId: null,
-      turns: []
+      threadId: "thread-conversation-delta-1",
+      activeTurnId: "turn-conversation-delta-1",
+      turns: [{ id: "turn-conversation-delta-1", status: "inProgress", items: [] }]
+    },
+    conversationState: {
+      sessionId: "session-conversation-delta-1",
+      threadId: "thread-conversation-delta-1",
+      version: 1,
+      activeTurnId: "turn-conversation-delta-1",
+      turns: [{ id: "turn-conversation-delta-1", assistant: { status: "running", body: [] } }]
     }
   };
 
@@ -428,37 +448,40 @@ test("input-stream contract: typed completed thread.snapshot closes the SSE stre
       return id === liveSession.id ? liveSession : null;
     },
     attachClient(_sessionId, client) {
-      liveSession.threadSnapshot = {
-        threadId: "thread-close-typed-1",
-        activeTurnId: "",
-        turns: [{ id: "turn-close-typed-1", status: "completed", items: [] }]
-      };
-      liveSession.conversationState = {
-        threadId: "thread-close-typed-1",
-        activeTurnId: "",
-        turns: [{ id: "turn-close-typed-1", assistant: { status: "completed", body: [] } }]
-      };
+      liveSession.clients.add(client);
       client.send(
         JSON.stringify({
-          type: "thread.snapshot",
-          threadId: "thread-close-typed-1",
-          sessionId: "session-close-typed-1",
-          turnId: "turn-close-typed-1",
-          status: "completed",
-          version: 99,
-          partial: true,
-          snapshot: {
-            threadId: "thread-close-typed-1",
-            activeTurnId: "",
-            turns: [{ id: "turn-close-typed-1", status: "completed", items: [] }]
-          },
+          type: "conversation.delta",
+          sessionId: "session-conversation-delta-1",
+          threadId: "thread-conversation-delta-1",
+          fromVersion: 1,
+          toVersion: 2,
           conversation: {
-            sessionId: "session-close-typed-1",
-            threadId: "thread-close-typed-1",
-            status: "completed",
-            activeTurnId: "",
-            turns: [{ id: "turn-close-typed-1", assistant: { status: "completed", body: [] } }]
-          }
+            sessionId: "session-conversation-delta-1",
+            threadId: "thread-conversation-delta-1",
+            version: 2,
+            status: "running",
+            activeTurnId: "turn-conversation-delta-1",
+            turns: [{ id: "turn-conversation-delta-1", assistant: { status: "running", body: [] } }]
+          },
+          deltas: [
+            {
+              kind: "body_appended",
+              turnId: "turn-conversation-delta-1",
+              block: {
+                id: "body-conversation-delta-1",
+                kind: "markdown",
+                text: "direct delta",
+                mergeMode: "stream_append"
+              }
+            },
+            {
+              kind: "turn_completed",
+              turnId: "turn-conversation-delta-1",
+              status: "completed",
+              timestamp: "2026-04-29T14:00:00.000Z"
+            }
+          ]
         })
       );
     }
@@ -487,38 +510,45 @@ test("input-stream contract: typed completed thread.snapshot closes the SSE stre
     }
   };
 
-  const { openSessionSseStream } = await import("../src/transport/sse/sessionStream.js");
   const stream = openSessionSseStream({
     req,
     res,
     sessionManager,
     sessionId: liveSession.id,
-    keepaliveMs: 15_000,
+    keepaliveMs: 5,
     terminalCloseDelayMs: 10
   });
-  stream.setTrackedTurnId("turn-close-typed-1");
+  stream.setTrackedTurnId("turn-conversation-delta-1");
 
   await new Promise((resolve) => setTimeout(resolve, 25));
+  const text = chunks.join("");
+  const frames = parseSseFrames(text);
+  const deltaFrame = frames.find((frame) => frame.event === "conversation.delta");
+  assert.ok(deltaFrame);
+  assert.equal(deltaFrame.payload.type, "conversation.delta");
+  assert.equal(deltaFrame.payload.deltas.length, 2);
+  assert.equal(deltaFrame.payload.deltas[0].kind, "body_appended");
+  assert.equal(deltaFrame.payload.deltas[1].kind, "turn_completed");
   assert.equal(closed, true);
-  assert.ok(chunks.join("").includes("event: thread.snapshot") || closed);
+  stream.close();
 });
 
-test("input-stream contract: terminal tracked snapshots keep the stream open long enough for trailing same-turn events", async () => {
+test("input-stream contract: typed terminal turn events close after tail events for the tracked turn", async () => {
   const liveSession = {
-    id: "session-terminal-drain-1",
+    id: "session-terminal-open-1",
     provider: "codex",
-    resumeSessionId: "thread-terminal-drain-1",
-    currentTurnId: "turn-terminal-drain-1",
+    resumeSessionId: "thread-terminal-open-1",
+    currentTurnId: "turn-terminal-open-1",
     clients: new Set(),
     threadSnapshot: {
-      threadId: "thread-terminal-drain-1",
-      activeTurnId: "turn-terminal-drain-1",
-      turns: [{ id: "turn-terminal-drain-1", status: "running", items: [] }]
+      threadId: "thread-terminal-open-1",
+      activeTurnId: "turn-terminal-open-1",
+      turns: [{ id: "turn-terminal-open-1", status: "running", items: [] }]
     },
     conversationState: {
-      threadId: "thread-terminal-drain-1",
-      activeTurnId: "turn-terminal-drain-1",
-      turns: [{ id: "turn-terminal-drain-1", assistant: { status: "running", body: [] } }]
+      threadId: "thread-terminal-open-1",
+      activeTurnId: "turn-terminal-open-1",
+      turns: [{ id: "turn-terminal-open-1", assistant: { status: "running", body: [] } }]
     }
   };
 
@@ -550,38 +580,15 @@ test("input-stream contract: terminal tracked snapshots keep the stream open lon
       return id === liveSession.id ? liveSession : null;
     },
     attachClient(_sessionId, client) {
-      liveSession.threadSnapshot = {
-        threadId: "thread-terminal-drain-1",
-        activeTurnId: "",
-        turns: [{ id: "turn-terminal-drain-1", status: "completed", items: [] }]
-      };
-      liveSession.conversationState = {
-        threadId: "thread-terminal-drain-1",
-        activeTurnId: "",
-        turns: [{ id: "turn-terminal-drain-1", assistant: { status: "completed", body: [] } }]
-      };
       liveSession.clients.add(client);
       client.send(
         JSON.stringify({
-          type: "thread.snapshot",
-          threadId: "thread-terminal-drain-1",
-          sessionId: "session-terminal-drain-1",
-          turnId: "turn-terminal-drain-1",
+          type: "turn.completed",
+          threadId: "thread-terminal-open-1",
+          sessionId: "session-terminal-open-1",
+          turnId: "turn-terminal-open-1",
           status: "completed",
-          version: 41,
-          partial: true,
-          snapshot: {
-            threadId: "thread-terminal-drain-1",
-            activeTurnId: "",
-            turns: [{ id: "turn-terminal-drain-1", status: "completed", items: [] }]
-          },
-          conversation: {
-            sessionId: "session-terminal-drain-1",
-            threadId: "thread-terminal-drain-1",
-            status: "completed",
-            activeTurnId: "",
-            turns: [{ id: "turn-terminal-drain-1", assistant: { status: "completed", body: [] } }]
-          }
+          ts: "2026-04-29T14:00:00.000Z"
         })
       );
 
@@ -589,9 +596,9 @@ test("input-stream contract: terminal tracked snapshots keep the stream open lon
         client.send(
           JSON.stringify({
             type: "process.completed",
-            sessionId: "session-terminal-drain-1",
-            threadId: "thread-terminal-drain-1",
-            turnId: "turn-terminal-drain-1",
+            sessionId: "session-terminal-open-1",
+            threadId: "thread-terminal-open-1",
+            turnId: "turn-terminal-open-1",
             processId: "proc-tail-1",
             processType: "command_execution",
             summary: "tail event",
@@ -602,22 +609,23 @@ test("input-stream contract: terminal tracked snapshots keep the stream open lon
     }
   };
 
-  const { openSessionSseStream } = await import("../src/transport/sse/sessionStream.js");
   const stream = openSessionSseStream({
     req,
     res,
     sessionManager,
     sessionId: liveSession.id,
-    keepaliveMs: 15_000,
+    keepaliveMs: 5,
     terminalCloseDelayMs: 20
   });
-  stream.setTrackedTurnId("turn-terminal-drain-1");
+  stream.setTrackedTurnId("turn-terminal-open-1");
 
   await new Promise((resolve) => setTimeout(resolve, 40));
 
   assert.equal(closed, true);
   const text = chunks.join("");
+  assert.match(text, /event: turn\.completed/);
   assert.match(text, /event: process\.completed/);
+  stream.close();
 });
 
 test("typed SSE writer contract: event type becomes event name and version-like fields become SSE id", () => {
@@ -896,8 +904,9 @@ test("typed SSE contract: transport ignores legacy snapshot event names instead 
 
   assert.match(
     sessionStreamSource,
-    /if \(type === "conversation\.snapshot" \|\| type === "conversation\.delta"\) \{/
+    /if \(type === "conversation\.snapshot" \|\| type === "conversation\.delta"\) \{[\s\S]*kind: "typed"/
   );
+  assert.doesNotMatch(sessionStreamSource, /buildThreadTransportSnapshot\(session, payload/);
   assert.doesNotMatch(sessionStreamSource, /type === "snapshot"/);
   assert.doesNotMatch(sessionStreamSource, /type === "conversation_snapshot"/);
 });
@@ -915,6 +924,12 @@ test("input-stream main-path guard: App closes the legacy websocket before switc
   assert.match(
     appSource,
     /state\.liveView\.activeInputStream = true;[\s\S]*if \(targetThreadId\) \{[\s\S]*requestThreadInputStream\(/
+  );
+  assert.doesNotMatch(appSource, /waitForHistoricalReply/);
+  assert.doesNotMatch(appSource, /Promise\.race\(\[streamPromise,\s*historyFallbackPromise\]\)/);
+  assert.match(
+    appSource,
+    /requestThreadInputStream\([\s\S]*?\);\s*\} else \{[\s\S]*?const finalPayload = targetThreadId[\s\S]*requestConversationSnapshotByThread/
   );
   assert.match(
     appSource,

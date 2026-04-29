@@ -243,6 +243,131 @@ test("version-gap payload resyncs to authoritative conversation snapshot instead
   assert.equal(conversation.turns[0].assistant.body[0].text, "同步后的正式答案");
 });
 
+test("server turn id aliases the local optimistic turn before streaming body deltas land", () => {
+  let state = createConversationState({
+    sessionId: "session-alias",
+    threadId: "thread-alias",
+    version: 0
+  });
+
+  state = applyPayload(state, {
+    deltas: [
+      {
+        kind: "turn_created",
+        turnId: "client-turn-1",
+        timestamp: "2026-04-29T00:00:00.000Z",
+        user: {
+          id: "user-alias-1",
+          text: "测试 alias",
+          ts: "2026-04-29T00:00:00.000Z"
+        }
+      },
+      {
+        kind: "turn_status_changed",
+        turnId: "server-turn-1",
+        clientTurnId: "client-turn-1",
+        aliasSource: "active-pending-turn",
+        status: "running",
+        timestamp: "2026-04-29T00:00:01.000Z"
+      },
+      {
+        kind: "body_appended",
+        turnId: "server-turn-1",
+        block: {
+          id: "body-server-1",
+          kind: "markdown",
+          text: "真实增量",
+          payload: { phase: "streaming" },
+          ts: "2026-04-29T00:00:02.000Z",
+          mergeMode: "stream_append"
+        }
+      }
+    ]
+  });
+
+  assert.equal(state.turns.length, 1);
+  assert.equal(state.turns[0].id, "server-turn-1");
+  assert.equal(state.turns[0].user.text, "测试 alias");
+  assert.equal(state.turns[0].assistant.body[0].text, "真实增量");
+  assert.equal(state.activeTurnId, "server-turn-1");
+});
+
+test("streaming body delta can establish the server turn alias without a prior status delta", () => {
+  let state = createConversationState({
+    sessionId: "session-alias-body",
+    threadId: "thread-alias-body",
+    version: 0
+  });
+
+  state = applyPayload(state, {
+    deltas: [
+      {
+        kind: "turn_created",
+        turnId: "client-turn-body",
+        timestamp: "2026-04-29T00:00:00.000Z",
+        user: {
+          id: "user-alias-body",
+          text: "测试首段 alias",
+          ts: "2026-04-29T00:00:00.000Z"
+        }
+      },
+      {
+        kind: "body_appended",
+        turnId: "server-turn-body",
+        clientTurnId: "client-turn-body",
+        aliasSource: "active-pending-turn",
+        block: {
+          id: "body-server-first",
+          kind: "markdown",
+          text: "首段真实增量",
+          payload: { phase: "streaming" },
+          ts: "2026-04-29T00:00:01.000Z",
+          mergeMode: "stream_append"
+        }
+      }
+    ]
+  });
+
+  assert.equal(state.turns.length, 1);
+  assert.equal(state.turns[0].id, "server-turn-body");
+  assert.equal(state.turns[0].user.text, "测试首段 alias");
+  assert.equal(state.turns[0].assistant.body[0].text, "首段真实增量");
+  assert.equal(state.activeTurnId, "server-turn-body");
+});
+
+test("unresolved body delta without turn id is buffered out of the visible conversation instead of guessing active turn", () => {
+  let state = createConversationState({
+    sessionId: "session-unresolved",
+    threadId: "thread-unresolved",
+    activeTurnId: "turn-active",
+    turns: [
+      {
+        id: "turn-active",
+        user: { id: "user-active", text: "已有 turn", ts: "2026-04-29T00:00:00.000Z" },
+        assistant: { status: "running", startedAt: "", finishedAt: "", process: [], body: [] }
+      }
+    ]
+  });
+
+  state = applyPayload(state, {
+    deltas: [
+      {
+        kind: "body_appended",
+        block: {
+          id: "body-unresolved",
+          kind: "markdown",
+          text: "不能猜写到 active turn",
+          payload: { phase: "streaming" },
+          ts: "2026-04-29T00:00:01.000Z",
+          mergeMode: "stream_append"
+        }
+      }
+    ]
+  });
+
+  assert.equal(state.turns[0].assistant.body.length, 0);
+});
+
 test("conversation_replaced delta swaps live conversation to the authoritative snapshot immediately", () => {
   const current = createConversationState({
     sessionId: "session-replaced",

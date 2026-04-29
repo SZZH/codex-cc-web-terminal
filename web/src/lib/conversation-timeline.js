@@ -155,7 +155,8 @@ export function createConversationState(input = {}) {
     updatedAt: toTimestamp(input?.updatedAt),
     turns: asArray(input?.turns),
     backgroundAgents: sortAgents(asArray(input?.backgroundAgents)),
-    activeTurnId: String(input?.activeTurnId || "")
+    activeTurnId: String(input?.activeTurnId || ""),
+    turnAliases: input?.turnAliases && typeof input.turnAliases === "object" ? { ...input.turnAliases } : {}
   };
 }
 
@@ -226,9 +227,79 @@ function replaceTurn(turns, turnId, updater) {
   });
 }
 
+function resolveTurnAlias(state, turnId = "") {
+  const targetTurnId = String(turnId || "").trim();
+  if (!targetTurnId) {
+    return "";
+  }
+  return String(state?.turnAliases?.[targetTurnId] || targetTurnId).trim();
+}
+
+function mergeAssistantState(left = {}, right = {}) {
+  const leftBody = asArray(left?.body);
+  const rightBody = asArray(right?.body);
+  const leftProcess = asArray(left?.process);
+  const rightProcess = asArray(right?.process);
+  const rightStatus = String(right?.status || "").trim();
+  const leftStatus = String(left?.status || "").trim();
+  return {
+    ...left,
+    ...right,
+    body: rightBody.length ? rightBody : leftBody,
+    process: rightProcess.length ? rightProcess : leftProcess,
+    status: rightStatus || leftStatus || "running",
+    startedAt: String(left?.startedAt || right?.startedAt || ""),
+    finishedAt: String(right?.finishedAt || left?.finishedAt || "")
+  };
+}
+
+function aliasTurn(state, clientTurnId = "", serverTurnId = "") {
+  const clientId = String(clientTurnId || "").trim();
+  const serverId = String(serverTurnId || "").trim();
+  if (!clientId || !serverId || clientId === serverId) {
+    return state;
+  }
+
+  const aliases = { ...(state.turnAliases || {}), [clientId]: serverId, [serverId]: serverId };
+  const turns = [...state.turns];
+  const clientIndex = turns.findIndex((turn) => String(turn?.id || "").trim() === clientId);
+  const serverIndex = turns.findIndex((turn) => String(turn?.id || "").trim() === serverId);
+
+  if (clientIndex >= 0 && serverIndex >= 0 && clientIndex !== serverIndex) {
+    const clientTurn = turns[clientIndex];
+    const serverTurn = turns[serverIndex];
+    turns[serverIndex] = {
+      ...clientTurn,
+      ...serverTurn,
+      id: serverId,
+      user: serverTurn?.user || clientTurn?.user || null,
+      assistant: mergeAssistantState(clientTurn?.assistant || {}, serverTurn?.assistant || {})
+    };
+    turns.splice(clientIndex, 1);
+  } else if (clientIndex >= 0) {
+    turns[clientIndex] = {
+      ...turns[clientIndex],
+      id: serverId
+    };
+  }
+
+  return {
+    ...state,
+    turns,
+    activeTurnId: state.activeTurnId === clientId ? serverId : state.activeTurnId,
+    turnAliases: aliases
+  };
+}
+
 function applyTurnCreated(state, delta) {
+  const serverTurnId = String(delta.turnId || "").trim();
+  const clientTurnId = String(delta.clientTurnId || delta.localTurnId || "").trim();
+  let baseState = state;
+  if (clientTurnId && serverTurnId && clientTurnId !== serverTurnId) {
+    baseState = aliasTurn(baseState, clientTurnId, serverTurnId);
+  }
   const nextTurn = {
-    id: String(delta.turnId || ""),
+    id: resolveTurnAlias(baseState, serverTurnId),
     sessionId: String(delta.sessionId || state.sessionId || ""),
     threadId: String(delta.threadId || state.threadId || ""),
     user: delta.user || null,
@@ -240,9 +311,9 @@ function applyTurnCreated(state, delta) {
       finishedAt: ""
     }
   };
-  const turns = state.turns.filter((turn) => turn.id !== nextTurn.id);
+  const turns = baseState.turns.filter((turn) => turn.id !== nextTurn.id);
   return {
-    ...state,
+    ...baseState,
     turns: [...turns, nextTurn],
     activeTurnId: nextTurn.id,
     status: "running"
@@ -310,10 +381,16 @@ function areProcessEventsEquivalent(left, right) {
 }
 
 function applyBodyAppended(state, delta) {
-  const targetTurnId = String(delta.turnId || state.activeTurnId || "");
+  const serverTurnId = String(delta.turnId || "").trim();
+  const clientTurnId = String(delta.clientTurnId || delta.localTurnId || "").trim();
+  const baseState = clientTurnId && serverTurnId ? aliasTurn(state, clientTurnId, serverTurnId) : state;
+  const targetTurnId = resolveTurnAlias(baseState, serverTurnId);
+  if (!targetTurnId) {
+    return baseState;
+  }
   return {
-    ...state,
-    turns: replaceTurn(state.turns, targetTurnId, (turn) => {
+    ...baseState,
+    turns: replaceTurn(baseState.turns, targetTurnId, (turn) => {
       const nextBody = [...(turn?.assistant?.body || [])];
       const incoming = delta.block || {};
       const incomingKind = String(incoming.kind || "markdown");
@@ -369,10 +446,16 @@ function applyBodyAppended(state, delta) {
 }
 
 function applyProcessAppended(state, delta) {
-  const targetTurnId = String(delta.turnId || state.activeTurnId || "");
+  const serverTurnId = String(delta.turnId || "").trim();
+  const clientTurnId = String(delta.clientTurnId || delta.localTurnId || "").trim();
+  const baseState = clientTurnId && serverTurnId ? aliasTurn(state, clientTurnId, serverTurnId) : state;
+  const targetTurnId = resolveTurnAlias(baseState, serverTurnId);
+  if (!targetTurnId) {
+    return baseState;
+  }
   return {
-    ...state,
-    turns: replaceTurn(state.turns, targetTurnId, (turn) => {
+    ...baseState,
+    turns: replaceTurn(baseState.turns, targetTurnId, (turn) => {
       const nextProcess = [...(turn?.assistant?.process || [])];
       const incomingEvent = delta.event || {};
       const lastEvent = nextProcess[nextProcess.length - 1];
@@ -394,12 +477,18 @@ function applyProcessAppended(state, delta) {
 }
 
 function applyTurnStatusChanged(state, delta) {
-  const targetTurnId = String(delta.turnId || state.activeTurnId || "");
+  const serverTurnId = String(delta.turnId || "").trim();
+  const clientTurnId = String(delta.clientTurnId || delta.localTurnId || "").trim();
+  const baseState = clientTurnId && serverTurnId ? aliasTurn(state, clientTurnId, serverTurnId) : state;
+  const targetTurnId = resolveTurnAlias(baseState, serverTurnId);
+  if (!targetTurnId) {
+    return baseState;
+  }
   const nextStatus = String(delta.status || "running");
   return {
-    ...state,
+    ...baseState,
     status: nextStatus,
-    turns: replaceTurn(state.turns, targetTurnId, (turn) => ({
+    turns: replaceTurn(baseState.turns, targetTurnId, (turn) => ({
       ...turn,
       assistant: {
         ...(turn?.assistant || {}),
@@ -411,13 +500,19 @@ function applyTurnStatusChanged(state, delta) {
 }
 
 function applyTurnCompleted(state, delta) {
-  const targetTurnId = String(delta.turnId || state.activeTurnId || "");
+  const serverTurnId = String(delta.turnId || "").trim();
+  const clientTurnId = String(delta.clientTurnId || delta.localTurnId || "").trim();
+  const baseState = clientTurnId && serverTurnId ? aliasTurn(state, clientTurnId, serverTurnId) : state;
+  const targetTurnId = resolveTurnAlias(baseState, serverTurnId);
+  if (!targetTurnId) {
+    return baseState;
+  }
   const nextStatus = String(delta.status || "completed");
   return {
-    ...state,
+    ...baseState,
     status: nextStatus,
-    activeTurnId: state.activeTurnId === targetTurnId ? "" : state.activeTurnId,
-    turns: replaceTurn(state.turns, targetTurnId, (turn) => ({
+    activeTurnId: baseState.activeTurnId === targetTurnId ? "" : baseState.activeTurnId,
+    turns: replaceTurn(baseState.turns, targetTurnId, (turn) => ({
       ...turn,
       assistant: {
         ...(turn?.assistant || {}),

@@ -307,6 +307,183 @@ test("live-session-runtime: message.delta and message.completed materialize assi
   assert.equal(state.liveView.conversation.turns[0].assistant.status, "completed");
 });
 
+test("live-session-runtime: typed message events stay fallback-only after conversation.delta owns the turn", () => {
+  const { state, runtime } = createHarness();
+  state.liveView.conversation = {
+    sessionId: "session-live-main-path",
+    threadId: "thread-live-main-path",
+    version: 1,
+    status: "running",
+    activeTurnId: "turn-main-path",
+    updatedAt: "2026-04-29T00:00:00.000Z",
+    backgroundAgents: [],
+    turns: [
+      {
+        id: "turn-main-path",
+        user: { text: "主路径测试", ts: "2026-04-29T00:00:00.000Z" },
+        assistant: { status: "running", process: [], body: [] }
+      }
+    ]
+  };
+
+  runtime.handleLivePayload({
+    type: "conversation.delta",
+    sessionId: "session-live-main-path",
+    threadId: "thread-live-main-path",
+    fromVersion: 1,
+    toVersion: 2,
+    deltas: [
+      {
+        kind: "body_appended",
+        turnId: "turn-main-path",
+        version: 2,
+        block: {
+          id: "body-main-path",
+          kind: "markdown",
+          text: "reducer 内容",
+          payload: { phase: "streaming" },
+          ts: "2026-04-29T00:00:01.000Z",
+          mergeMode: "stream_append"
+        }
+      }
+    ]
+  });
+
+  runtime.handleLivePayload({
+    type: "message.completed",
+    sessionId: "session-live-main-path",
+    threadId: "thread-live-main-path",
+    turnId: "turn-main-path",
+    role: "assistant",
+    text: "typed 不应覆盖 reducer 内容",
+    ts: "2026-04-29T00:00:02.000Z"
+  });
+
+  assert.equal(state.liveView.conversation.turns[0].assistant.body[0].text, "reducer 内容");
+  assert.equal(state.liveView.conversation.turns[0].assistant.status, "running");
+});
+
+test("live-session-runtime: reducer mode typed turn.completed settles even when active turn is still running", () => {
+  const { state, runtime } = createHarness();
+  state.liveView.hasReducerConversationDelta = true;
+  state.liveView.activeInputStream = true;
+  state.liveView.interruptInFlight = true;
+  state.loading = true;
+  state.liveView.conversation = {
+    sessionId: "session-live-terminal-typed",
+    threadId: "thread-live-terminal-typed",
+    version: 2,
+    status: "running",
+    activeTurnId: "turn-live-terminal-typed",
+    updatedAt: "2026-04-29T00:00:00.000Z",
+    backgroundAgents: [],
+    turns: [
+      {
+        id: "turn-live-terminal-typed",
+        user: { text: "terminal typed", ts: "2026-04-29T00:00:00.000Z" },
+        assistant: { status: "running", process: [], body: [{ kind: "markdown", text: "done" }] }
+      }
+    ]
+  };
+
+  runtime.handleLivePayload({
+    type: "turn.completed",
+    sessionId: "session-live-terminal-typed",
+    threadId: "thread-live-terminal-typed",
+    turnId: "turn-live-terminal-typed",
+    status: "completed",
+    ts: "2026-04-29T00:00:03.000Z"
+  });
+
+  assert.equal(state.liveView.activeInputStream, false);
+  assert.equal(state.liveView.interruptInFlight, false);
+  assert.equal(state.loading, false);
+  assert.equal(state.statusText, "");
+});
+
+test("live-session-runtime: reducer mode ignores typed turn.completed for an unknown turn", () => {
+  const { state, runtime } = createHarness();
+  state.liveView.hasReducerConversationDelta = true;
+  state.liveView.activeInputStream = true;
+  state.liveView.interruptInFlight = true;
+  state.loading = true;
+  state.liveView.conversation = {
+    sessionId: "session-live-terminal-unknown",
+    threadId: "thread-live-terminal-unknown",
+    version: 2,
+    status: "running",
+    activeTurnId: "turn-live-terminal-known",
+    updatedAt: "2026-04-29T00:00:00.000Z",
+    backgroundAgents: [],
+    turns: [
+      {
+        id: "turn-live-terminal-known",
+        user: { text: "terminal typed known", ts: "2026-04-29T00:00:00.000Z" },
+        assistant: { status: "running", process: [], body: [{ kind: "markdown", text: "still running" }] }
+      }
+    ]
+  };
+
+  runtime.handleLivePayload({
+    type: "turn.completed",
+    sessionId: "session-live-terminal-unknown",
+    threadId: "thread-live-terminal-unknown",
+    turnId: "server-turn-not-yet-known",
+    status: "completed",
+    ts: "2026-04-29T00:00:03.000Z"
+  });
+
+  assert.equal(state.liveView.activeInputStream, true);
+  assert.equal(state.liveView.interruptInFlight, true);
+  assert.equal(state.loading, true);
+});
+
+test("live-session-runtime: conversation.delta turn_completed settles active input state", () => {
+  const { state, runtime } = createHarness();
+  state.liveView.activeInputStream = true;
+  state.liveView.interruptInFlight = true;
+  state.loading = true;
+  state.liveView.conversation = {
+    sessionId: "session-live-terminal-delta",
+    threadId: "thread-live-terminal-delta",
+    version: 1,
+    status: "running",
+    activeTurnId: "turn-live-terminal-delta",
+    updatedAt: "2026-04-29T00:00:00.000Z",
+    backgroundAgents: [],
+    turns: [
+      {
+        id: "turn-live-terminal-delta",
+        user: { text: "terminal delta", ts: "2026-04-29T00:00:00.000Z" },
+        assistant: { status: "running", process: [], body: [{ kind: "markdown", text: "done" }] }
+      }
+    ]
+  };
+
+  runtime.handleLivePayload({
+    type: "conversation.delta",
+    sessionId: "session-live-terminal-delta",
+    threadId: "thread-live-terminal-delta",
+    fromVersion: 1,
+    toVersion: 2,
+    deltas: [
+      {
+        kind: "turn_completed",
+        turnId: "turn-live-terminal-delta",
+        status: "completed",
+        timestamp: "2026-04-29T00:00:04.000Z"
+      }
+    ]
+  });
+
+  assert.equal(state.liveView.conversation.turns[0].assistant.status, "completed");
+  assert.equal(state.liveView.conversation.activeTurnId, "");
+  assert.equal(state.liveView.activeInputStream, false);
+  assert.equal(state.liveView.interruptInFlight, false);
+  assert.equal(state.loading, false);
+  assert.equal(state.statusText, "");
+});
+
 test("live-session-runtime: turn.completed settles the active turn without waiting for snapshot backfill", () => {
   const { state, runtime } = createHarness();
   state.liveView.activeInputStream = true;

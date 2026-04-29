@@ -3,14 +3,11 @@ import { createCanonicalEvent } from "../../canonical/createCanonicalEvent.js";
 import { createCanonicalEventFromLegacy } from "../../canonical/fromLegacyEvent.js";
 import { CANONICAL_EVENT_KINDS } from "../../canonical/eventKinds.js";
 import {
-  buildThreadTransportOverlay,
-  buildThreadTransportSnapshot
+  buildThreadTransportOverlay
 } from "../../sessions/conversation/protocol.js";
 
 function noop() {}
 
-const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "aborted", "interrupted"]);
-const TERMINAL_PAYLOAD_TYPES = new Set(["turn_completed", "turn_failed", "turn_aborted"]);
 const DIRECT_TYPED_EVENT_TYPES = new Set([
   "message.delta",
   "message.completed",
@@ -29,6 +26,9 @@ const DIRECT_TYPED_EVENT_TYPES = new Set([
   "transport.error",
   "session.updated"
 ]);
+
+const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "aborted", "interrupted"]);
+const TERMINAL_DELTA_KINDS = new Set(["turn_completed", "turn_status_changed"]);
 
 function createCloseSignal() {
   const listeners = new Set();
@@ -137,10 +137,6 @@ export function applySessionInputEvents(sessionManager, sessionId, events = []) 
   return { lastInputTurnId };
 }
 
-function isTerminalTurnStatus(status) {
-  return TERMINAL_TURN_STATUSES.has(String(status || "").trim().toLowerCase());
-}
-
 function findTurnById(turns, turnId) {
   if (!Array.isArray(turns) || !turnId) {
     return null;
@@ -149,62 +145,125 @@ function findTurnById(turns, turnId) {
   return turns.find((turn) => String(turn?.id || "") === turnId) || null;
 }
 
-function isPayloadTerminalForTurn(payload, trackedTurnId) {
-  if (!payload || typeof payload !== "object" || !trackedTurnId) {
-    return false;
-  }
-
-  const payloadType = String(payload.type || "").trim();
-  const payloadTurnId = String(payload.turnId || payload?.payload?.turnId || payload?.payload?.turn_id || "");
-  if (TERMINAL_PAYLOAD_TYPES.has(payloadType) && payloadTurnId === trackedTurnId) {
-    return true;
-  }
-  if (payloadType === "thread.snapshot" && payloadTurnId === trackedTurnId && isTerminalTurnStatus(payload?.status)) {
-    return true;
-  }
-
-  const conversationTurn =
-    findTurnById(payload?.conversation?.turns, trackedTurnId) ||
-    findTurnById(payload?.snapshot?.turns, trackedTurnId) ||
-    findTurnById(payload?.turns, trackedTurnId) ||
-    findTurnById(payload?.threadSnapshot?.turns, trackedTurnId) ||
-    findTurnById(payload?.thread?.snapshot?.turns, trackedTurnId);
-
-  return isTerminalTurnStatus(conversationTurn?.status);
+function isTerminalTurnStatus(status) {
+  return TERMINAL_TURN_STATUSES.has(String(status || "").trim().toLowerCase());
 }
 
-function isSessionTerminalForTurn(session, trackedTurnId) {
-  if (!session || !trackedTurnId) {
+function payloadDeltaReferencesTurn(delta, trackedTurnId) {
+  if (!delta || typeof delta !== "object" || !trackedTurnId) {
     return false;
   }
-
-  const threadTurn = findTurnById(session?.threadSnapshot?.turns, trackedTurnId);
-  if (isTerminalTurnStatus(threadTurn?.status)) {
-    return true;
-  }
-
-  const conversationTurn = findTurnById(session?.conversationState?.turns, trackedTurnId);
-  const assistantStatus = String(conversationTurn?.assistant?.status || "").trim().toLowerCase();
-  return isTerminalTurnStatus(conversationTurn?.status) || isTerminalTurnStatus(assistantStatus);
+  return [delta.turnId, delta.turn_id, delta.clientTurnId, delta.localTurnId]
+    .map((value) => String(value || "").trim())
+    .some((value) => value === trackedTurnId);
 }
 
-function payloadReferencesTurn(payload, trackedTurnId) {
-  if (!payload || typeof payload !== "object" || !trackedTurnId) {
+function resolveTrackedTurnIds(session, trackedTurnId = "") {
+  const id = String(trackedTurnId || "").trim();
+  if (!id) {
+    return [];
+  }
+  const ids = new Set([id]);
+  const aliases = session?.turnIdAliases instanceof Map ? session.turnIdAliases : null;
+  if (aliases) {
+    const direct = String(aliases.get(id) || "").trim();
+    if (direct) {
+      ids.add(direct);
+    }
+    for (const [clientId, serverId] of aliases.entries()) {
+      if (String(serverId || "").trim() === id) {
+        ids.add(String(clientId || "").trim());
+      }
+    }
+  }
+  return [...ids].filter(Boolean);
+}
+
+function payloadReferencesAnyTurn(payload, trackedTurnIds = []) {
+  if (!payload || typeof payload !== "object" || !trackedTurnIds.length) {
     return false;
   }
 
   const payloadTurnId = String(payload.turnId || payload?.payload?.turnId || payload?.payload?.turn_id || "").trim();
-  if (payloadTurnId && payloadTurnId === trackedTurnId) {
+  if (payloadTurnId && trackedTurnIds.includes(payloadTurnId)) {
     return true;
   }
 
-  return Boolean(
-    findTurnById(payload?.conversation?.turns, trackedTurnId) ||
-      findTurnById(payload?.snapshot?.turns, trackedTurnId) ||
-      findTurnById(payload?.turns, trackedTurnId) ||
-      findTurnById(payload?.threadSnapshot?.turns, trackedTurnId) ||
-      findTurnById(payload?.thread?.snapshot?.turns, trackedTurnId)
+  if (Array.isArray(payload?.deltas) && payload.deltas.some((delta) => trackedTurnIds.some((turnId) => payloadDeltaReferencesTurn(delta, turnId)))) {
+    return true;
+  }
+
+  return trackedTurnIds.some((turnId) =>
+    Boolean(
+      findTurnById(payload?.conversation?.turns, turnId) ||
+        findTurnById(payload?.snapshot?.turns, turnId) ||
+        findTurnById(payload?.turns, turnId) ||
+        findTurnById(payload?.threadSnapshot?.turns, turnId) ||
+        findTurnById(payload?.thread?.snapshot?.turns, turnId)
+    )
   );
+}
+
+function payloadCompletesTrackedTurn(payload, trackedTurnIds = []) {
+  if (!payload || typeof payload !== "object" || !trackedTurnIds.length) {
+    return false;
+  }
+  const type = String(payload.type || "").trim();
+  if ((type === "turn.completed" || type === "turn.failed" || type === "turn.interrupted") && payloadReferencesAnyTurn(payload, trackedTurnIds)) {
+    return true;
+  }
+  if (type !== "conversation.delta" || !Array.isArray(payload.deltas)) {
+    return false;
+  }
+  return payload.deltas.some((delta) => (
+    (
+      String(delta?.kind || "").trim() === "conversation_replaced"
+        ? trackedTurnIds.some((turnId) =>
+            findTurnById(delta?.conversation?.turns, turnId) &&
+            isTerminalTurnStatus(findTurnById(delta?.conversation?.turns, turnId)?.assistant?.status || findTurnById(delta?.conversation?.turns, turnId)?.status)
+          )
+        : TERMINAL_DELTA_KINDS.has(String(delta?.kind || "").trim()) &&
+          trackedTurnIds.some((turnId) => payloadDeltaReferencesTurn(delta, turnId)) &&
+          isTerminalTurnStatus(delta?.status)
+    )
+  ));
+}
+
+function collectCompletedTurnIds(payload) {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+  const type = String(payload.type || "").trim();
+  const ids = [];
+  const pushId = (value) => {
+    const id = String(value || "").trim();
+    if (id && !ids.includes(id)) {
+      ids.push(id);
+    }
+  };
+  if (type === "turn.completed" || type === "turn.failed" || type === "turn.interrupted") {
+    pushId(payload.turnId || payload?.payload?.turnId || payload?.payload?.turn_id);
+  }
+  if (type === "conversation.delta" && Array.isArray(payload.deltas)) {
+    for (const delta of payload.deltas) {
+      if (String(delta?.kind || "").trim() === "conversation_replaced") {
+        for (const turn of Array.isArray(delta?.conversation?.turns) ? delta.conversation.turns : []) {
+          if (isTerminalTurnStatus(turn?.assistant?.status || turn?.status)) {
+            pushId(turn?.id);
+          }
+        }
+        continue;
+      }
+      if (!TERMINAL_DELTA_KINDS.has(String(delta?.kind || "").trim()) || !isTerminalTurnStatus(delta?.status)) {
+        continue;
+      }
+      pushId(delta.turnId);
+      pushId(delta.turn_id);
+      pushId(delta.clientTurnId);
+      pushId(delta.localTurnId);
+    }
+  }
+  return ids;
 }
 
 function buildTransportFrames(payload, { session = null, trackedTurnId = "" } = {}) {
@@ -216,7 +275,7 @@ function buildTransportFrames(payload, { session = null, trackedTurnId = "" } = 
   const sessionId = String(session?.id || "");
   const threadId = String(session?.resumeSessionId || session?.threadSnapshot?.threadId || "");
   if (type === "conversation.snapshot" || type === "conversation.delta") {
-    return [{ kind: "snapshot", data: buildThreadTransportSnapshot(session, payload, { trackedTurnId }) }];
+    return [{ kind: "typed", data: payload }];
   }
 
   if (DIRECT_TYPED_EVENT_TYPES.has(type)) {
@@ -344,6 +403,7 @@ export function openSessionSseStream({
   let trackedTurnId = "";
   let terminalCloseTimer = null;
   let terminalClosePending = false;
+  const completedTurnIds = new Set();
 
   const close = () => {
     if (closed) {
@@ -395,17 +455,21 @@ export function openSessionSseStream({
       } catch {
         // Ignore payload hook failures to avoid breaking the stream.
       }
-      const payloadTouchesTrackedTurn = payloadReferencesTurn(payload, trackedTurnId);
+      for (const turnId of collectCompletedTurnIds(payload)) {
+        completedTurnIds.add(turnId);
+      }
+      const session = sessionManager.get(sessionId);
+      const trackedTurnIds = resolveTrackedTurnIds(session, trackedTurnId);
+      const payloadTouchesTrackedTurn = payloadReferencesAnyTurn(payload, trackedTurnIds);
       if (payloadTouchesTrackedTurn) {
         clearTimeout(terminalCloseTimer);
         if (terminalClosePending) {
           shouldScheduleTerminalClose = true;
         }
       }
-      if (!shouldScheduleTerminalClose && isPayloadTerminalForTurn(payload, trackedTurnId)) {
+      if (!shouldScheduleTerminalClose && payloadCompletesTrackedTurn(payload, trackedTurnIds)) {
         shouldScheduleTerminalClose = true;
       }
-      const session = sessionManager.get(sessionId);
       const frames = buildTransportFrames(payload, { session, trackedTurnId });
       for (const frame of frames) {
         if (frame.kind === "snapshot") {
@@ -437,7 +501,7 @@ export function openSessionSseStream({
     if (!closed) {
       writer.sendKeepalive();
     }
-  }, Math.max(1000, Number(keepaliveMs) || 15000));
+  }, Math.max(1, Number(keepaliveMs) || 15000));
   keepaliveTimer.unref?.();
 
   req.on("close", close);
@@ -460,8 +524,7 @@ export function openSessionSseStream({
       if (!trackedTurnId) {
         return;
       }
-      const session = sessionManager.get(sessionId);
-      if (isSessionTerminalForTurn(session, trackedTurnId)) {
+      if (completedTurnIds.has(trackedTurnId)) {
         scheduleTerminalClose();
       }
     },
