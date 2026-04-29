@@ -89,45 +89,6 @@ function buildHistoricalFileChanges(items = []) {
   return [...fileMap.values()];
 }
 
-function createLiveOverlayItem(liveOverlay = {}) {
-  const text = String(firstDefined(liveOverlay.text, liveOverlay.body, "")).trim();
-  if (!text) {
-    return null;
-  }
-  return {
-    id: String(firstDefined(liveOverlay.id, `live-overlay-${liveOverlay.turnId || "turn"}`)),
-    kind: "AgentMessage",
-    status: firstDefined(liveOverlay.status, "inProgress"),
-    text,
-    message: text,
-    content: [{ type: "output_text", text }],
-    isLiveOverlay: true
-  };
-}
-
-function appendLiveOverlay(items = [], turn = {}, liveOverlay = null) {
-  if (!liveOverlay) {
-    return items;
-  }
-  if (String(turn?.id || "") !== String(liveOverlay.turnId || "")) {
-    return items;
-  }
-  if (
-    items.some(
-      (item) =>
-        String(item?.id || "") === String(liveOverlay.id || "") ||
-        (String(item?.kind || "").toLowerCase() === "agentmessage" && String(item?.text || "").trim() === String(liveOverlay.text || "").trim())
-    )
-  ) {
-    return items;
-  }
-  const overlayItem = createLiveOverlayItem(liveOverlay);
-  if (!overlayItem) {
-    return items;
-  }
-  return [...items, overlayItem];
-}
-
 function createSegment(kind, items = [], turn = {}, index = 0) {
   return {
     id: `${turn?.id || "turn"}-segment-${index}-${kind}`,
@@ -194,7 +155,7 @@ export function segmentTurnItems(items = [], turn = {}, options = {}) {
 }
 
 export function buildTurnViewModel(turn = {}, options = {}) {
-  const items = appendLiveOverlay(asArray(turn?.items), turn, options.liveOverlay);
+  const items = asArray(turn?.items);
   const segments = segmentTurnItems(items, turn, options);
   const fileChanges = buildHistoricalFileChanges(items);
   const hasFileChange = segments.some((segment) =>

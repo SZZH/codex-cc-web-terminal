@@ -39,6 +39,7 @@ import {
   extractComposerOptions,
   sessionRequiresJsonExec
 } from "./sessions/shared/composerOptions.js";
+import { CodexThreadStateStore } from "./sessions/state/CodexThreadStateStore.js";
 import {
   buildCodexJsonExecArgs,
   enqueueRunnerInput,
@@ -154,6 +155,20 @@ function hasThreadSnapshotMeaningfulAdvance(incomingSnapshot, currentSnapshot) {
   }
 
   return false;
+}
+
+function parseSnapshotUpdatedAt(snapshot) {
+  const value = String(snapshot?.updatedAt || "").trim();
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function snapshotHasTurn(snapshot, turnId = "") {
+  const targetTurnId = String(turnId || "").trim();
+  if (!targetTurnId) {
+    return false;
+  }
+  return Array.isArray(snapshot?.turns) && snapshot.turns.some((turn) => String(turn?.id || "").trim() === targetTurnId);
 }
 
 function buildThreadProjection(session) {
@@ -398,7 +413,6 @@ export class SessionManager {
     return Boolean(
       this.config.codexAppServerEnabled &&
         this.appServerBridge &&
-        !String(resumeSessionId || "").trim() &&
         !sessionRequiresJsonExec({ permissionMode })
     )
       ? "app_server"
@@ -408,29 +422,40 @@ export class SessionManager {
   create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "", reasoningEffort = "", permissionMode = "" } = {}) {
     const resolvedProvider = this.getProvider(provider);
     const id = crypto.randomUUID();
-    const resolvedCwd = this.resolveCwd(cwd);
+    const normalizedResumeSessionId = String(resumeSessionId || "").trim();
+    let nextCwd = cwd;
+    let nextModel = model;
+    let nextReasoningEffort = reasoningEffort;
+    let nextPermissionMode = permissionMode;
+
+    if (resolvedProvider.id === "codex" && normalizedResumeSessionId) {
+      const threadState = new CodexThreadStateStore(this.config).getThreadComposerState(normalizedResumeSessionId);
+      if (threadState) {
+        nextCwd = String(nextCwd || "").trim() || threadState.cwd || nextCwd;
+        nextModel = String(nextModel || "").trim() || threadState.model || nextModel;
+        nextReasoningEffort = String(nextReasoningEffort || "").trim() || threadState.reasoningEffort || nextReasoningEffort;
+        nextPermissionMode = String(nextPermissionMode || "").trim() || threadState.permissionMode || nextPermissionMode;
+      }
+    }
+
+    const resolvedCwd = this.resolveCwd(nextCwd);
     const fallbackName = `${resolvedProvider.fallbackPrefix}-${this.sessions.size + 1}`;
     const sessionName =
       resolvedProvider.id === "codex" && !String(name || "").trim()
         ? ""
         : normalizeName(name, fallbackName);
-    const composerOptions = extractComposerOptions({ model, reasoningEffort, permissionMode });
+    const composerOptions = extractComposerOptions({ model: nextModel, reasoningEffort: nextReasoningEffort, permissionMode: nextPermissionMode });
     const spawnSpec = resolvedProvider.buildSpawnSpec({
-      resumeSessionId: String(resumeSessionId || "").trim() || null,
+      resumeSessionId: normalizedResumeSessionId || null,
       name: sessionName,
       model: composerOptions.model,
       permissionMode: composerOptions.permissionMode
     });
 
     if (resolvedProvider.id === "codex") {
-      // App-server bridge does not yet provide a reliable resumed-thread turn lifecycle
-      // (notifications can stall after userMessage without a terminal turn event), so
-      // thread continuation must stay on the stable json_exec runner until the adapter
-      // contract is completed end-to-end.
       const preferAppServer = Boolean(
         this.config.codexAppServerEnabled &&
           this.appServerBridge &&
-          !String(resumeSessionId || "").trim() &&
           !sessionRequiresJsonExec({ permissionMode: composerOptions.permissionMode })
       );
       const session = {
@@ -453,7 +478,7 @@ export class SessionManager {
         sawBootstrapCommand: true,
         bootstrapNames: resolvedProvider.bootstrapNames,
         claudeStartupStage: 2,
-        resumeSessionId: String(resumeSessionId || "").trim() || null,
+        resumeSessionId: normalizedResumeSessionId || null,
         resumeBootstrapComplete: true,
         pendingResumeInput: "",
         model: composerOptions.model || resolvedProvider.defaultModel || "",
@@ -469,7 +494,7 @@ export class SessionManager {
         queuedTurnIds: [],
         conversationState: createConversationState({
           sessionId: id,
-          threadId: String(resumeSessionId || "").trim(),
+          threadId: normalizedResumeSessionId,
           status: "idle"
         }),
         threadSnapshot: null,
@@ -477,6 +502,7 @@ export class SessionManager {
         threadCanonicalizerState: createCanonicalizerState(),
         threadProjection: null,
         currentTurnId: "",
+        activeTypedItems: new Map(),
         sessionType: "main",
         parentThreadId: "",
         agentRole: "",
@@ -520,16 +546,16 @@ export class SessionManager {
       sawBootstrapCommand: false,
       bootstrapNames: resolvedProvider.bootstrapNames,
       claudeStartupStage: 0,
-      resumeSessionId: String(resumeSessionId || "").trim() || null,
-      resumeBootstrapComplete: !String(resumeSessionId || "").trim(),
+      resumeSessionId: normalizedResumeSessionId || null,
+      resumeBootstrapComplete: !normalizedResumeSessionId,
       pendingResumeInput: "",
-      model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+      model: String(nextModel || "").trim() || resolvedProvider.defaultModel || "",
       reasoningEffort: composerOptions.reasoningEffort,
       permissionMode: composerOptions.permissionMode,
       titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
       conversationState: createConversationState({
         sessionId: id,
-        threadId: String(resumeSessionId || "").trim(),
+        threadId: normalizedResumeSessionId,
         status: "idle"
       }),
       threadSnapshot: null,
@@ -537,6 +563,7 @@ export class SessionManager {
       threadCanonicalizerState: createCanonicalizerState(),
       threadProjection: null,
       currentTurnId: "",
+      activeTypedItems: new Map(),
       queuedTurnIds: [],
       sessionType: "main",
       parentThreadId: "",
@@ -796,14 +823,16 @@ export class SessionManager {
     ]);
   }
 
-  createConversationTurn(session, userText, timestamp = nowIso()) {
+  createConversationTurn(session, userText, timestamp = nowIso(), { activate = true } = {}) {
     if (!session) {
       return null;
     }
     session.turnSequence = Math.max(0, Number(session.turnSequence) || 0) + 1;
     const suffix = typeof crypto.randomUUID === "function" ? crypto.randomUUID().slice(0, 8) : String(Date.now());
     const turnId = `${session.id}-turn-${Date.now()}-${session.turnSequence}-${suffix}`;
-    session.currentTurnId = turnId;
+    if (activate) {
+      session.currentTurnId = turnId;
+    }
     const previous = createConversationState(session.conversationState);
     this.applyThreadRawRecord(
       session,
@@ -890,6 +919,20 @@ export class SessionManager {
         }
         const currentSnapshot = this.ensureThreadSnapshot(live);
         const incomingSnapshot = historical?.threadSnapshot || null;
+        const currentUpdatedAt = parseSnapshotUpdatedAt(currentSnapshot);
+        const incomingUpdatedAt = parseSnapshotUpdatedAt(incomingSnapshot);
+        const protectedTurnId = String(
+          live.currentTurnId ||
+          currentSnapshot?.activeTurnId ||
+          live.conversationState?.activeTurnId ||
+          ""
+        ).trim();
+        if (protectedTurnId && snapshotHasTurn(currentSnapshot, protectedTurnId) && !snapshotHasTurn(incomingSnapshot, protectedTurnId)) {
+          return;
+        }
+        if (incomingUpdatedAt && currentUpdatedAt && incomingUpdatedAt < currentUpdatedAt) {
+          return;
+        }
         const shouldReplace =
           Number(incomingSnapshot?.lastEventSeq || 0) > Number(currentSnapshot?.lastEventSeq || 0) ||
           Number(incomingSnapshot?.version || 0) > Number(currentSnapshot?.version || 0) ||

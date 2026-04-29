@@ -5,7 +5,6 @@ import ThreadTurnCard from "./ThreadTurnCard.vue";
 
 const props = defineProps({
   snapshot: { type: Object, default: null },
-  liveOverlay: { type: Object, default: null },
   assistantName: { type: String, default: "Codex" },
   workspaceCwd: { type: String, default: "" }
 });
@@ -14,8 +13,7 @@ const emit = defineEmits(["status"]);
 
 const viewModel = computed(() =>
   buildThreadViewModel(props.snapshot || {}, {
-    assistantName: props.assistantName,
-    liveOverlay: props.liveOverlay
+    assistantName: props.assistantName
   })
 );
 </script>

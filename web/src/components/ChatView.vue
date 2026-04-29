@@ -16,7 +16,6 @@ const props = defineProps({
   threadMismatch: { type: Boolean, default: false },
   assistantName: { type: String, default: "Codex" },
   threadSnapshot: { type: Object, default: null },
-  liveOverlay: { type: Object, default: null },
   workspaceCwd: { type: String, default: "" },
   draft: { type: String, default: "" },
   composerOptions: { type: Object, required: true },
@@ -561,7 +560,7 @@ function observeBottomLayout() {
 watch(
   () =>
     hasThreadSnapshot.value
-      ? `${props.threadSnapshot?.version || 0}:${props.threadSnapshot?.turns?.length || 0}:${props.liveOverlay?.id || props.liveOverlay?.turnId || ""}:${props.liveOverlay?.text?.length || 0}`
+      ? `${props.threadSnapshot?.version || 0}:${props.threadSnapshot?.turns?.length || 0}`
       : "",
   () => {
     if (!hasThreadSnapshot.value) {
@@ -638,15 +637,12 @@ onBeforeUnmount(() => {
       <section ref="messageListEl" class="message-stream" :style="messageStreamStyle" @scroll="handleStreamScroll">
         <ThreadTurnTimeline
           :snapshot="threadSnapshot"
-          :live-overlay="liveOverlay"
           :assistant-name="assistantName"
           :workspace-cwd="workspaceCwd"
           @status="emit('status', $event)"
         />
         <span ref="messageBottomEl" class="message-bottom-anchor" aria-hidden="true"></span>
       </section>
-
-      <p v-if="statusText" ref="statusEl" class="chat-status">{{ statusText }}</p>
 
       <div ref="composerHostEl" class="chat-composer-host">
         <ChatComposer

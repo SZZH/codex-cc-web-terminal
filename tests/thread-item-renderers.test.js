@@ -202,6 +202,56 @@ test("thread view model collapses process segments that contain diagnostic dumps
   assert.match(processSegment.processSummary.label, /调试输出 1/);
 });
 
+test("thread view model does not append live overlay text on top of committed turn items", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-live-overlay",
+        status: "completed",
+        items: [
+          { id: "user-1", kind: "UserMessage", text: "你好" },
+          { id: "assistant-1", kind: "AgentMessage", text: "正式回复" }
+        ]
+      }
+    ]
+  }, {
+    liveOverlay: {
+      turnId: "turn-live-overlay",
+      text: "正式回复"
+    }
+  });
+
+  const items = viewModel.turns[0].segments.flatMap((segment) => segment.items);
+  assert.equal(items.filter((item) => item.kind === "agentmessage").length, 1);
+});
+
+test("thread view model keeps a process segment renderable even before primary text materializes", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-process-only",
+        status: "inProgress",
+        items: [
+          {
+            id: "proc-early-1",
+            kind: "CommandExecution",
+            status: "running",
+            summary: "npm run check",
+            payload: { command: "npm run check" }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(viewModel.turns[0].hasPrimary, false);
+  assert.equal(viewModel.turns[0].hasProcess, true);
+  assert.equal(viewModel.turns[0].segments.length, 1);
+  assert.equal(viewModel.turns[0].segments[0].kind, "process");
+  assert.equal(viewModel.turns[0].segments[0].items[0].label, "命令执行");
+  assert.equal(viewModel.turns[0].segments[0].defaultCollapsed, false);
+});
+
 test("thread view model keeps workspace changes anchored to the file-change turn", () => {
   const viewModel = buildThreadViewModel({
     turns: [

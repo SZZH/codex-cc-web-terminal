@@ -217,6 +217,130 @@ test("createHistoryPayloadResolver returns merged conversation payload for threa
   assert.deepEqual(bundle.threadSnapshot.turns.map((turn) => turn.id), ["turn-stale", "turn-fresh"]);
 });
 
+test("createHistoryPayloadResolver merges equivalent historical and live continuation turns instead of duplicating shell turns", () => {
+  const resolver = createHistoryPayloadResolver({
+    getHistoricalMessages() {
+      return {
+        session: { id: "history:codex:thread-1" },
+        messages: [],
+        turns: [],
+        backgroundAgents: [],
+        threadSnapshot: {
+          threadId: "thread-1",
+          turns: [
+            {
+              id: "turn-historical",
+              status: "completed",
+              startedAt: "2026-04-29T09:44:44.748Z",
+              completedAt: "2026-04-29T09:44:59.714Z",
+              items: [
+                { id: "u-1", kind: "UserMessage", text: "回复：TRACE-FIX" },
+                { id: "a-1", kind: "AgentMessage", text: "TRACE-FIX" }
+              ]
+            }
+          ]
+        },
+        conversation: {
+          threadId: "thread-1",
+          turns: [
+            {
+              id: "turn-historical",
+              user: { id: "u-1", text: "回复：TRACE-FIX", ts: "2026-04-29T09:44:44.748Z" },
+              assistant: {
+                body: [{ id: "a-1", kind: "markdown", text: "TRACE-FIX", ts: "2026-04-29T09:44:59.714Z" }],
+                process: [],
+                status: "completed",
+                startedAt: "2026-04-29T09:44:44.748Z",
+                finishedAt: "2026-04-29T09:44:59.714Z"
+              }
+            }
+          ],
+          backgroundAgents: []
+        }
+      };
+    },
+    getThreadSnapshotBundle() {
+      return {
+        session: { id: "history:codex:thread-1" },
+        threadSnapshot: {
+          threadId: "thread-1",
+          turns: [
+            {
+              id: "turn-historical",
+              status: "completed",
+              startedAt: "2026-04-29T09:44:44.748Z",
+              completedAt: "2026-04-29T09:44:59.714Z",
+              items: [
+                { id: "u-1", kind: "UserMessage", text: "回复：TRACE-FIX" },
+                { id: "a-1", kind: "AgentMessage", text: "TRACE-FIX" }
+              ]
+            }
+          ]
+        },
+        conversation: {
+          threadId: "thread-1",
+          turns: [
+            {
+              id: "turn-historical",
+              user: { id: "u-1", text: "回复：TRACE-FIX", ts: "2026-04-29T09:44:44.748Z" },
+              assistant: {
+                body: [{ id: "a-1", kind: "markdown", text: "TRACE-FIX", ts: "2026-04-29T09:44:59.714Z" }],
+                process: [],
+                status: "completed",
+                startedAt: "2026-04-29T09:44:44.748Z",
+                finishedAt: "2026-04-29T09:44:59.714Z"
+              }
+            }
+          ],
+          backgroundAgents: []
+        }
+      };
+    },
+    getThreadContinuationRuntime() {
+      return {
+        session: { id: "live-1" },
+        threadSnapshot: {
+          threadId: "thread-1",
+          turns: [
+            {
+              id: "live-shell",
+              status: "completed",
+              startedAt: "2026-04-29T09:44:40.979Z",
+              completedAt: "2026-04-29T09:45:12.129Z",
+              items: [{ id: "u-2", kind: "UserMessage", text: "回复：TRACE-FIX" }]
+            }
+          ]
+        },
+        conversation: {
+          threadId: "thread-1",
+          turns: [
+            {
+              id: "live-shell",
+              user: { id: "u-2", text: "回复：TRACE-FIX", ts: "2026-04-29T09:44:40.979Z" },
+              assistant: {
+                body: [],
+                process: [],
+                status: "completed",
+                startedAt: "2026-04-29T09:44:40.979Z",
+                finishedAt: "2026-04-29T09:45:12.129Z"
+              }
+            }
+          ],
+          backgroundAgents: []
+        }
+      };
+    }
+  });
+
+  const payload = resolver.getThreadMessagesPayload("codex", "thread-1");
+
+  assert.equal(payload.session.id, "live-1");
+  assert.equal(payload.threadSnapshot.turns.length, 1);
+  assert.equal(payload.threadSnapshot.turns[0].items.length, 2);
+  assert.equal(payload.conversation.turns.length, 1);
+  assert.equal(payload.conversation.turns[0].assistant.body[0].text, "TRACE-FIX");
+});
+
 test("buildSessionCreatePayloadFromThreadState fills missing create fields from thread state", () => {
   const payload = buildSessionCreatePayloadFromThreadState(
     {

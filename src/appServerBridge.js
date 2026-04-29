@@ -290,7 +290,7 @@ export class AppServerBridge extends EventEmitter {
       cwd: session.cwd,
       model: session.model || null,
       reasoningEffort: session.reasoningEffort || null,
-      experimentalRawEvents: false,
+      experimentalRawEvents: true,
       persistExtendedHistory: true
     });
     const threadId = String(result?.thread?.id || "").trim();

@@ -45,6 +45,11 @@ function normalizeAppServerErrorMessage(error = {}) {
 function emitAppServerError(manager, session, error = {}, timestamp = nowIso()) {
   const details = normalizeAppServerErrorMessage(error);
   const text = `Codex 执行失败：${details}`;
+  broadcastTypedTransportError(manager, session, {}, {
+    message: text,
+    code: String(error?.code || "app_server_error"),
+    payload: error
+  });
   manager.broadcast(session, {
     type: "message_part",
     role: "system",
@@ -83,6 +88,485 @@ function summarizeNotification(msg) {
   } catch {
     return String(msg || "").slice(0, 2000);
   }
+}
+
+function summarizeRawNotificationPayload(params = {}) {
+  return String(
+    params?.delta ||
+    params?.output ||
+    params?.chunk ||
+    params?.text ||
+    params?.message ||
+    params?.summary ||
+    params?.content ||
+    params?.name ||
+    params?.status ||
+    ""
+  ).trim();
+}
+
+function clearPendingTurnCompletion(session) {
+  if (!session?.pendingTurnCompletion) {
+    return;
+  }
+  clearTimeout(session.pendingTurnCompletion.timer);
+  session.pendingTurnCompletion = null;
+}
+
+function schedulePendingTurnCompletion(manager, session, params = {}, { status = "completed", error = null, delayMs = 1200 } = {}) {
+  if (!manager || !session) {
+    return;
+  }
+  const turnId = String(
+    params?.turnId ||
+      params?.turn_id ||
+      session.currentTurnId ||
+      session.threadSnapshot?.activeTurnId ||
+      session.conversationState?.activeTurnId ||
+      ""
+  ).trim();
+  if (!turnId) {
+    return;
+  }
+  clearPendingTurnCompletion(session);
+  session.pendingTurnCompletion = {
+    turnId,
+    status,
+    error,
+    timer: setTimeout(() => {
+      session.pendingTurnCompletion = null;
+      const completedAt = nowIso();
+      session.turnRunning = false;
+      session.updatedAt = completedAt;
+      if (status === "failed" || error) {
+        broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
+          type: "turn.failed",
+          status: "failed",
+          error: error || { message: "turn failed" }
+        });
+        emitAppServerError(manager, session, error || { message: "turn failed" }, completedAt);
+        manager.finalizeConversationTurn(session, "failed", completedAt);
+      } else {
+        if (!session.turnHadVisibleOutput) {
+          emitNoReplyFallback(manager, session);
+        }
+        broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
+          type: "turn.completed",
+          status: "completed"
+        });
+        manager.finalizeConversationTurn(session, "completed", completedAt);
+      }
+      manager.scheduleConversationHistoryResync(session);
+      manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
+      startAppServerTurn(manager, session);
+    }, Math.max(0, Number(delayMs) || 0))
+  };
+  session.pendingTurnCompletion.timer.unref?.();
+}
+
+function extendPendingTurnCompletion(manager, session, params = {}, delayMs = 1200) {
+  if (!session?.pendingTurnCompletion) {
+    return;
+  }
+  const pendingTurnId = String(session.pendingTurnCompletion.turnId || "").trim();
+  const resolvedTurnId = String(
+    params?.turnId ||
+      params?.turn_id ||
+      session.currentTurnId ||
+      session.threadSnapshot?.activeTurnId ||
+      session.conversationState?.activeTurnId ||
+      ""
+  ).trim();
+  if (!pendingTurnId || !resolvedTurnId || pendingTurnId !== resolvedTurnId) {
+    return;
+  }
+  schedulePendingTurnCompletion(manager, session, { ...params, turnId: resolvedTurnId }, {
+    status: session.pendingTurnCompletion.status,
+    error: session.pendingTurnCompletion.error,
+    delayMs
+  });
+}
+
+function resolveSessionThreadId(session, params = {}) {
+  return String(
+    params?.threadId ||
+    params?.thread_id ||
+    session.resumeSessionId ||
+    session.threadSnapshot?.threadId ||
+    session.conversationState?.threadId ||
+    ""
+  ).trim();
+}
+
+function resolveSessionTurnId(session, params = {}) {
+  return String(
+    params?.turnId ||
+    params?.turn_id ||
+    session.currentTurnId ||
+    session.threadSnapshot?.activeTurnId ||
+    session.conversationState?.activeTurnId ||
+    ""
+  ).trim();
+}
+
+function broadcastTypedEvent(manager, session, payload = null) {
+  if (!manager || !session || !payload || typeof payload !== "object") {
+    return false;
+  }
+  manager.broadcast(session, payload);
+  return true;
+}
+
+function buildTypedEventContext(session, params = {}) {
+  return {
+    sessionId: String(session?.id || "").trim(),
+    threadId: resolveSessionThreadId(session, params),
+    turnId: resolveSessionTurnId(session, params),
+    ts: nowIso()
+  };
+}
+
+function broadcastTypedMessage(manager, session, params = {}, {
+  type = "message.completed",
+  text = "",
+  role = "assistant",
+  format = "markdown",
+  phase = "completed"
+} = {}) {
+  const { sessionId, threadId, turnId, ts } = buildTypedEventContext(session, params);
+  const normalizedText = String(text || "").trim();
+  if (!sessionId || !threadId || !turnId || !normalizedText) {
+    return false;
+  }
+  return broadcastTypedEvent(manager, session, {
+    type,
+    sessionId,
+    threadId,
+    turnId,
+    role,
+    text: normalizedText,
+    format,
+    ts,
+    phase
+  });
+}
+
+function broadcastTypedTurnLifecycle(manager, session, params = {}, {
+  type = "turn.completed",
+  status = "",
+  error = null
+} = {}) {
+  const { sessionId, threadId, turnId, ts } = buildTypedEventContext(session, params);
+  if (!sessionId || !threadId || !turnId) {
+    return false;
+  }
+  return broadcastTypedEvent(manager, session, {
+    type,
+    sessionId,
+    threadId,
+    turnId,
+    status: String(status || "").trim() || undefined,
+    error: error && typeof error === "object" ? error : undefined,
+    ts
+  });
+}
+
+function broadcastTypedThreadState(manager, session, params = {}, {
+  type = "thread.status.updated",
+  status = "",
+  metrics = null,
+  payload = null
+} = {}) {
+  const { sessionId, threadId, turnId, ts } = buildTypedEventContext(session, params);
+  if (!sessionId || !threadId) {
+    return false;
+  }
+  return broadcastTypedEvent(manager, session, {
+    type,
+    sessionId,
+    threadId,
+    turnId: turnId || undefined,
+    status: String(status || "").trim() || undefined,
+    metrics: metrics && typeof metrics === "object" ? metrics : undefined,
+    payload: payload && typeof payload === "object" ? payload : undefined,
+    ts
+  });
+}
+
+function broadcastTypedTransportError(manager, session, params = {}, {
+  message = "",
+  code = "",
+  payload = null
+} = {}) {
+  const { sessionId, threadId, turnId, ts } = buildTypedEventContext(session, params);
+  const normalizedMessage = String(message || "").trim();
+  if (!sessionId || !threadId || !normalizedMessage) {
+    return false;
+  }
+  return broadcastTypedEvent(manager, session, {
+    type: "transport.error",
+    sessionId,
+    threadId,
+    turnId: turnId || undefined,
+    message: normalizedMessage,
+    code: String(code || "").trim() || undefined,
+    payload: payload && typeof payload === "object" ? payload : undefined,
+    ts
+  });
+}
+
+function broadcastTypedProcess(manager, session, params = {}, {
+  type = "process.completed",
+  processType = "event",
+  processId = "",
+  summary = "",
+  payload = null,
+  phase = "completed"
+} = {}) {
+  const { sessionId, threadId, turnId, ts } = buildTypedEventContext(session, params);
+  const text = String(summary || summarizeRawNotificationPayload(params)).trim();
+  if (!sessionId || !turnId || !threadId || !text) {
+    return false;
+  }
+  return broadcastTypedEvent(manager, session, {
+    type,
+    sessionId,
+    threadId,
+    turnId,
+    processId: String(processId || params?.id || params?.itemId || params?.item_id || processType).trim(),
+    processType,
+    summary: text,
+    payload: payload || params,
+    ts,
+    phase
+  });
+}
+
+function classifyTypedProcessFromNotification(method = "", normalizedMethod = "", params = {}) {
+  const run = params?.run || {};
+  const item = params?.item || {};
+
+  if (method === "hook/started" || normalizedMethod === "hookstarted") {
+    return {
+      type: "process.started",
+      processType: "hook",
+      processId: String(run?.id || "hook"),
+      summary: `${String(run?.eventName || "hook")} started`,
+      payload: run,
+      phase: "streaming"
+    };
+  }
+  if (method === "hook/completed" || normalizedMethod === "hookcompleted") {
+    return {
+      type: "process.completed",
+      processType: "hook",
+      processId: String(run?.id || "hook"),
+      summary: `${String(run?.eventName || "hook")} completed`,
+      payload: run,
+      phase: "completed"
+    };
+  }
+  if (method === "item/started" || normalizedMethod === "itemstarted") {
+    const itemType = normalizeSymbolToken(item?.type || "");
+    if (!itemType || itemType === "usermessage" || itemType === "agentmessage" || itemType === "reasoning") {
+      return null;
+    }
+    return {
+      type: "process.started",
+      processType: itemType,
+      processId: String(item?.id || itemType),
+      summary: `${String(item?.type || "item")} started`,
+      payload: item,
+      phase: "streaming"
+    };
+  }
+  if (method === "item/completed" || normalizedMethod === "itemcompleted") {
+    const itemType = normalizeSymbolToken(item?.type || "");
+    if (!itemType || itemType === "usermessage" || itemType === "agentmessage" || itemType === "reasoning") {
+      return null;
+    }
+    return {
+      type: "process.completed",
+      processType: itemType,
+      processId: String(item?.id || itemType),
+      summary: summarizeRawNotificationPayload(item) || `${String(item?.type || "item")} completed`,
+      payload: item,
+      phase: "completed"
+    };
+  }
+  if (normalizedMethod.includes("commandexecutionoutputdelta")) {
+    return {
+      type: "process.delta",
+      processType: "command_execution",
+      processId: String(params?.itemId || params?.item_id || params?.processId || params?.process_id || "command_execution"),
+      summary: String(params?.delta || "").trim(),
+      payload: params,
+      phase: "streaming"
+    };
+  }
+  if (normalizedMethod.includes("commandexecutionterminalinteraction")) {
+    return {
+      type: "process.delta",
+      processType: "command_execution",
+      processId: String(params?.itemId || params?.item_id || params?.processId || params?.process_id || "command_execution"),
+      summary: String(params?.stdin || "").trim() || "terminal interaction",
+      payload: params,
+      phase: "streaming"
+    };
+  }
+  if (normalizedMethod.includes("reasoning") && normalizedMethod.includes("delta")) {
+    return {
+      type: "reasoning.delta",
+      processType: "reasoning",
+      processId: String(params?.id || params?.itemId || params?.item_id || "reasoning"),
+      summary: summarizeRawNotificationPayload(params),
+      payload: params,
+      phase: "streaming"
+    };
+  }
+  if (normalizedMethod.includes("reasoning") && (normalizedMethod.includes("done") || normalizedMethod.includes("completed"))) {
+    return {
+      type: "reasoning.completed",
+      processType: "reasoning",
+      processId: String(params?.id || params?.itemId || params?.item_id || "reasoning"),
+      summary: summarizeRawNotificationPayload(params),
+      payload: params,
+      phase: "completed"
+    };
+  }
+  if (normalizedMethod.includes("tool") && normalizedMethod.includes("delta")) {
+    return {
+      type: "process.delta",
+      processType: "tool",
+      processId: String(params?.callId || params?.call_id || params?.id || "tool"),
+      summary: summarizeRawNotificationPayload(params),
+      payload: params,
+      phase: "streaming"
+    };
+  }
+  return null;
+}
+
+function classifyTypedDirectEventFromNotification(method = "", normalizedMethod = "", params = {}) {
+  const item = params?.item || {};
+  const itemType = normalizeSymbolToken(item?.type || "");
+  const itemPhase = normalizeSymbolToken(item?.phase || "");
+
+  if (method === "turn/started" || normalizedMethod === "turnstarted") {
+    return { type: "turn.started", status: "running", payload: params };
+  }
+  if (method === "thread/status/changed" || normalizedMethod === "threadstatuschanged") {
+    return {
+      type: "thread.status.updated",
+      status: String(params?.status || params?.thread?.status || "").trim() || "updated",
+      payload: params
+    };
+  }
+  if (method === "thread/tokenUsage/updated" || normalizedMethod === "threadtokenusageupdated") {
+    return {
+      type: "thread.metrics.updated",
+      metrics: params?.usage && typeof params.usage === "object" ? params.usage : params,
+      payload: params
+    };
+  }
+  if (method === "warning" || normalizedMethod === "warning") {
+    return {
+      type: "transport.error",
+      message: summarizeRawNotificationPayload(params) || "app-server warning",
+      code: "warning",
+      payload: params
+    };
+  }
+  if (method === "error" || normalizedMethod === "error") {
+    return {
+      type: "transport.error",
+      message: summarizeRawNotificationPayload(params) || normalizeAppServerErrorMessage(params) || "app-server error",
+      code: String(params?.code || "error"),
+      payload: params
+    };
+  }
+  if (method === "item/started" || normalizedMethod === "itemstarted") {
+    if (itemType === "agentmessage") {
+      return {
+        type: itemPhase === "commentary" ? "reasoning.started" : "message.started",
+        processId: String(item?.id || "agentmessage"),
+        summary: summarizeRawNotificationPayload(item) || `${String(item?.type || "item")} started`,
+        payload: item
+      };
+    }
+    if (itemType === "reasoning") {
+      return {
+        type: "reasoning.started",
+        processId: String(item?.id || "reasoning"),
+        summary: summarizeRawNotificationPayload(item) || "reasoning started",
+        payload: item
+      };
+    }
+    return null;
+  }
+  if (method === "item/completed" || normalizedMethod === "itemcompleted") {
+    if (itemType === "agentmessage") {
+      return {
+        type: itemPhase === "commentary" ? "reasoning.completed" : "message.completed",
+        processId: String(item?.id || "agentmessage"),
+        summary: summarizeRawNotificationPayload(item),
+        payload: item
+      };
+    }
+    if (itemType === "reasoning") {
+      return {
+        type: "reasoning.completed",
+        processId: String(item?.id || "reasoning"),
+        summary: summarizeRawNotificationPayload(item) || "reasoning completed",
+        payload: item
+      };
+    }
+  }
+  return null;
+}
+
+function broadcastTypedStructuredEvent(manager, session, params = {}, event = null) {
+  if (!event || typeof event !== "object") {
+    return false;
+  }
+  if (event.type === "turn.started" || event.type === "turn.completed" || event.type === "turn.failed" || event.type === "turn.interrupted") {
+    return broadcastTypedTurnLifecycle(manager, session, params, event);
+  }
+  if (event.type === "message.started") {
+    const itemId = String(event.processId || event.payload?.id || "").trim();
+    if (itemId) {
+      session.activeTypedItems?.set(itemId, "message");
+    }
+    return true;
+  }
+  if (event.type === "message.completed") {
+    return broadcastTypedMessage(manager, session, params, {
+      type: "message.completed",
+      text: String(event.payload?.text || event.summary || "").trim(),
+      phase: "final"
+    });
+  }
+  if (event.type === "thread.status.updated" || event.type === "thread.metrics.updated") {
+    return broadcastTypedThreadState(manager, session, params, event);
+  }
+  if (event.type === "transport.error") {
+    return broadcastTypedTransportError(manager, session, params, event);
+  }
+  if (event.type === "reasoning.started" || event.type === "reasoning.delta" || event.type === "reasoning.completed") {
+    const itemId = String(event.processId || event.payload?.id || "").trim();
+    if (event.type === "reasoning.started" && itemId) {
+      session.activeTypedItems?.set(itemId, "reasoning");
+    }
+    return broadcastTypedEvent(manager, session, {
+      ...buildTypedEventContext(session, params),
+      type: event.type,
+      processId: event.processId,
+      summary: event.summary,
+      payload: event.payload || params,
+      phase: event.phase || (event.type.endsWith(".completed") ? "completed" : "streaming")
+    });
+  }
+  return false;
 }
 
 export function summarizeRelevantStderr(stderr = "") {
@@ -141,7 +625,7 @@ export function enqueueRunnerInput(manager, session, data) {
   for (const line of lines) {
     session.queuedInputs.push(line);
     if (session.provider === "codex") {
-      const turnId = manager.createConversationTurn(session, line, nowIso());
+      const turnId = manager.createConversationTurn(session, line, nowIso(), { activate: false });
       session.queuedTurnIds.push(turnId);
       lastTurnId = turnId;
     }
@@ -463,20 +947,47 @@ export function handleAppServerNotification(manager, msg) {
 
   for (const session of targets) {
     session.updatedAt = nowIso();
+    if (!(method === "turn/completed" || normalizedMethod === "turncompleted")) {
+      extendPendingTurnCompletion(manager, session, params);
+    }
+    const directEvent = classifyTypedDirectEventFromNotification(method, normalizedMethod, params);
+    if (broadcastTypedStructuredEvent(manager, session, params, directEvent)) {
+      if (directEvent?.type === "thread.status.updated") {
+        manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
+      }
+      continue;
+    }
+    const processEvent = classifyTypedProcessFromNotification(method, normalizedMethod, params);
+    if (String(processEvent?.type || "").startsWith("reasoning.") && broadcastTypedStructuredEvent(manager, session, params, processEvent)) {
+      continue;
+    }
+    if (processEvent?.summary && broadcastTypedProcess(manager, session, params, processEvent)) {
+      continue;
+    }
     if (method === "item/agentMessage/delta" || normalizedMethod === "itemagentmessagedelta") {
       const delta = String(params?.delta || "");
       if (!delta.trim()) {
         continue;
       }
+      const itemId = String(params?.itemId || params?.item_id || "").trim();
+      const typedKind = itemId ? session.activeTypedItems?.get(itemId) : "";
       session.turnHadVisibleOutput = true;
       manager.pushSessionBuffer(session, delta);
-      manager.broadcast(session, {
-        type: "message_part",
-        role: "assistant",
-        part: { type: "text", text: delta, format: "markdown" },
-        phase: "streaming",
-        timestamp: nowIso()
-      });
+      if (typedKind === "reasoning") {
+        broadcastTypedStructuredEvent(manager, session, params, {
+          type: "reasoning.delta",
+          processId: itemId || "reasoning",
+          summary: delta,
+          payload: params,
+          phase: "streaming"
+        });
+      } else {
+        broadcastTypedMessage(manager, session, params, {
+          type: "message.delta",
+          text: delta,
+          phase: "streaming"
+        });
+      }
       manager.applyConversationRecord(session, {
         type: "message_part",
         role: "assistant",
@@ -512,12 +1023,10 @@ export function handleAppServerNotification(manager, msg) {
       }
       session.turnHadVisibleOutput = true;
       manager.pushSessionBuffer(session, `${text}\n`);
-      manager.broadcast(session, {
-        type: "message_part",
-        role: "assistant",
-        part: { type: "text", text, format: "markdown" },
-        phase: "final",
-        timestamp: nowIso()
+      broadcastTypedMessage(manager, session, params, {
+        type: "message.completed",
+        text,
+        phase: "final"
       });
       manager.applyConversationRecord(session, {
         type: "item.completed",
@@ -526,32 +1035,25 @@ export function handleAppServerNotification(manager, msg) {
       });
       continue;
     }
+    if (method === "turn/started" || normalizedMethod === "turnstarted") {
+      manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
+      continue;
+    }
     if (method === "turn/completed" || normalizedMethod === "turncompleted") {
       const turn = params?.turn || {};
       const turnStatus = normalizeSymbolToken(turn?.status || "");
       const turnError = turn?.error && typeof turn.error === "object" ? turn.error : null;
-      const completedAt = nowIso();
-      session.turnRunning = false;
-      session.updatedAt = completedAt;
       if (turnStatus === "failed" || turnError) {
-        emitAppServerError(manager, session, turnError || { message: "turn failed" }, completedAt);
-        manager.finalizeConversationTurn(session, "failed", completedAt);
-        manager.scheduleConversationHistoryResync(session);
-        manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
-        startAppServerTurn(manager, session);
+        schedulePendingTurnCompletion(manager, session, params, {
+          status: "failed",
+          error: turnError || { message: "turn failed" }
+        });
         continue;
       }
-      if (!session.turnHadVisibleOutput) {
-        emitNoReplyFallback(manager, session);
-      }
-      manager.finalizeConversationTurn(session, "completed", completedAt);
-      manager.scheduleConversationHistoryResync(session);
-      manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
-      startAppServerTurn(manager, session);
+      schedulePendingTurnCompletion(manager, session, params, {
+        status: "completed"
+      });
       continue;
-    }
-    if (method === "thread/status/changed" || normalizedMethod === "threadstatuschanged") {
-      manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
     }
   }
 }

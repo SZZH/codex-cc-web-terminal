@@ -129,7 +129,6 @@ const {
   activeThreadId,
   displayedSessionMeta,
   displayedThreadSnapshot,
-  displayedLiveOverlay,
   activeSessionTitle,
   activeWorkspaceName,
   activeWorkspaceCwd,
@@ -971,7 +970,6 @@ if (typeof window !== 'undefined') {
         :workspace-cwd="activeWorkspaceCwd"
         :assistant-name="activeAssistantName"
         :thread-snapshot="displayedThreadSnapshot"
-        :live-overlay="displayedLiveOverlay"
         v-model:draft="composerDraft"
         :composer-options="composerOptions"
         :models="availableModels"

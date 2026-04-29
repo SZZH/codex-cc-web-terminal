@@ -409,7 +409,7 @@ test("input-stream contract: route tracks the turn id returned by write() so fas
   assert.ok(frames.some((frame) => frame.event === "thread.snapshot" && frame.payload?.version === 2));
 });
 
-test("input-stream contract: typed completed thread.snapshot closes the SSE stream for the tracked turn", async () => {
+test("input-stream contract: typed completed thread.snapshot closes the SSE stream for the tracked turn after a short terminal drain window", async () => {
   const liveSession = {
     id: "session-close-typed-1",
     provider: "codex",
@@ -493,12 +493,131 @@ test("input-stream contract: typed completed thread.snapshot closes the SSE stre
     res,
     sessionManager,
     sessionId: liveSession.id,
-    keepaliveMs: 15_000
+    keepaliveMs: 15_000,
+    terminalCloseDelayMs: 10
   });
   stream.setTrackedTurnId("turn-close-typed-1");
 
+  await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(closed, true);
   assert.ok(chunks.join("").includes("event: thread.snapshot") || closed);
+});
+
+test("input-stream contract: terminal tracked snapshots keep the stream open long enough for trailing same-turn events", async () => {
+  const liveSession = {
+    id: "session-terminal-drain-1",
+    provider: "codex",
+    resumeSessionId: "thread-terminal-drain-1",
+    currentTurnId: "turn-terminal-drain-1",
+    clients: new Set(),
+    threadSnapshot: {
+      threadId: "thread-terminal-drain-1",
+      activeTurnId: "turn-terminal-drain-1",
+      turns: [{ id: "turn-terminal-drain-1", status: "running", items: [] }]
+    },
+    conversationState: {
+      threadId: "thread-terminal-drain-1",
+      activeTurnId: "turn-terminal-drain-1",
+      turns: [{ id: "turn-terminal-drain-1", assistant: { status: "running", body: [] } }]
+    }
+  };
+
+  const reqListeners = new Map();
+  const resListeners = new Map();
+  const chunks = [];
+  let closed = false;
+
+  const req = {
+    on(name, handler) {
+      reqListeners.set(name, handler);
+    }
+  };
+  const res = {
+    setHeader() {},
+    write(chunk) {
+      chunks.push(String(chunk));
+    },
+    end() {
+      closed = true;
+    },
+    on(name, handler) {
+      resListeners.set(name, handler);
+    }
+  };
+
+  const sessionManager = {
+    get(id) {
+      return id === liveSession.id ? liveSession : null;
+    },
+    attachClient(_sessionId, client) {
+      liveSession.threadSnapshot = {
+        threadId: "thread-terminal-drain-1",
+        activeTurnId: "",
+        turns: [{ id: "turn-terminal-drain-1", status: "completed", items: [] }]
+      };
+      liveSession.conversationState = {
+        threadId: "thread-terminal-drain-1",
+        activeTurnId: "",
+        turns: [{ id: "turn-terminal-drain-1", assistant: { status: "completed", body: [] } }]
+      };
+      liveSession.clients.add(client);
+      client.send(
+        JSON.stringify({
+          type: "thread.snapshot",
+          threadId: "thread-terminal-drain-1",
+          sessionId: "session-terminal-drain-1",
+          turnId: "turn-terminal-drain-1",
+          status: "completed",
+          version: 41,
+          partial: true,
+          snapshot: {
+            threadId: "thread-terminal-drain-1",
+            activeTurnId: "",
+            turns: [{ id: "turn-terminal-drain-1", status: "completed", items: [] }]
+          },
+          conversation: {
+            sessionId: "session-terminal-drain-1",
+            threadId: "thread-terminal-drain-1",
+            status: "completed",
+            activeTurnId: "",
+            turns: [{ id: "turn-terminal-drain-1", assistant: { status: "completed", body: [] } }]
+          }
+        })
+      );
+
+      setTimeout(() => {
+        client.send(
+          JSON.stringify({
+            type: "process.completed",
+            sessionId: "session-terminal-drain-1",
+            threadId: "thread-terminal-drain-1",
+            turnId: "turn-terminal-drain-1",
+            processId: "proc-tail-1",
+            processType: "command_execution",
+            summary: "tail event",
+            ts: "2026-04-29T14:00:01.000Z"
+          })
+        );
+      }, 5);
+    }
+  };
+
+  const { openSessionSseStream } = await import("../src/transport/sse/sessionStream.js");
+  const stream = openSessionSseStream({
+    req,
+    res,
+    sessionManager,
+    sessionId: liveSession.id,
+    keepaliveMs: 15_000,
+    terminalCloseDelayMs: 20
+  });
+  stream.setTrackedTurnId("turn-terminal-drain-1");
+
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(closed, true);
+  const text = chunks.join("");
+  assert.match(text, /event: process\.completed/);
 });
 
 test("typed SSE writer contract: event type becomes event name and version-like fields become SSE id", () => {
@@ -535,6 +654,56 @@ test("typed SSE writer contract: event type becomes event name and version-like 
   assert.equal(frames[0].payload.type, "thread.snapshot");
   assert.equal(frames[0].payload.threadId, "thread-transport-42");
   assert.equal(frames[1].payload.text, "hello");
+});
+
+test("typed SSE writer contract: started/delta/completed lifecycle events preserve event names and ids", () => {
+  const writes = [];
+  const writer = createSseStreamWriter({
+    write(chunk) {
+      writes.push(String(chunk));
+    },
+    flushHeaders() {},
+    end() {}
+  });
+
+  writer.open();
+  writer.sendTypedEvent({
+    type: "process.started",
+    processId: "proc-writer-1",
+    processType: "command_execution",
+    summary: "npm run check",
+    ts: "2026-04-29T00:00:01.000Z"
+  });
+  writer.sendTypedEvent({
+    type: "process.delta",
+    processId: "proc-writer-1",
+    processType: "command_execution",
+    summary: "src/sessionManager.js",
+    ts: "2026-04-29T00:00:02.000Z"
+  });
+  writer.sendTypedEvent({
+    type: "process.completed",
+    processId: "proc-writer-1",
+    processType: "command_execution",
+    summary: "done",
+    ts: "2026-04-29T00:00:03.000Z"
+  });
+  writer.sendTypedEvent({
+    type: "turn.completed",
+    turnId: "turn-writer-1",
+    ts: "2026-04-29T00:00:04.000Z"
+  });
+
+  const frames = parseSseFrames(writes.join(""));
+  assert.deepEqual(
+    frames.map((frame) => ({ event: frame.event, id: frame.id })),
+    [
+      { event: "process.started", id: "2026-04-29T00:00:01.000Z" },
+      { event: "process.delta", id: "2026-04-29T00:00:02.000Z" },
+      { event: "process.completed", id: "2026-04-29T00:00:03.000Z" },
+      { event: "turn.completed", id: "turn-writer-1" }
+    ]
+  );
 });
 
 test("typed SSE client contract: requestSessionInputStream parses typed event blocks without falling back to websocket semantics", async (t) => {
@@ -773,7 +942,7 @@ test("input-stream main-path guard: App closes the legacy websocket before switc
   );
   assert.match(
     sessionManagerSource,
-    /const preferAppServer = Boolean\([\s\S]*this\.config\.codexAppServerEnabled[\s\S]*this\.appServerBridge[\s\S]*!String\(resumeSessionId \|\| ""\)\.trim\(\)/
+    /const preferAppServer = Boolean\([\s\S]*this\.config\.codexAppServerEnabled[\s\S]*this\.appServerBridge[\s\S]*!sessionRequiresJsonExec/
   );
 });
 

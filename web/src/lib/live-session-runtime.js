@@ -282,6 +282,84 @@ export function createLiveSessionRuntimeController({
 
   function handleLivePayload(payload, deps = {}) {
     const { activeThreadId, detectSystemFailureText, isDisposableAssistantFragment } = deps;
+    if (payload.type === "message.delta" || payload.type === "message.completed") {
+      const text = String(payload?.text || "").trim();
+      const turnId = String(payload?.turnId || "").trim();
+      if (text && turnId) {
+        const nextConversation = threadRuntime.appendMessageEventToConversation(state.liveView.conversation, {
+          turnId,
+          messageId: payload?.messageId || "",
+          phase: payload.type === "message.delta" ? "streaming" : "final",
+          ts: payload?.ts || new Date().toISOString(),
+          text
+        });
+        threadRuntime.setConversation(nextConversation, {
+          fallbackMessages: threadRuntime.collectConversationFallbackMessages(state.liveView.messages),
+          force: true
+        });
+        threadRuntime.setLiveThreadSnapshot(
+          threadRuntime.resolveAuthoritativeLiveThreadSnapshot({
+            conversation: nextConversation,
+            fallbackThreadId: payload?.threadId || activeThreadId
+          }),
+          state.liveView.liveOverlay
+        );
+      }
+      return;
+    }
+
+    if (payload.type === "process.started" || payload.type === "process.delta" || payload.type === "process.completed") {
+      const turnId = String(payload?.turnId || "").trim();
+      const summary = String(payload?.summary || "").trim();
+      if (turnId && summary) {
+        const nextConversation = threadRuntime.appendProcessEventToConversation(state.liveView.conversation, payload);
+        threadRuntime.setConversation(nextConversation, {
+          fallbackMessages: threadRuntime.collectConversationFallbackMessages(state.liveView.messages),
+          force: true
+        });
+        threadRuntime.setLiveThreadSnapshot(
+          threadRuntime.resolveAuthoritativeLiveThreadSnapshot({
+            conversation: nextConversation,
+            fallbackThreadId: payload?.threadId || activeThreadId
+          }),
+          state.liveView.liveOverlay
+        );
+      }
+      return;
+    }
+
+    if (payload.type === "turn.completed") {
+      const turnId = String(payload?.turnId || "").trim();
+      if (turnId) {
+        const nextConversation = threadRuntime.mergeConversationPatch(state.liveView.conversation, {
+          turns: [
+            {
+              id: turnId,
+              assistant: {
+                status: "completed",
+                finishedAt: String(payload?.ts || new Date().toISOString())
+              }
+            }
+          ],
+          activeTurnId: "",
+          status: "completed"
+        });
+        threadRuntime.setConversation(nextConversation, {
+          fallbackMessages: threadRuntime.collectConversationFallbackMessages(state.liveView.messages),
+          force: true
+        });
+        threadRuntime.setLiveThreadSnapshot(
+          threadRuntime.resolveAuthoritativeLiveThreadSnapshot({
+            conversation: nextConversation,
+            fallbackThreadId: payload?.threadId || activeThreadId
+          }),
+          state.liveView.liveOverlay
+        );
+      }
+      settleAuthoritativeInputState();
+      return;
+    }
+
     if (payload.type === "thread.snapshot") {
       stopHistorySyncLoop?.();
       if (String(payload?.session?.id || "").trim()) {
@@ -347,26 +425,33 @@ export function createLiveSessionRuntimeController({
     if (payload.type === "thread.overlay") {
       stopHistorySyncLoop?.();
       threadRuntime.setLiveOverlay(payload);
-      state.liveView.hasConversationSnapshot = true;
-      state.liveView.hasConversationDelta = true;
-      const parts = Array.isArray(payload.parts) ? payload.parts : [];
-      const normalizedParts = parts
-        .map((part) => {
-          if (String(part?.type || "").trim().toLowerCase() !== "text") {
-            return null;
+      const hasTypedConversation =
+        Array.isArray(state.liveView.conversation?.turns) &&
+        state.liveView.conversation.turns.some((turn) => {
+          if (String(turn?.id || "").trim() !== String(payload?.turnId || "").trim()) {
+            return false;
           }
-          return {
-            role: payload?.role === "user" ? "user" : "assistant",
-            partType: "markdown",
-            payload: { text: String(part?.text || "") },
-            ts: payload?.timestamp || new Date().toISOString(),
-            phase: payload?.phase || "streaming",
-            source: "message_part",
-            rawType: "message_part"
-          };
-        })
-        .filter(Boolean);
-      appendNormalizedParts(normalizedParts, { detectSystemFailureText, isDisposableAssistantFragment });
+          return (
+            (Array.isArray(turn?.assistant?.body) && turn.assistant.body.length > 0) ||
+            (Array.isArray(turn?.assistant?.process) && turn.assistant.process.length > 0)
+          );
+        });
+      if (!hasTypedConversation) {
+        const nextConversation = threadRuntime.appendOverlayPartsToConversation(state.liveView.conversation, payload);
+        threadRuntime.setConversation(nextConversation, {
+          fallbackMessages: threadRuntime.collectConversationFallbackMessages(state.liveView.messages),
+          force: true
+        });
+        threadRuntime.setLiveThreadSnapshot(
+          threadRuntime.resolveAuthoritativeLiveThreadSnapshot({
+            conversation: nextConversation,
+            fallbackThreadId: payload?.threadId || activeThreadId
+          }),
+          payload
+        );
+        state.liveView.hasConversationSnapshot = true;
+        state.liveView.hasConversationDelta = true;
+      }
       return;
     }
 

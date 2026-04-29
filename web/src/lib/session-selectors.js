@@ -6,6 +6,12 @@ import { getProviderModelOptions } from "./composer.js";
 import { workspaceName } from "./session-helpers.js";
 
 export function createSessionSelectors({ state, route, sessionCache, composerOptions, providerCatalog }) {
+  function turnHasRenderableTypedContent(turn = {}) {
+    const body = Array.isArray(turn?.assistant?.body) ? turn.assistant.body : [];
+    const process = Array.isArray(turn?.assistant?.process) ? turn.assistant.process : [];
+    return body.some((part) => String(part?.text || "").trim()) || process.some((item) => String(item?.summary || item?.content || "").trim());
+  }
+
   const routeHistoryTarget = computed(() => {
     if (route.name !== "chat") {
       return null;
@@ -70,7 +76,21 @@ export function createSessionSelectors({ state, route, sessionCache, composerOpt
     });
   });
 
-  const displayedLiveOverlay = computed(() => state.liveView.liveOverlay);
+  const displayedLiveOverlay = computed(() => {
+    if (state.liveView.hasConversationDelta || state.liveView.hasConversationSnapshot) {
+      return null;
+    }
+    const overlayTurnId = String(state.liveView.liveOverlay?.turnId || "").trim();
+    if (overlayTurnId) {
+      const typedTurn = (Array.isArray(state.liveView.conversation?.turns) ? state.liveView.conversation.turns : []).find(
+        (turn) => String(turn?.id || "").trim() === overlayTurnId
+      );
+      if (typedTurn && turnHasRenderableTypedContent(typedTurn)) {
+        return null;
+      }
+    }
+    return state.liveView.liveOverlay;
+  });
 
   const activeSessionTitle = computed(() => {
     if (displayedSessionMeta.value) {

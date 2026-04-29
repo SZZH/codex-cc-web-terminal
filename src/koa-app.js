@@ -36,6 +36,11 @@ export function createKoaApp({ config, sessionManager }) {
       return;
     }
 
+    if (ctx.path === "/api/health" && ctx.method === "GET") {
+      runtime.json(ctx, 200, runtime.healthPayload());
+      return;
+    }
+
     if (!runtime.isAllowedClient(ctx.req)) {
       const clientIp = runtime.normalizeIp(runtime.getClientAddress(ctx.req));
       console.warn(`[access] denied client=${clientIp || "unknown"} url=${ctx.url || ""}`);

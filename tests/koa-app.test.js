@@ -465,6 +465,25 @@ test("session routes delegate CRUD operations and health stays public", async (t
   assert.equal(healthPayload.sessions, 1);
 });
 
+test("health route stays public even when client access policy would reject other routes", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const server = await startTestServer({
+    sessionManager,
+    configOverrides: {
+      trustedCidrs: ["100.64.0.0/10"]
+    }
+  });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const healthResponse = await fetch(`${server.baseUrl}/api/health`);
+  assert.equal(healthResponse.status, 200);
+
+  const protectedResponse = await fetch(`${server.baseUrl}/api/sessions`);
+  assert.equal(protectedResponse.status, 403);
+});
+
 test("session create reuses existing live session for same provider+resume id", async (t) => {
   const sessionManager = createSessionManagerStub();
   sessionManager.findRunningLiveSessionByResume = (provider, resumeSessionId) => {
@@ -732,7 +751,11 @@ test("session input-stream route returns typed sse events and applies input to t
     }
   ]);
   assert.ok(events.some((event) => event.event === "thread.snapshot"));
-  assert.ok(events.some((event) => event.event === "thread.overlay"));
+  assert.ok(
+    events.some((event) => event.event === "thread.overlay") ||
+    events.some((event) => event.event === "message.delta") ||
+    events.some((event) => event.event === "message.completed")
+  );
   const completedSnapshot = events.find(
     (event) =>
       event.event === "thread.snapshot" &&
@@ -918,7 +941,11 @@ test("thread input-stream route can resume or create a live session from thread 
     }
   ]);
   assert.ok(events.some((event) => event.event === "thread.snapshot"));
-  assert.ok(events.some((event) => event.event === "thread.overlay"));
+  assert.ok(
+    events.some((event) => event.event === "thread.overlay") ||
+    events.some((event) => event.event === "message.delta") ||
+    events.some((event) => event.event === "message.completed")
+  );
 });
 
 test("fs and history routes return manager-backed payloads", async (t) => {

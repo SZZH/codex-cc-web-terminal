@@ -492,6 +492,36 @@ test("codex resumed session inherits model, reasoning effort, permission and cwd
   assert.equal(live.runnerMode, "json_exec");
 });
 
+test("codex resumed session prefers app_server when permission mode stays default", () => {
+  const rootDir = createTempDir();
+  const stateDbPath = path.join(rootDir, ".codex", "state.sqlite");
+  fs.mkdirSync(path.dirname(stateDbPath), { recursive: true });
+  execFileSync("sqlite3", [stateDbPath, "create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer);"]);
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      `insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, model, reasoning_effort)
+       values ('thread-resume-default', '/tmp/rollout.jsonl', 1, 1, 'vscode', 'openai', '${path.join(rootDir, "workspace", "project-a").replace(/'/g, "''")}', 'resume default', 'workspace-write', 'on-request', 'gpt-5.4', 'low');`
+    ],
+    { stdio: "ignore" }
+  );
+
+  const config = createBaseConfig(rootDir, {
+    codexStateDbPath: stateDbPath
+  });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  const created = manager.create({
+    provider: "codex",
+    resumeSessionId: "thread-resume-default"
+  });
+  const live = manager.get(created.id);
+
+  assert.equal(live.permissionMode, "default");
+  assert.equal(live.runnerMode, "app_server");
+});
+
 test("codex live session auto-renames and streams app-server replies", async () => {
   const { manager, bridge } = createManager();
   const session = manager.create({ provider: "codex", cwd: process.cwd() });
@@ -652,6 +682,305 @@ test("startTurn in-progress shell does not emit no-reply fallback before notific
         String(payload.part?.text || "").includes("未返回可展示文本")
     )
   );
+});
+
+test("app-server hook notifications emit typed process lifecycle events", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-hook-events" });
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const live = manager.get(session.id);
+  live.currentTurnId = manager.createConversationTurn(live, "测试 hook 事件", "2026-04-14T00:00:00.000Z");
+
+  manager.handleAppServerNotification({
+    method: "hook/started",
+    params: {
+      threadId: "thread-hook-events",
+      turnId: live.currentTurnId,
+      run: {
+        id: "hook-1",
+        eventName: "userPromptSubmit",
+        status: "running"
+      }
+    }
+  });
+
+  manager.handleAppServerNotification({
+    method: "hook/completed",
+    params: {
+      threadId: "thread-hook-events",
+      turnId: live.currentTurnId,
+      run: {
+        id: "hook-1",
+        eventName: "userPromptSubmit",
+        status: "completed"
+      }
+    }
+  });
+
+  assert.ok(sentPayloads.some((payload) => payload.type === "process.started" && payload.processType === "hook"));
+  assert.ok(sentPayloads.some((payload) => payload.type === "process.completed" && payload.processType === "hook"));
+});
+
+test("app-server item/completed for non-message items emits typed process completion", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-item-completed-events" });
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const live = manager.get(session.id);
+  live.currentTurnId = manager.createConversationTurn(live, "测试 item completed 事件", "2026-04-14T00:00:00.000Z");
+
+  manager.handleAppServerNotification({
+    method: "item/completed",
+    params: {
+      threadId: "thread-item-completed-events",
+      turnId: live.currentTurnId,
+      item: {
+        type: "functionCallOutput",
+        id: "tool-output-1",
+        text: "tool output ready"
+      }
+    }
+  });
+
+  assert.ok(sentPayloads.some((payload) => payload.type === "process.completed" && payload.processType === "functioncalloutput"));
+});
+
+test("app-server command execution delta notifications emit typed process deltas", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-command-delta-events" });
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const live = manager.get(session.id);
+  live.currentTurnId = manager.createConversationTurn(live, "测试命令过程增量", "2026-04-14T00:00:00.000Z");
+
+  manager.handleAppServerNotification({
+    method: "item/commandExecution/outputDelta",
+    params: {
+      threadId: "thread-command-delta-events",
+      turnId: live.currentTurnId,
+      itemId: "cmd-1",
+      processId: "123",
+      delta: "npm run check"
+    }
+  });
+
+  manager.handleAppServerNotification({
+    method: "item/commandExecution/terminalInteraction",
+    params: {
+      threadId: "thread-command-delta-events",
+      turnId: live.currentTurnId,
+      itemId: "cmd-1",
+      processId: "123",
+      stdin: "y"
+    }
+  });
+
+  assert.ok(sentPayloads.some((payload) => payload.type === "process.delta" && payload.summary === "npm run check"));
+  assert.ok(sentPayloads.some((payload) => payload.type === "process.delta" && payload.summary === "y"));
+});
+
+test("app-server message delta notifications emit typed message events directly", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-message-delta-events" });
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const live = manager.get(session.id);
+  live.currentTurnId = manager.createConversationTurn(live, "测试文本增量", "2026-04-14T00:00:00.000Z");
+
+  manager.handleAppServerNotification({
+    method: "item/agentMessage/delta",
+    params: {
+      threadId: "thread-message-delta-events",
+      turnId: live.currentTurnId,
+      delta: "第一段增量"
+    }
+  });
+
+  assert.ok(sentPayloads.some((payload) => payload.type === "message.delta" && payload.text === "第一段增量"));
+});
+
+test("queued codex turns do not rebind currentTurnId before the running turn finishes", async () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-queue-bind-events" });
+  const live = manager.get(session.id);
+
+  manager.write(session.id, "回复：TRACE-03");
+  await waitForMicrotasks();
+  const firstTurnId = live.currentTurnId;
+
+  // Simulate a second user input arriving while the first turn is still running.
+  manager.write(session.id, "回复：TRACE-04");
+  const secondTurnId = live.queuedTurnIds[0];
+
+  assert.notEqual(firstTurnId, secondTurnId);
+  assert.equal(live.currentTurnId, firstTurnId);
+});
+
+test("app-server thread lifecycle notifications emit typed thread and turn events", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-lifecycle-events" });
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const live = manager.get(session.id);
+  live.currentTurnId = manager.createConversationTurn(live, "测试线程状态", "2026-04-14T00:00:00.000Z");
+
+  manager.handleAppServerNotification({
+    method: "turn/started",
+    params: {
+      threadId: "thread-lifecycle-events",
+      turnId: live.currentTurnId
+    }
+  });
+  manager.handleAppServerNotification({
+    method: "thread/status/changed",
+    params: {
+      threadId: "thread-lifecycle-events",
+      status: "running"
+    }
+  });
+  manager.handleAppServerNotification({
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: "thread-lifecycle-events",
+      usage: { inputTokens: 12, outputTokens: 34 }
+    }
+  });
+
+  assert.ok(sentPayloads.some((payload) => payload.type === "turn.started" && payload.turnId === live.currentTurnId));
+  assert.ok(sentPayloads.some((payload) => payload.type === "thread.status.updated" && payload.status === "running"));
+  assert.ok(sentPayloads.some((payload) => payload.type === "thread.metrics.updated" && payload.metrics?.outputTokens === 34));
+});
+
+test("app-server reasoning notifications emit typed reasoning lifecycle events", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-reasoning-events" });
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const live = manager.get(session.id);
+  live.currentTurnId = manager.createConversationTurn(live, "测试 reasoning", "2026-04-14T00:00:00.000Z");
+
+  manager.handleAppServerNotification({
+    method: "item/started",
+    params: {
+      threadId: "thread-reasoning-events",
+      turnId: live.currentTurnId,
+      item: {
+        id: "reasoning-1",
+        type: "reasoning"
+      }
+    }
+  });
+  manager.handleAppServerNotification({
+    method: "item/reasoning/delta",
+    params: {
+      threadId: "thread-reasoning-events",
+      turnId: live.currentTurnId,
+      itemId: "reasoning-1",
+      delta: "先检查链路"
+    }
+  });
+  manager.handleAppServerNotification({
+    method: "item/completed",
+    params: {
+      threadId: "thread-reasoning-events",
+      turnId: live.currentTurnId,
+      item: {
+        id: "reasoning-1",
+        type: "reasoning",
+        text: "先检查链路"
+      }
+    }
+  });
+
+  assert.ok(sentPayloads.some((payload) => payload.type === "reasoning.started" && payload.processId === "reasoning-1"));
+  assert.ok(sentPayloads.some((payload) => payload.type === "reasoning.delta" && payload.summary === "先检查链路"));
+  assert.ok(sentPayloads.some((payload) => payload.type === "reasoning.completed" && payload.processId === "reasoning-1"));
+});
+
+test("app-server commentary agentMessage delta is routed to typed reasoning events", () => {
+  const { manager } = createManager();
+  const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-commentary-events" });
+  const sentPayloads = [];
+
+  manager.attachClient(session.id, {
+    send(payload) {
+      sentPayloads.push(JSON.parse(payload));
+    },
+    on() {}
+  });
+
+  const live = manager.get(session.id);
+  live.currentTurnId = manager.createConversationTurn(live, "测试 commentary", "2026-04-14T00:00:00.000Z");
+
+  manager.handleAppServerNotification({
+    method: "item/started",
+    params: {
+      threadId: "thread-commentary-events",
+      turnId: live.currentTurnId,
+      item: {
+        id: "msg-commentary-1",
+        type: "agentMessage",
+        phase: "commentary"
+      }
+    }
+  });
+
+  manager.handleAppServerNotification({
+    method: "item/agentMessage/delta",
+    params: {
+      threadId: "thread-commentary-events",
+      turnId: live.currentTurnId,
+      itemId: "msg-commentary-1",
+      delta: "先分析一下"
+    }
+  });
+
+  assert.ok(sentPayloads.some((payload) => payload.type === "reasoning.started" && payload.processId === "msg-commentary-1"));
+  assert.ok(sentPayloads.some((payload) => payload.type === "reasoning.delta" && payload.summary === "先分析一下"));
+  assert.equal(sentPayloads.filter((payload) => payload.type === "message.delta").length, 0);
 });
 
 test("app-server item/completed ignores userMessage echoes", () => {
@@ -1285,6 +1614,7 @@ test("codex sidebar filters project sessions to vscode threads on the active git
   const codexDir = path.join(rootDir, ".codex");
   const globalStatePath = path.join(codexDir, ".codex-global-state.json");
   const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const nowSeconds = Math.floor(Date.now() / 1000);
   fs.mkdirSync(codexDir, { recursive: true });
   fs.mkdirSync(workspaceRoot, { recursive: true });
 
@@ -1339,11 +1669,11 @@ test("codex sidebar filters project sessions to vscode threads on the active git
       sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
       cli_version, first_user_message, agent_nickname, agent_role, memory_mode
     ) values
-    ('thread-current-1','',1714200000,1714200000,'vscode','openai','${workspaceRoot}','branch session A','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled'),
-    ('thread-current-2','',1714201000,1714201000,'vscode','openai','${workspaceRoot}','branch session B','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled'),
-    ('thread-main','',1714100000,1714100000,'vscode','openai','${workspaceRoot}','main old session','danger','full',0,0,0,'main','','','','','enabled'),
-    ('thread-subagent','',1714202000,1714202000,'subagent','openai','${workspaceRoot}','subagent session','danger','full',0,0,0,'feature/conversation-sync-fix','','','','worker','enabled'),
-    ('thread-exec','',1714203000,1714203000,'exec','openai','${workspaceRoot}','exec session','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled');
+    ('thread-current-1','',${nowSeconds - 200},${nowSeconds - 200},'vscode','openai','${workspaceRoot}','branch session A','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled'),
+    ('thread-current-2','',${nowSeconds - 100},${nowSeconds - 100},'vscode','openai','${workspaceRoot}','branch session B','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled'),
+    ('thread-main','',${nowSeconds - 300},${nowSeconds - 300},'vscode','openai','${workspaceRoot}','main old session','danger','full',0,0,0,'main','','','','','enabled'),
+    ('thread-subagent','',${nowSeconds - 50},${nowSeconds - 50},'subagent','openai','${workspaceRoot}','subagent session','danger','full',0,0,0,'feature/conversation-sync-fix','','','','worker','enabled'),
+    ('thread-exec','',${nowSeconds - 25},${nowSeconds - 25},'exec','openai','${workspaceRoot}','exec session','danger','full',0,0,0,'feature/conversation-sync-fix','','','','','enabled');
   `;
   execFileSync("sqlite3", [stateDbPath, sqliteInit], { stdio: "ignore" });
 
@@ -1850,6 +2180,192 @@ test("history resync broadcasts when resumed-thread snapshot content advances wi
 
   assert.equal(snapshots.length, 1);
   assert.match(String(snapshots[0]?.turns?.[0]?.items?.[0]?.text || ""), /新内容/);
+});
+
+test("history resync does not roll back a newer live snapshot with an older historical snapshot", async () => {
+  const { manager } = createManager();
+  const liveSessionMeta = manager.create({
+    provider: "codex",
+    cwd: process.cwd(),
+    resumeSessionId: "thread-resync-stale-1"
+  });
+  const liveSession = manager.get(liveSessionMeta.id);
+  liveSession.threadSnapshot = {
+    threadId: "thread-resync-stale-1",
+    version: 9,
+    lastEventSeq: 20,
+    updatedAt: "2026-04-29T05:54:53.977Z",
+    turns: [
+      {
+        id: "turn-latest-1",
+        status: "completed",
+        items: [
+          { id: "user-1", kind: "UserMessage", text: "回复：5555" },
+          { id: "agent-1", kind: "AgentMessage", text: "5555" }
+        ]
+      }
+    ]
+  };
+
+  manager.historyService.getHistoricalMessages = () => ({
+    threadSnapshot: {
+      threadId: "thread-resync-stale-1",
+      version: 8,
+      lastEventSeq: 19,
+      updatedAt: "2026-04-29T05:53:31.274Z",
+      turns: []
+    },
+    liveOverlay: null
+  });
+
+  const snapshots = [];
+  manager.broadcastConversationSnapshot = (session) => {
+    snapshots.push(session.threadSnapshot);
+  };
+
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (handler) => {
+    handler();
+    return { unref() {} };
+  };
+  try {
+    manager.scheduleConversationHistoryResync(liveSession, { attempts: 1, delayMs: 1 });
+  } finally {
+    global.setTimeout = realSetTimeout;
+  }
+
+  assert.equal(snapshots.length, 0);
+  assert.equal(liveSession.threadSnapshot.version, 9);
+  assert.equal(liveSession.threadSnapshot.turns.length, 1);
+  assert.equal(liveSession.threadSnapshot.turns[0].items[1].text, "5555");
+});
+
+test("history resync does not drop the current live turn when historical snapshot has not caught up yet", async () => {
+  const { manager } = createManager();
+  const liveSessionMeta = manager.create({
+    provider: "codex",
+    cwd: process.cwd(),
+    resumeSessionId: "thread-resync-active-1"
+  });
+  const liveSession = manager.get(liveSessionMeta.id);
+  liveSession.currentTurnId = "turn-active-1";
+  liveSession.conversationState = createConversationState({
+    sessionId: liveSession.id,
+    threadId: "thread-resync-active-1",
+    version: 12,
+    status: "running",
+    activeTurnId: "turn-active-1",
+    turns: [
+      {
+        id: "turn-active-1",
+        user: { id: "u1", text: "看一下这个接口怎么改", ts: "2026-04-29T06:00:48.136Z" },
+        assistant: {
+          status: "running",
+          body: [{ id: "body-1", kind: "markdown", text: "先按接口说明改这一处。", payload: {}, ts: "2026-04-29T06:01:00.685Z" }],
+          process: []
+        }
+      }
+    ]
+  });
+  liveSession.threadSnapshot = deriveThreadSnapshotFromConversationState(liveSession.conversationState, {
+    threadId: "thread-resync-active-1",
+    metadata: { name: "Active Thread", cwd: process.cwd(), source: "codex" }
+  });
+  liveSession.threadSnapshot.updatedAt = "2026-04-29T06:01:00.687Z";
+  liveSession.threadSnapshot.activeTurnId = "turn-active-1";
+
+  manager.historyService.getHistoricalMessages = () => ({
+    threadSnapshot: {
+      threadId: "thread-resync-active-1",
+      version: 13,
+      lastEventSeq: Number(liveSession.threadSnapshot.lastEventSeq || 0) + 1,
+      updatedAt: "2026-04-29T06:01:11.464Z",
+      activeTurnId: "",
+      turns: []
+    },
+    liveOverlay: null
+  });
+
+  const snapshots = [];
+  manager.broadcastConversationSnapshot = (session) => {
+    snapshots.push(session.threadSnapshot);
+  };
+
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (handler) => {
+    handler();
+    return { unref() {} };
+  };
+  try {
+    manager.scheduleConversationHistoryResync(liveSession, { attempts: 1, delayMs: 1 });
+  } finally {
+    global.setTimeout = realSetTimeout;
+  }
+
+  assert.equal(snapshots.length, 0);
+  assert.equal(liveSession.threadSnapshot.activeTurnId, "turn-active-1");
+  assert.equal(liveSession.threadSnapshot.turns.length, 1);
+  assert.equal(liveSession.threadSnapshot.turns[0].items[0].text, "看一下这个接口怎么改");
+});
+
+test("history resync does not replace a protected live turn with an empty historical shell of the same thread", async () => {
+  const { manager } = createManager();
+  const liveSessionMeta = manager.create({
+    provider: "codex",
+    cwd: process.cwd(),
+    resumeSessionId: "thread-resync-protected-shell-1"
+  });
+  const liveSession = manager.get(liveSessionMeta.id);
+  liveSession.currentTurnId = "turn-protected-shell-1";
+  liveSession.threadSnapshot = {
+    threadId: "thread-resync-protected-shell-1",
+    version: 12,
+    lastEventSeq: 24,
+    updatedAt: "2026-04-29T06:00:48.136Z",
+    activeTurnId: "turn-protected-shell-1",
+    turns: [
+      {
+        id: "turn-protected-shell-1",
+        status: "inProgress",
+        items: [
+          { id: "user-1", kind: "UserMessage", text: "看一下这个接口怎么改" },
+          { id: "agent-1", kind: "AgentMessage", text: "先按接口说明改这一处。" }
+        ]
+      }
+    ]
+  };
+
+  manager.historyService.getHistoricalMessages = () => ({
+    threadSnapshot: {
+      threadId: "thread-resync-protected-shell-1",
+      version: 13,
+      lastEventSeq: 25,
+      updatedAt: "2026-04-29T06:01:00.687Z",
+      activeTurnId: "",
+      turns: []
+    },
+    liveOverlay: null
+  });
+
+  const snapshots = [];
+  manager.broadcastConversationSnapshot = (session) => {
+    snapshots.push(session.threadSnapshot);
+  };
+
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (handler) => {
+    handler();
+    return { unref() {} };
+  };
+  try {
+    manager.scheduleConversationHistoryResync(liveSession, { attempts: 1, delayMs: 1 });
+  } finally {
+    global.setTimeout = realSetTimeout;
+  }
+
+  assert.equal(snapshots.length, 0);
+  assert.equal(liveSession.threadSnapshot.turns.length, 1);
+  assert.equal(liveSession.threadSnapshot.turns[0].items[1].text, "先按接口说明改这一处。");
 });
 
 test("buildProviderCommand reflects provider-specific CLI arguments", () => {

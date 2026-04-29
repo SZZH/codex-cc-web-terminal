@@ -11,6 +11,24 @@ function noop() {}
 
 const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "aborted", "interrupted"]);
 const TERMINAL_PAYLOAD_TYPES = new Set(["turn_completed", "turn_failed", "turn_aborted"]);
+const DIRECT_TYPED_EVENT_TYPES = new Set([
+  "message.delta",
+  "message.completed",
+  "reasoning.started",
+  "reasoning.delta",
+  "reasoning.completed",
+  "process.started",
+  "process.delta",
+  "process.completed",
+  "thread.status.updated",
+  "thread.metrics.updated",
+  "turn.started",
+  "turn.completed",
+  "turn.failed",
+  "turn.interrupted",
+  "transport.error",
+  "session.updated"
+]);
 
 function createCloseSignal() {
   const listeners = new Set();
@@ -170,17 +188,104 @@ function isSessionTerminalForTurn(session, trackedTurnId) {
   return isTerminalTurnStatus(conversationTurn?.status) || isTerminalTurnStatus(assistantStatus);
 }
 
+function payloadReferencesTurn(payload, trackedTurnId) {
+  if (!payload || typeof payload !== "object" || !trackedTurnId) {
+    return false;
+  }
+
+  const payloadTurnId = String(payload.turnId || payload?.payload?.turnId || payload?.payload?.turn_id || "").trim();
+  if (payloadTurnId && payloadTurnId === trackedTurnId) {
+    return true;
+  }
+
+  return Boolean(
+    findTurnById(payload?.conversation?.turns, trackedTurnId) ||
+      findTurnById(payload?.snapshot?.turns, trackedTurnId) ||
+      findTurnById(payload?.turns, trackedTurnId) ||
+      findTurnById(payload?.threadSnapshot?.turns, trackedTurnId) ||
+      findTurnById(payload?.thread?.snapshot?.turns, trackedTurnId)
+  );
+}
+
 function buildTransportFrames(payload, { session = null, trackedTurnId = "" } = {}) {
   if (!payload || typeof payload !== "object") {
     return [];
   }
 
   const type = String(payload.type || "").trim();
+  const sessionId = String(session?.id || "");
+  const threadId = String(session?.resumeSessionId || session?.threadSnapshot?.threadId || "");
   if (type === "conversation.snapshot" || type === "conversation.delta") {
     return [{ kind: "snapshot", data: buildThreadTransportSnapshot(session, payload, { trackedTurnId }) }];
   }
 
+  if (DIRECT_TYPED_EVENT_TYPES.has(type)) {
+    return [{ kind: "typed", data: payload }];
+  }
+
   if (type === "message_part") {
+    const partType = String(payload?.part?.type || "").trim().toLowerCase();
+    const text = String(payload?.part?.text || "");
+    const turnId = String(
+      payload?.turnId ||
+      trackedTurnId ||
+      session?.currentTurnId ||
+      session?.threadSnapshot?.activeTurnId ||
+      session?.conversationState?.activeTurnId ||
+      ""
+    ).trim();
+    if ((partType === "text" || partType === "markdown") && text.trim() && turnId) {
+      return [{
+        kind: "typed",
+        data: {
+          type: String(payload?.phase || "").trim().toLowerCase() === "streaming" ? "message.delta" : "message.completed",
+          sessionId,
+          threadId,
+          turnId,
+          role: String(payload?.role || "assistant"),
+          text,
+          format: String(payload?.part?.format || "markdown"),
+          ts: payload?.timestamp || undefined,
+          phase: payload?.phase || undefined
+        }
+      }];
+    }
+    if (["tool", "event", "subagent", "reference"].includes(partType) && turnId) {
+      const summary = String(
+        payload?.part?.summary ||
+        payload?.part?.text ||
+        payload?.part?.payload?.summary ||
+        payload?.part?.payload?.message ||
+        payload?.part?.rawType ||
+        partType
+      ).trim();
+      if (summary) {
+        const phase = String(payload?.phase || "").trim().toLowerCase();
+        return [{
+          kind: "typed",
+          data: {
+            type: phase === "streaming" ? "process.started" : "process.completed",
+            sessionId,
+            threadId,
+            turnId,
+            role: String(payload?.role || "assistant"),
+            processId: String(
+              payload?.part?.payload?.id ||
+              payload?.part?.payload?.callId ||
+              payload?.part?.payload?.call_id ||
+              payload?.part?.payload?.command ||
+              payload?.part?.rawType ||
+              partType
+            ),
+            processType: String(payload?.part?.rawType || partType),
+            summary,
+            payload: payload?.part?.payload || {},
+            ts: payload?.timestamp || undefined,
+            phase: payload?.phase || undefined
+          }
+        }];
+      }
+    }
     const overlay = buildThreadTransportOverlay(session, payload, { trackedTurnId });
     return overlay ? [{ kind: "overlay", data: overlay }] : [];
   }
@@ -229,6 +334,7 @@ export function openSessionSseStream({
   sessionManager,
   sessionId,
   keepaliveMs = 15000,
+  terminalCloseDelayMs = 1500,
   onBeforeClose = noop,
   onPayload = noop
 }) {
@@ -236,12 +342,15 @@ export function openSessionSseStream({
   const closeSignal = createCloseSignal();
   let closed = false;
   let trackedTurnId = "";
+  let terminalCloseTimer = null;
+  let terminalClosePending = false;
 
   const close = () => {
     if (closed) {
       return;
     }
     closed = true;
+    clearTimeout(terminalCloseTimer);
     clearInterval(keepaliveTimer);
     closeSignal.emit();
     try {
@@ -252,10 +361,23 @@ export function openSessionSseStream({
     writer.close();
   };
 
+  const scheduleTerminalClose = () => {
+    if (closed) {
+      return;
+    }
+    terminalClosePending = true;
+    clearTimeout(terminalCloseTimer);
+    terminalCloseTimer = setTimeout(() => {
+      terminalClosePending = false;
+      close();
+    }, Math.max(0, Number(terminalCloseDelayMs) || 0));
+    terminalCloseTimer.unref?.();
+  };
+
   const client = {
     send(raw) {
       let payload = raw;
-      let shouldCloseAfterSend = false;
+      let shouldScheduleTerminalClose = false;
       if (typeof raw === "string") {
         try {
           payload = JSON.parse(raw);
@@ -267,20 +389,31 @@ export function openSessionSseStream({
         onPayload(payload, {
           close,
           closeAfterSend() {
-            shouldCloseAfterSend = true;
+            shouldScheduleTerminalClose = true;
           }
         });
       } catch {
         // Ignore payload hook failures to avoid breaking the stream.
       }
-      if (!shouldCloseAfterSend && isPayloadTerminalForTurn(payload, trackedTurnId)) {
-        shouldCloseAfterSend = true;
+      const payloadTouchesTrackedTurn = payloadReferencesTurn(payload, trackedTurnId);
+      if (payloadTouchesTrackedTurn) {
+        clearTimeout(terminalCloseTimer);
+        if (terminalClosePending) {
+          shouldScheduleTerminalClose = true;
+        }
+      }
+      if (!shouldScheduleTerminalClose && isPayloadTerminalForTurn(payload, trackedTurnId)) {
+        shouldScheduleTerminalClose = true;
       }
       const session = sessionManager.get(sessionId);
       const frames = buildTransportFrames(payload, { session, trackedTurnId });
       for (const frame of frames) {
         if (frame.kind === "snapshot") {
           writer.sendSnapshot(frame.data);
+          continue;
+        }
+        if (frame.kind === "typed") {
+          writer.sendTypedEvent(frame.data);
           continue;
         }
         if (frame.kind === "overlay") {
@@ -291,8 +424,8 @@ export function openSessionSseStream({
           writer.sendCanonicalEvent(frame.data);
         }
       }
-      if (shouldCloseAfterSend) {
-        close();
+      if (shouldScheduleTerminalClose) {
+        scheduleTerminalClose();
       }
     },
     on(eventName, handler) {
@@ -329,7 +462,7 @@ export function openSessionSseStream({
       }
       const session = sessionManager.get(sessionId);
       if (isSessionTerminalForTurn(session, trackedTurnId)) {
-        close();
+        scheduleTerminalClose();
       }
     },
     sendError(error) {
