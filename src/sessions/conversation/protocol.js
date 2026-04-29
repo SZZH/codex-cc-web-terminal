@@ -65,9 +65,12 @@ function resolveThreadRuntime(session, payload = {}) {
 }
 
 function pickTurnById(turns, turnId) {
-  const targetTurnId = String(turnId || "").trim();
-  if (!targetTurnId || !Array.isArray(turns)) {
+  if (!Array.isArray(turns)) {
     return [];
+  }
+  const targetTurnId = String(turnId || "").trim();
+  if (!targetTurnId) {
+    return turns;
   }
   return turns.filter((turn) => String(turn?.id || "").trim() === targetTurnId);
 }

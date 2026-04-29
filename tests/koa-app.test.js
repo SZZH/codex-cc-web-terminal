@@ -678,7 +678,16 @@ test("session input-stream route returns typed sse events and applies input to t
   let buffer = "";
   const events = [];
 
-  while (events.length < 3) {
+  while (
+    events.length < 6 &&
+    !events.some((event) =>
+      event.event === "thread.snapshot" &&
+      event.payload?.conversation?.turns?.some((turn) =>
+        turn?.user?.text === "你好" &&
+        turn?.assistant?.body?.some((block) => block?.text === "流式回复")
+      )
+    )
+  ) {
     const { value, done } = await reader.read();
     if (done) {
       break;
@@ -697,7 +706,16 @@ test("session input-stream route returns typed sse events and applies input to t
         event: eventLine ? eventLine.slice(6).trim() : "",
         payload: JSON.parse(dataLine)
       });
-      if (events.length >= 3) {
+      if (
+        events.length >= 6 ||
+        events.some((event) =>
+          event.event === "thread.snapshot" &&
+          event.payload?.conversation?.turns?.some((turn) =>
+            turn?.user?.text === "你好" &&
+            turn?.assistant?.body?.some((block) => block?.text === "流式回复")
+          )
+        )
+      ) {
         break;
       }
     }
@@ -715,6 +733,15 @@ test("session input-stream route returns typed sse events and applies input to t
   ]);
   assert.ok(events.some((event) => event.event === "thread.snapshot"));
   assert.ok(events.some((event) => event.event === "thread.overlay"));
+  const completedSnapshot = events.find(
+    (event) =>
+      event.event === "thread.snapshot" &&
+      event.payload?.conversation?.turns?.some((turn) =>
+        turn?.user?.text === "你好" &&
+        turn?.assistant?.body?.some((block) => block?.text === "流式回复")
+      )
+  );
+  assert.ok(completedSnapshot, "input-stream should surface submitted user text and assistant reply");
 });
 
 test("thread input-stream route can resume or create a live session from thread id", async (t) => {

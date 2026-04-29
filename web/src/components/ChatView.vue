@@ -373,13 +373,9 @@ function scrollToBottom(force = false) {
       return;
     }
 
-    const applyScroll = () => {
-      el.scrollTop = el.scrollHeight;
-      messageBottomEl.value?.scrollIntoView({ block: "end" });
-      isPinnedToBottom.value = true;
-    };
-
-    setTimeout(applyScroll, 1000)
+    el.scrollTop = el.scrollHeight;
+    messageBottomEl.value?.scrollIntoView({ block: "end" });
+    isPinnedToBottom.value = true;
   });
 }
 
@@ -571,7 +567,7 @@ watch(
     if (!hasThreadSnapshot.value) {
       return;
     }
-    settleInitialScrollToBottom();
+    settleScrollToBottom();
   },
   { flush: "post" }
 );

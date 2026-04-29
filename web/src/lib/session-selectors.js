@@ -65,7 +65,7 @@ export function createSessionSelectors({ state, route, sessionCache, composerOpt
       liveSessionMeta: state.liveView.sessionMeta,
       threadMeta: state.threadView.meta,
       preferAuthoritativeSnapshot,
-      includeLiveConversation: false,
+      includeLiveConversation: true,
       includeRuntimeDraft: true
     });
   });
