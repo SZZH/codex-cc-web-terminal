@@ -201,7 +201,7 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <div v-else class="empty-state">还没有可展示的会话。</div>
+    <div v-if="!groups.length" class="empty-state">还没有可展示的会话。</div>
   </main>
 </template>
 

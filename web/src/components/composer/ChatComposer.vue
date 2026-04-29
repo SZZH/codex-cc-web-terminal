@@ -221,6 +221,8 @@ defineExpose({
 <template>
   <div class="chat-composer-wrap">
     <form class="chat-composer" @submit.prevent="handlePrimaryAction">
+      <!-- 文件上传入口暂时下线，相关交互保留在代码里方便后续恢复。 -->
+      <!--
       <ComposerPopover :open="activePopover === 'add'" title="添加内容" @close="closePopover">
         <AddContentMenu
           @capture-photo="triggerInput(captureInputEl)"
@@ -229,6 +231,7 @@ defineExpose({
           @paste-clipboard="handleClipboardPasteRequest"
         />
       </ComposerPopover>
+      -->
 
       <ComposerPopover :open="activePopover === 'settings'" title="输入设置" @close="closePopover">
         <ComposerSettings
@@ -274,6 +277,7 @@ defineExpose({
       />
 
       <div class="chat-composer-actions">
+        <!--
         <button
           class="chat-composer-icon-button"
           type="button"
@@ -285,6 +289,7 @@ defineExpose({
             <path d="M12 5v14M5 12h14"></path>
           </svg>
         </button>
+        -->
 
         <button
           class="chat-composer-context-button"
@@ -307,6 +312,7 @@ defineExpose({
       </div>
     </form>
 
+    <!--
     <input
       ref="captureInputEl"
       class="chat-composer-hidden-input"
@@ -330,6 +336,7 @@ defineExpose({
       multiple
       @change="handleSelectedFiles($event, 'file', 'upload-file')"
     >
+    -->
   </div>
 </template>
 

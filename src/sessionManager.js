@@ -7,6 +7,14 @@ import pty from "node-pty";
 import { HistoricalSessionService } from "./sessions/history/HistoricalSessionService.js";
 import { CodexSidebarService } from "./sessions/history/CodexSidebarService.js";
 import {
+  buildLiveHistoryContinuation,
+  buildThreadSnapshotBundle
+} from "./sessions/history/liveHistoryRuntime.js";
+import {
+  buildSidebarSnapshotFromGroups,
+  mergeProjectGroupsWithLiveSessions
+} from "./sessions/history/sessionSidebarSnapshot.js";
+import {
   createTurnCompletedDelta,
   createTurnCreatedDelta,
   createTurnStatusDelta,
@@ -55,40 +63,6 @@ function normalizeName(value, fallback) {
   return text || fallback;
 }
 
-function normalizeComparablePath(value) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return "";
-  }
-  try {
-    return path.resolve(text);
-  } catch {
-    return text;
-  }
-}
-
-function isSubpathOf(targetPath, rootPath) {
-  const target = normalizeComparablePath(targetPath);
-  const root = normalizeComparablePath(rootPath);
-  if (!target || !root) {
-    return false;
-  }
-  if (target === root) {
-    return true;
-  }
-  const relative = path.relative(root, target);
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
-function bestProjectRootForCwd(cwd, projectRoots) {
-  const matches = projectRoots.filter((rootPath) => isSubpathOf(cwd, rootPath));
-  return matches.sort((left, right) => right.length - left.length)[0] || "";
-}
-
-function byUpdatedAtDesc(left, right) {
-  return String(right?.updatedAt || "").localeCompare(String(left?.updatedAt || ""));
-}
-
 function readCodexModelsFromCache(filePath = "") {
   const targetPath = String(filePath || "").trim();
   if (!targetPath || !fs.existsSync(targetPath)) {
@@ -130,6 +104,56 @@ function readCodexModelsFromCache(filePath = "") {
 function isManuallyNamedSession(session) {
   const titleSource = String(session?.titleSource || "").trim().toLowerCase();
   return titleSource === "custom_name" || titleSource === "user_provided";
+}
+
+function buildThreadTurnSignature(turn = null) {
+  if (!turn || typeof turn !== "object") {
+    return "";
+  }
+  const items = Array.isArray(turn.items)
+    ? turn.items.map((item) => ({
+        id: String(item?.id || ""),
+        kind: String(item?.kind || ""),
+        text: String(item?.text || ""),
+        type: String(item?.type || ""),
+        status: String(item?.status || "")
+      }))
+    : [];
+  return JSON.stringify({
+    id: String(turn.id || ""),
+    status: String(turn.status || ""),
+    items
+  });
+}
+
+function hasThreadSnapshotMeaningfulAdvance(incomingSnapshot, currentSnapshot) {
+  if (!incomingSnapshot || typeof incomingSnapshot !== "object") {
+    return false;
+  }
+  if (!currentSnapshot || typeof currentSnapshot !== "object") {
+    return true;
+  }
+
+  const incomingTurns = Array.isArray(incomingSnapshot.turns) ? incomingSnapshot.turns : [];
+  const currentTurns = Array.isArray(currentSnapshot.turns) ? currentSnapshot.turns : [];
+
+  if (incomingTurns.length !== currentTurns.length) {
+    return true;
+  }
+
+  const currentById = new Map(currentTurns.map((turn) => [String(turn?.id || "").trim(), turn]));
+  for (const incomingTurn of incomingTurns) {
+    const incomingTurnId = String(incomingTurn?.id || "").trim();
+    const currentTurn = currentById.get(incomingTurnId);
+    if (!currentTurn) {
+      return true;
+    }
+    if (buildThreadTurnSignature(incomingTurn) !== buildThreadTurnSignature(currentTurn)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function buildThreadProjection(session) {
@@ -227,50 +251,16 @@ export class SessionManager {
     return [...liveSessions, ...historySessions].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   }
 
+  listSidebarSnapshot() {
+    return buildSidebarSnapshotFromGroups(this.listAll(), this.listProjectGroups());
+  }
+
   listArchived() {
     return this.listHistoricalSessions({ archived: true });
   }
 
   listProjectGroups() {
-    const baseGroups = this.codexSidebarService.listProjectGroups();
-    if (!baseGroups.length) {
-      return [];
-    }
-
-    const groups = baseGroups.map((group) => ({
-      ...group,
-      sessions: Array.isArray(group.sessions) ? [...group.sessions] : []
-    }));
-    const projectRoots = groups.map((group) => String(group.projectRoot || group.cwd || "").trim()).filter(Boolean);
-    const groupsByRoot = new Map(groups.map((group) => [String(group.projectRoot || group.cwd || "").trim(), group]));
-
-    for (const session of this.listLiveSessions()) {
-      const projectRoot = bestProjectRootForCwd(session.cwd, projectRoots);
-      if (!projectRoot) {
-        continue;
-      }
-      const group = groupsByRoot.get(projectRoot);
-      if (!group) {
-        continue;
-      }
-      group.sessions.push(session);
-    }
-
-    for (const group of groups) {
-      const deduped = new Map();
-      for (const session of group.sessions) {
-        const identity = `${String(session.provider || "codex").trim()}:${String(
-          session.resumeSessionId || session.threadId || session.id || ""
-        ).trim()}`;
-        const existing = deduped.get(identity);
-        if (!existing || byUpdatedAtDesc(session, existing) < 0) {
-          deduped.set(identity, session);
-        }
-      }
-      group.sessions = [...deduped.values()].sort(byUpdatedAtDesc);
-    }
-
-    return groups.sort((left, right) => byUpdatedAtDesc(left.sessions[0], right.sessions[0]));
+    return mergeProjectGroupsWithLiveSessions(this.codexSidebarService.listProjectGroups(), this.listLiveSessions());
   }
 
   get(id) {
@@ -902,7 +892,8 @@ export class SessionManager {
         const incomingSnapshot = historical?.threadSnapshot || null;
         const shouldReplace =
           Number(incomingSnapshot?.lastEventSeq || 0) > Number(currentSnapshot?.lastEventSeq || 0) ||
-          Number(incomingSnapshot?.version || 0) > Number(currentSnapshot?.version || 0);
+          Number(incomingSnapshot?.version || 0) > Number(currentSnapshot?.version || 0) ||
+          hasThreadSnapshotMeaningfulAdvance(incomingSnapshot, currentSnapshot);
         if (!shouldReplace) {
           return;
         }
@@ -1136,63 +1127,23 @@ export class SessionManager {
 
   getThreadSnapshotBundle(providerId, resumeSessionId) {
     const provider = this.getProvider(providerId);
-    let historical = null;
-    try {
-      historical = this.historyService.getHistoricalMessages(provider, resumeSessionId);
-    } catch {
-      historical = null;
-    }
-    return {
-      session: historical?.session || null,
-      threadSnapshot: historical?.threadSnapshot || null,
-      liveOverlay: historical?.liveOverlay || null,
-      conversation: historical?.conversation || null,
-      conversationSnapshot: historical?.conversationSnapshot || null
-    };
+    return buildThreadSnapshotBundle(this.historyService, provider, resumeSessionId);
   }
 
   getLiveHistoryContinuation(providerId, resumeSessionId) {
     const provider = this.getProvider(providerId);
-    const targetResumeId = String(resumeSessionId || "").trim();
-    if (!targetResumeId) {
-      return null;
-    }
-    const liveSession = [...this.sessions.values()]
-      .filter(
-        (session) =>
-          session.provider === provider.id &&
-          session.status !== "exited" &&
-          String(session.resumeSessionId || "").trim() === targetResumeId
-      )
-      .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
-    if (!liveSession) {
-      return null;
-    }
-    let baseSnapshot = null;
-    try {
-      baseSnapshot = this.historyService.getHistoricalMessages(provider, targetResumeId)?.threadSnapshot || null;
-    } catch {
-      baseSnapshot = null;
-    }
-    const currentSnapshot = this.ensureThreadSnapshot(liveSession);
-    const currentConversation = this.ensureConversationState(liveSession);
-    buildThreadProjection(liveSession);
-    const mergedSnapshot =
-      (currentSnapshot?.turns?.length || 0) >= (currentConversation?.turns?.length || 0)
-        ? currentSnapshot
-        : deriveThreadSnapshotFromConversationState(currentConversation, {
-            threadId: targetResumeId,
-            metadata: currentSnapshot?.metadata || baseSnapshot?.metadata || {},
-            baseSnapshot: baseSnapshot || currentSnapshot || null
-          });
-    liveSession.threadSnapshot = mergedSnapshot;
-    syncProjectedThreadState(liveSession, { previousSnapshot: mergedSnapshot });
-    return {
-      session: this.serialize(liveSession),
-      conversation: currentConversation,
-      threadSnapshot: mergedSnapshot,
-      liveOverlay: liveSession.liveOverlay || null
-    };
+    return buildLiveHistoryContinuation({
+      sessions: this.sessions.values(),
+      provider,
+      resumeSessionId,
+      historyService: this.historyService,
+      ensureThreadSnapshot: (session) => this.ensureThreadSnapshot(session),
+      ensureConversationState: (session) => this.ensureConversationState(session),
+      buildThreadProjection,
+      deriveThreadSnapshotFromConversationState,
+      syncProjectedThreadState,
+      serialize: (session) => this.serialize(session)
+    });
   }
 
   getThreadContinuation(providerId, resumeSessionId) {

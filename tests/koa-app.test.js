@@ -103,11 +103,20 @@ function createSessionManagerStub() {
         }
       ];
     },
+    listSidebarSnapshot() {
+      return {
+        sessions: [liveSession],
+        projectGroups: this.listProjectGroups()
+      };
+    },
     listArchived() {
       return [{ ...liveSession, id: "history:codex:thread-1", kind: "archived", status: "archived" }];
     },
     get(id) {
       return id === liveSession.id ? liveSession : null;
+    },
+    findRunningLiveSessionByResume(provider, resumeSessionId) {
+      return provider === liveSession.provider && resumeSessionId === liveSession.resumeSessionId ? liveSession : null;
     },
     serialize(session) {
       return session;
@@ -116,8 +125,10 @@ function createSessionManagerStub() {
       calls.create.push(body);
       return {
         ...liveSession,
+        id: body.id || liveSession.id,
         name: body.name || liveSession.name,
         cwd: body.cwd || liveSession.cwd,
+        resumeSessionId: body.resumeSessionId || liveSession.resumeSessionId,
         model: body.model || liveSession.model,
         reasoningEffort: body.reasoningEffort || liveSession.reasoningEffort,
         permissionMode: body.permissionMode || liveSession.permissionMode
@@ -1360,7 +1371,7 @@ test("session create resumes Codex thread with sqlite-backed permission state wh
   assert.equal(payload.session.permissionMode, "full-access");
 });
 
-test("single-thread model contract: history conversation route returns the persisted thread snapshot only, without live continuation turns", async (t) => {
+test("single-thread model contract: history conversation route returns the authoritative merged thread view when live continuation exists", async (t) => {
   const sessionManager = createSessionManagerStub();
   sessionManager.getHistoricalMessages = (provider, resumeSessionId) => {
     sessionManager.calls.history.push({ provider, resumeSessionId });
@@ -1453,12 +1464,13 @@ test("single-thread model contract: history conversation route returns the persi
   const payload = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(payload.threadSnapshot.turns.length, 1);
+  assert.equal(payload.session.id, "session-live-1");
+  assert.equal(payload.threadSnapshot.turns.length, 2);
   assert.equal(payload.continuation.threadSnapshot.turns.length, 2);
-  assert.equal(payload.turns.length, 1);
+  assert.equal(payload.turns.length, 2);
 });
 
-test("single-thread model contract: continuation route returns only live continuation runtime and keeps it separate from historical conversation route", async (t) => {
+test("single-thread model contract: continuation route still exposes raw live continuation separately from the merged history conversation route", async (t) => {
   const sessionManager = createSessionManagerStub();
   sessionManager.getHistoricalMessages = (provider, resumeSessionId) => ({
     session: {
@@ -1510,10 +1522,69 @@ test("single-thread model contract: continuation route returns only live continu
 
   assert.equal(historyResponse.status, 200);
   assert.equal(continuationResponse.status, 200);
-  assert.equal(historyPayload.threadSnapshot.turns.length, 1);
+  assert.equal(historyPayload.threadSnapshot.turns.length, 2);
   assert.equal(historyPayload.turns.length, 0);
   assert.equal(continuationPayload.hasLiveContinuation, true);
   assert.equal(continuationPayload.continuation.threadSnapshot.turns.length, 2);
+});
+
+test("single-thread model contract: thread bundle route returns the authoritative merged thread snapshot", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  sessionManager.getHistoricalMessages = (provider, resumeSessionId) => ({
+    session: {
+      id: `history:${provider}:${resumeSessionId}`,
+      kind: "history",
+      resumeSessionId
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [{ id: "turn-history-only", items: [{ id: "u1", kind: "UserMessage", text: "历史问题" }] }]
+    },
+    conversation: {
+      threadId: resumeSessionId,
+      turns: [{ id: "turn-history-only" }],
+      backgroundAgents: []
+    },
+    liveOverlay: null
+  });
+  sessionManager.getThreadContinuationRuntime = (provider, resumeSessionId) => ({
+    session: {
+      id: "session-live-1",
+      kind: "live",
+      resumeSessionId
+    },
+    threadSnapshot: {
+      threadId: resumeSessionId,
+      turns: [
+        { id: "turn-history-only", items: [{ id: "u1", kind: "UserMessage", text: "历史问题" }] },
+        { id: "turn-live-only", items: [{ id: "u2", kind: "UserMessage", text: "继续追问" }] }
+      ]
+    },
+    conversation: {
+      threadId: resumeSessionId,
+      turns: [{ id: "turn-live-only" }],
+      backgroundAgents: []
+    },
+    liveOverlay: {
+      turnId: "turn-live-only",
+      text: "继续对话的实时内容"
+    }
+  });
+
+  const server = await startTestServer({ sessionManager });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const response = await fetch(`${server.baseUrl}/api/threads/codex/thread-1`, {
+    headers: { cookie: cookies }
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.session.id, "session-live-1");
+  assert.equal(payload.threadSnapshot.turns.length, 2);
 });
 
 test("history messages route falls back to live continuation when historical session is missing", async (t) => {

@@ -2,9 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { applySessionInputEvents, normalizeSessionInputEvents, openSessionSseStream } from "../transport/index.js";
-import { readCodexDesktopDefaults } from "../sessions/shared/codexDesktopConfig.js";
 import { applyComposerOptionOverrides } from "../sessions/shared/composerOptions.js";
-import { CodexThreadStateStore } from "../sessions/state/CodexThreadStateStore.js";
+import { buildSessionSidebarPayload } from "./sessionSidebar.js";
+import { buildSessionCreatePayloadFromThreadState, buildThreadComposerState } from "./threadComposerState.js";
 import { workspaceChangesInternals } from "./workspaceChanges.js";
 
 function extractSessionOptionOverrides(body = {}) {
@@ -40,94 +40,6 @@ function isTurnTerminalInSnapshot(session, turnId) {
     session?.threadSnapshot?.turns?.find((turn) => String(turn?.id || "") === targetTurnId)?.status || ""
   ).trim().toLowerCase();
   return status === "completed" || status === "failed" || status === "aborted" || status === "interrupted";
-}
-
-function emptyGitState(cwd = "") {
-  return {
-    available: false,
-    loading: false,
-    isGitRepo: false,
-    currentBranch: "",
-    dirty: false,
-    branches: [],
-    error: "",
-    cwd: String(cwd || "").trim()
-  };
-}
-
-function listComposerGitState(cwd = "") {
-  const normalizedCwd = String(cwd || "").trim();
-  if (!normalizedCwd) {
-    return emptyGitState("");
-  }
-  try {
-    const payload = workspaceChangesInternals.listGitBranches(normalizedCwd);
-    return {
-      available: true,
-      loading: false,
-      isGitRepo: Boolean(payload?.isGitRepo),
-      currentBranch: String(payload?.currentBranch || "").trim(),
-      dirty: Boolean(payload?.dirty),
-      branches: Array.isArray(payload?.branches) ? payload.branches : [],
-      error: "",
-      cwd: String(payload?.cwd || normalizedCwd).trim()
-    };
-  } catch (error) {
-    return {
-      ...emptyGitState(normalizedCwd),
-      error: error?.message || String(error)
-    };
-  }
-}
-
-function getCodexThreadStateStore(runtime) {
-  return new CodexThreadStateStore(runtime.config);
-}
-
-function buildThreadComposerState(runtime, providerId, threadId) {
-  const resolvedProviderId = String(providerId || "codex").trim().toLowerCase() || "codex";
-  const resolvedThreadId = String(threadId || "").trim();
-  if (!resolvedThreadId) {
-    throw new Error("threadId is required");
-  }
-
-  const codexDefaults = readCodexDesktopDefaults(runtime.config);
-  const threadState =
-    resolvedProviderId === "codex"
-      ? getCodexThreadStateStore(runtime).getThreadComposerState(resolvedThreadId)
-      : null;
-  const cwd = String(
-    threadState?.cwd ||
-      runtime.config.defaultCwd ||
-      ""
-  ).trim();
-
-  const model = String(
-    threadState?.model ||
-      codexDefaults.model ||
-      ""
-  ).trim();
-  const reasoningEffort = String(
-    threadState?.reasoningEffort ||
-      codexDefaults.reasoningEffort ||
-      "medium"
-  ).trim() || "medium";
-  const permissionMode = String(
-    threadState?.permissionMode ||
-      codexDefaults.permissionMode ||
-      "default"
-  ).trim() || "default";
-
-  return {
-    provider: resolvedProviderId,
-    threadId: resolvedThreadId,
-    model,
-    reasoningEffort,
-    permissionMode,
-    cwd,
-    git: listComposerGitState(cwd),
-    source: threadState ? "thread_state" : "defaults"
-  };
 }
 
 async function openInputStream(ctx, runtime, session, events) {
@@ -231,10 +143,7 @@ export async function handleSessionRoute(ctx, runtime) {
       return true;
     }
 
-    runtime.json(ctx, 200, {
-      sessions: runtime.sessionManager.listAll(),
-      projectGroups: runtime.sessionManager.listProjectGroups()
-    });
+    runtime.json(ctx, 200, buildSessionSidebarPayload(runtime.sessionManager));
     return true;
   }
 
@@ -300,7 +209,7 @@ export async function handleSessionRoute(ctx, runtime) {
     try {
       const providerId = decodeURIComponent(parts[3] || "").trim();
       const threadId = decodeURIComponent(parts[4] || "").trim();
-      runtime.json(ctx, 200, buildThreadComposerState(runtime, providerId, threadId));
+      runtime.json(ctx, 200, buildThreadComposerState(runtime, workspaceChangesInternals, providerId, threadId));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -335,7 +244,7 @@ export async function handleSessionRoute(ctx, runtime) {
         runtime.json(ctx, 404, { error: `Thread composer state not found: ${providerId}/${threadId}` });
         return true;
       }
-      const nextComposerState = buildThreadComposerState(runtime, providerId, threadId);
+      const nextComposerState = buildThreadComposerState(runtime, workspaceChangesInternals, providerId, threadId);
 
       const liveSession =
         typeof runtime.sessionManager.findLiveSessionByThreadId === "function"
@@ -409,7 +318,17 @@ export async function handleSessionRoute(ctx, runtime) {
           return true;
         }
       }
-      const session = runtime.sessionManager.create(body);
+      let createPayload = body;
+      if (resumeSessionId) {
+        const threadComposerState = buildThreadComposerState(
+          runtime,
+          workspaceChangesInternals,
+          providerId,
+          resumeSessionId
+        );
+        createPayload = buildSessionCreatePayloadFromThreadState(body, threadComposerState);
+      }
+      const session = runtime.sessionManager.create(createPayload);
       console.log(
         `[session] created id=${session.id} provider=${session.provider} model=${session.model || ""} cwd=${session.cwd || ""} resume=${session.resumeSessionId || ""}`
       );

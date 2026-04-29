@@ -349,6 +349,10 @@ export function startJsonExecRun(manager, session) {
   session.runningProcess = child;
   session.updatedAt = nowIso();
   manager.updateConversationTurnStatus(session, "running", session.updatedAt);
+  manager.scheduleConversationHistoryResync(session, {
+    attempts: 60,
+    delayMs: 500
+  });
 
   let stdoutBuffer = "";
   let stderrBuffer = "";
@@ -412,6 +416,7 @@ export function startJsonExecRun(manager, session) {
         timestamp: nowIso()
       });
       manager.finalizeConversationTurn(session, "failed", session.updatedAt);
+      manager.scheduleConversationHistoryResync(session);
     } else if (!emittedAssistant) {
       const concise = summarizeRelevantStderr(stderrBuffer);
       manager.broadcast(session, {
@@ -429,8 +434,10 @@ export function startJsonExecRun(manager, session) {
         timestamp: nowIso()
       });
       manager.finalizeConversationTurn(session, "completed", session.updatedAt);
+      manager.scheduleConversationHistoryResync(session);
     } else {
       manager.finalizeConversationTurn(session, "completed", session.updatedAt);
+      manager.scheduleConversationHistoryResync(session);
     }
     startJsonExecRun(manager, session);
   });

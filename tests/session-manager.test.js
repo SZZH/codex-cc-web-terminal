@@ -175,6 +175,139 @@ test("listProjectGroups sorts groups by latest session activity including live s
   assert.deepEqual(groups[0].sessions.map((session) => session.name), ["alpha live", "旧 alpha"]);
 });
 
+test("listSidebarSnapshot reuses project groups and appends unmatched live sessions", () => {
+  const { manager, rootDir } = createManager();
+  const alphaRoot = path.join(rootDir, "workspace", "alpha");
+  const gammaRoot = path.join(rootDir, "workspace", "gamma");
+  fs.mkdirSync(alphaRoot, { recursive: true });
+  fs.mkdirSync(gammaRoot, { recursive: true });
+
+  manager.codexSidebarService.listProjectGroups = () => [
+    {
+      id: `project:${alphaRoot}`,
+      name: "alpha",
+      projectRoot: alphaRoot,
+      cwd: alphaRoot,
+      collapsed: false,
+      sessions: [
+        {
+          id: "history:codex:thread-alpha",
+          provider: "codex",
+          providerLabel: "Codex",
+          cliLabel: "Codex CLI",
+          name: "alpha history",
+          cwd: alphaRoot,
+          kind: "history",
+          status: "saved",
+          createdAt: "",
+          updatedAt: "2026-04-25T10:00:00.000Z",
+          exitCode: null,
+          autoNamed: false,
+          inputPreview: "",
+          resumeSessionId: "thread-alpha",
+          model: "",
+          titleSource: "codex_state_db",
+          sessionType: "main",
+          parentThreadId: "",
+          agentRole: "",
+          agentNickname: ""
+        }
+      ]
+    }
+  ];
+
+  const groupedLive = manager.get(manager.create({ provider: "codex", cwd: alphaRoot, name: "alpha live" }).id);
+  groupedLive.updatedAt = "2026-04-27T10:00:00.000Z";
+
+  const unmatchedLive = manager.get(manager.create({ provider: "codex", cwd: gammaRoot, name: "gamma live" }).id);
+  unmatchedLive.updatedAt = "2026-04-28T10:00:00.000Z";
+
+  const snapshot = manager.listSidebarSnapshot();
+
+  assert.equal(snapshot.projectGroups.length, 1);
+  assert.deepEqual(snapshot.projectGroups[0].sessions.map((session) => session.name), ["alpha live", "alpha history"]);
+  assert.equal(snapshot.sessions.some((session) => session.name === "gamma live"), true);
+  assert.equal(snapshot.sessions[0].name, "gamma live");
+});
+
+test("listSidebarSnapshot excludes stale sessions older than two weeks but keeps running live sessions", () => {
+  const realNow = Date.now;
+  Date.now = () => Date.parse("2026-04-29T12:00:00.000Z");
+  try {
+    const { manager, rootDir } = createManager();
+    const alphaRoot = path.join(rootDir, "workspace", "alpha");
+    fs.mkdirSync(alphaRoot, { recursive: true });
+
+    manager.codexSidebarService.listProjectGroups = () => [
+      {
+        id: `project:${alphaRoot}`,
+        name: "alpha",
+        projectRoot: alphaRoot,
+        cwd: alphaRoot,
+        collapsed: false,
+        sessions: [
+          {
+            id: "history:codex:thread-recent",
+            provider: "codex",
+            providerLabel: "Codex",
+            cliLabel: "Codex CLI",
+            name: "recent history",
+            cwd: alphaRoot,
+            kind: "history",
+            status: "saved",
+            createdAt: "",
+            updatedAt: "2026-04-25T10:00:00.000Z",
+            exitCode: null,
+            autoNamed: false,
+            inputPreview: "",
+            resumeSessionId: "thread-recent",
+            model: "",
+            titleSource: "codex_state_db",
+            sessionType: "main",
+            parentThreadId: "",
+            agentRole: "",
+            agentNickname: ""
+          },
+          {
+            id: "history:codex:thread-old",
+            provider: "codex",
+            providerLabel: "Codex",
+            cliLabel: "Codex CLI",
+            name: "old history",
+            cwd: alphaRoot,
+            kind: "history",
+            status: "saved",
+            createdAt: "",
+            updatedAt: "2026-04-01T10:00:00.000Z",
+            exitCode: null,
+            autoNamed: false,
+            inputPreview: "",
+            resumeSessionId: "thread-old",
+            model: "",
+            titleSource: "codex_state_db",
+            sessionType: "main",
+            parentThreadId: "",
+            agentRole: "",
+            agentNickname: ""
+          }
+        ]
+      }
+    ];
+
+    const live = manager.get(manager.create({ provider: "codex", cwd: alphaRoot, name: "running live" }).id);
+    live.updatedAt = "2026-04-01T10:00:00.000Z";
+    live.status = "running";
+
+    const snapshot = manager.listSidebarSnapshot();
+
+    assert.deepEqual(snapshot.projectGroups[0].sessions.map((session) => session.name), ["recent history", "running live"]);
+    assert.equal(snapshot.sessions.some((session) => session.name === "old history"), false);
+    assert.equal(snapshot.sessions.some((session) => session.name === "running live"), true);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 test("create rejects unsupported providers", () => {
   const { manager } = createManager();
   assert.throws(() => manager.create({ provider: "unknown-provider" }), /Unsupported session provider/);
@@ -1660,6 +1793,63 @@ test("live continuation lookup does not require a persisted historical session",
     ),
     true
   );
+});
+
+test("history resync broadcasts when resumed-thread snapshot content advances without version bump", async () => {
+  const { manager } = createManager();
+  const liveSessionMeta = manager.create({
+    provider: "codex",
+    cwd: process.cwd(),
+    resumeSessionId: "thread-resync-1"
+  });
+  const liveSession = manager.get(liveSessionMeta.id);
+  liveSession.threadSnapshot = {
+    threadId: "thread-resync-1",
+    version: 5,
+    lastEventSeq: 10,
+    turns: [
+      {
+        id: "turn-resync-1",
+        status: "running",
+        items: [{ id: "item-1", kind: "AgentMessage", text: "旧内容" }]
+      }
+    ]
+  };
+
+  manager.historyService.getHistoricalMessages = () => ({
+    threadSnapshot: {
+      threadId: "thread-resync-1",
+      version: 5,
+      lastEventSeq: 10,
+      turns: [
+        {
+          id: "turn-resync-1",
+          status: "running",
+          items: [{ id: "item-1", kind: "AgentMessage", text: "旧内容\n新内容" }]
+        }
+      ]
+    },
+    liveOverlay: null
+  });
+
+  const snapshots = [];
+  manager.broadcastConversationSnapshot = (session) => {
+    snapshots.push(session.threadSnapshot);
+  };
+
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (handler) => {
+    handler();
+    return { unref() {} };
+  };
+  try {
+    manager.scheduleConversationHistoryResync(liveSession, { attempts: 1, delayMs: 1 });
+  } finally {
+    global.setTimeout = realSetTimeout;
+  }
+
+  assert.equal(snapshots.length, 1);
+  assert.match(String(snapshots[0]?.turns?.[0]?.items?.[0]?.text || ""), /新内容/);
 });
 
 test("buildProviderCommand reflects provider-specific CLI arguments", () => {

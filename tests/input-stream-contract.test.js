@@ -735,6 +735,8 @@ test("typed SSE contract: transport ignores legacy snapshot event names instead 
 
 test("input-stream main-path guard: App closes the legacy websocket before switching to thread-level SSE", () => {
   const appSource = fs.readFileSync(new URL("../web/src/App.vue", import.meta.url), "utf8");
+  const threadRuntimeSource = fs.readFileSync(new URL("../web/src/lib/thread-runtime.js", import.meta.url), "utf8");
+  const liveRuntimeSource = fs.readFileSync(new URL("../web/src/lib/live-session-runtime.js", import.meta.url), "utf8");
   const sessionManagerSource = fs.readFileSync(new URL("../src/sessionManager.js", import.meta.url), "utf8");
 
   assert.match(
@@ -743,30 +745,30 @@ test("input-stream main-path guard: App closes the legacy websocket before switc
   );
   assert.match(
     appSource,
-    /state\.liveView\.activeInputStream = true;\s*if \(targetThreadId\) \{\s*await requestThreadInputStream\(/
+    /state\.liveView\.activeInputStream = true;[\s\S]*if \(targetThreadId\) \{[\s\S]*requestThreadInputStream\(/
   );
   assert.match(
     appSource,
     /async function interruptActiveSession\(\) \{[\s\S]*?closeSocket\(\{ silent: true \}\);[\s\S]*?type:\s*"interrupt"/
   );
   assert.match(
-    appSource,
+    threadRuntimeSource,
     /incomingVersion > currentVersion[\s\S]*contentComparison < 0[\s\S]*incoming\.activeTurnId[\s\S]*current\.activeTurnId[\s\S]*return false;/
   );
   assert.match(
-    appSource,
-    /if \(payload\.type === "thread\.snapshot"\) \{[\s\S]*?stopHistorySyncLoop\(\);[\s\S]*?hasConversationSnapshot = true;[\s\S]*?hasConversationDelta = true;/
+    liveRuntimeSource,
+    /if \(payload\.type === "thread\.snapshot"\) \{[\s\S]*?stopHistorySyncLoop\?\.\(\);[\s\S]*?hasConversationSnapshot = true;[\s\S]*?hasConversationDelta = true;/
   );
   assert.match(
-    appSource,
-    /if \(payload\.type === "thread\.overlay"\) \{[\s\S]*?stopHistorySyncLoop\(\);[\s\S]*?setLiveOverlay\(payload\);[\s\S]*?hasConversationSnapshot = true;[\s\S]*?hasConversationDelta = true;/
+    liveRuntimeSource,
+    /if \(payload\.type === "thread\.overlay"\) \{[\s\S]*?stopHistorySyncLoop\?\.\(\);[\s\S]*?(?:setLiveOverlay\(payload\)|threadRuntime\.setLiveOverlay\(payload\))[\s\S]*?hasConversationSnapshot = true;[\s\S]*?hasConversationDelta = true;/
   );
   assert.match(
-    appSource,
+    liveRuntimeSource,
     /if \(isTerminalTurnStatus\(payload\?\.status\) \|\| isTerminalTurnStatus\(authoritativeAssistantStatus\)\) \{\s*settleAuthoritativeInputState\(\);/
   );
   assert.match(
-    appSource,
+    threadRuntimeSource,
     /const existingText = collectAssistantText\(existingAssistant\);[\s\S]*const incomingText = collectAssistantText\(incomingAssistant\);[\s\S]*const keepExistingBody = existingText\.length > incomingText\.length;/
   );
   assert.match(
