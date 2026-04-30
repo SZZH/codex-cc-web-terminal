@@ -277,6 +277,90 @@ test("display state maps assistant image body blocks into image items", () => {
   assert.equal(snapshot.turns[0].items[2].text, "图已经生成好了");
 });
 
+test("display state maps live assistant process events into thread items for rendering", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    liveConversation: {
+      turns: [
+        {
+          id: "turn-process-live",
+          user: { text: "跑一下检查", ts: "2026-04-22T00:00:03.000Z" },
+          assistant: {
+            status: "running",
+            process: [
+              {
+                id: "proc-1",
+                type: "command_execution",
+                summary: "exec_command started",
+                content: "exec_command started",
+                payload: { command: "npm run check" },
+                phase: "streaming"
+              }
+            ],
+            body: []
+          }
+        }
+      ]
+    },
+    threadId: "thread-process-live",
+    liveSessionMeta: { resumeSessionId: "thread-process-live" },
+    threadMeta: { resumeSessionId: "thread-process-live" }
+  });
+
+  assert.equal(snapshot.turns.length, 1);
+  assert.equal(snapshot.turns[0].items[1].kind, "CommandExecution");
+  assert.equal(snapshot.turns[0].items[1].summary, "exec_command started");
+});
+
+test("display state merges live assistant body and process into the same authoritative turn without rollback", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    authoritativeSnapshot: {
+      threadId: "thread-authoritative-live",
+      metadata: { name: "会话" },
+      turns: [
+        {
+          id: "turn-authoritative-live-1",
+          status: "inProgress",
+          items: [{ id: "user-1", kind: "UserMessage", text: "检查一下当前实现" }]
+        }
+      ],
+      version: 5,
+      updatedAt: "2026-04-29T00:00:00.000Z"
+    },
+    liveConversation: {
+      turns: [
+        {
+          id: "turn-authoritative-live-1",
+          user: { text: "检查一下当前实现", ts: "2026-04-29T00:00:00.000Z" },
+          assistant: {
+            status: "running",
+            process: [
+              {
+                id: "proc-authoritative-1",
+                type: "command_execution",
+                summary: "npm run check",
+                content: "npm run check",
+                payload: { command: "npm run check" },
+                phase: "streaming"
+              }
+            ],
+            body: [{ id: "body-1", kind: "markdown", text: "我先跑一遍检查。" }]
+          }
+        }
+      ]
+    },
+    threadId: "thread-authoritative-live",
+    liveSessionMeta: { resumeSessionId: "thread-authoritative-live" },
+    threadMeta: { resumeSessionId: "thread-authoritative-live" }
+  });
+
+  assert.equal(snapshot.turns.length, 1);
+  assert.equal(snapshot.turns[0].items[0].kind, "UserMessage");
+  assert.equal(snapshot.turns[0].items[1].kind, "CommandExecution");
+  assert.equal(snapshot.turns[0].items[1].summary, "npm run check");
+  assert.equal(snapshot.turns[0].items[2].kind, "AgentMessage");
+  assert.equal(snapshot.turns[0].items[2].text, "我先跑一遍检查。");
+});
+
 test("display state contract: same-thread continuation keeps runtime assistant text visible without refresh while preserving a single live turn", () => {
   const snapshot = buildDisplayedThreadSnapshot({
     persistedSnapshot: {
@@ -333,6 +417,84 @@ test("display state contract: same-thread continuation keeps runtime assistant t
     snapshot.turns[1].items.map((item) => item.text),
     ["继续追问", "实时回复"]
   );
+});
+
+test("display state does not append legacy runtime draft when the same typed turn already has assistant content", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    liveConversation: {
+      turns: [
+        {
+          id: "live-turn-typed-1",
+          user: { text: "继续追问", ts: "2026-04-22T00:00:03.000Z" },
+          assistant: {
+            status: "completed",
+            body: [{ text: "typed 正式回复" }]
+          }
+        }
+      ]
+    },
+    runtimeMessages: [
+      {
+        id: "draft-user-live-typed-1",
+        role: "user",
+        text: "继续追问",
+        source: "draft",
+        partType: "text",
+        timestamp: "2026-04-22T00:00:03.000Z"
+      },
+      {
+        id: "draft-assistant-live-typed-1",
+        role: "assistant",
+        text: "legacy 兜底回复",
+        source: "normalized",
+        partType: "markdown",
+        timestamp: "2026-04-22T00:00:04.000Z"
+      }
+    ],
+    threadId: "thread-typed-1",
+    liveSessionMeta: { resumeSessionId: "thread-typed-1" },
+    threadMeta: { resumeSessionId: "thread-typed-1" }
+  });
+
+  assert.equal(snapshot.turns.length, 1);
+  assert.deepEqual(
+    snapshot.turns[0].items.map((item) => item.text),
+    ["继续追问", "typed 正式回复"]
+  );
+});
+
+test("display state does not append legacy runtime draft when the same typed turn already exists before assistant text arrives", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    authoritativeSnapshot: {
+      threadId: "thread-typed-2",
+      metadata: { name: "会话" },
+      turns: [
+        {
+          id: "turn-typed-2",
+          status: "inProgress",
+          items: [{ id: "u1", kind: "UserMessage", text: "回忆一下昨天做了什么" }]
+        }
+      ],
+      version: 2,
+      updatedAt: "2026-04-29T00:00:00.000Z"
+    },
+    runtimeMessages: [
+      {
+        id: "draft-user-typed-2",
+        role: "user",
+        text: "回忆一下昨天做了什么",
+        source: "draft",
+        partType: "text",
+        timestamp: "2026-04-29T00:00:01.000Z"
+      }
+    ],
+    threadId: "thread-typed-2",
+    liveSessionMeta: { resumeSessionId: "thread-typed-2" },
+    threadMeta: { resumeSessionId: "thread-typed-2" }
+  });
+
+  assert.equal(snapshot.turns.length, 1);
+  assert.equal(snapshot.turns[0].id, "turn-typed-2");
 });
 
 test("display state prefers authoritative snapshot over stale live conversation for the same thread", () => {
@@ -463,6 +625,63 @@ test("display state keeps the current user turn visible when authoritative snaps
   assert.equal(snapshot.turns.filter((turn) => turn.id === "runtime-draft:thread-1").length, 0);
 });
 
+test("display state keeps the latest completed live turn visible when authoritative snapshot still lags behind", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    authoritativeSnapshot: {
+      threadId: "thread-1",
+      metadata: { name: "会话" },
+      turns: [
+        {
+          id: "history-turn-1",
+          status: "completed",
+          items: [
+            { id: "u1", kind: "UserMessage", text: "回复：1111" },
+            { id: "a1", kind: "AgentMessage", text: "11111111" }
+          ]
+        }
+      ],
+      version: 8,
+      updatedAt: "2026-04-22T00:00:08.000Z"
+    },
+    liveConversation: {
+      turns: [
+        {
+          id: "history-turn-1",
+          user: { text: "回复：1111", ts: "2026-04-22T00:00:01.000Z" },
+          assistant: {
+            status: "completed",
+            startedAt: "2026-04-22T00:00:01.000Z",
+            finishedAt: "2026-04-22T00:00:02.000Z",
+            body: [{ text: "11111111" }]
+          }
+        },
+        {
+          id: "live-turn-2",
+          user: { text: "回复：2222", ts: "2026-04-22T00:00:09.000Z" },
+          assistant: {
+            status: "completed",
+            startedAt: "2026-04-22T00:00:09.000Z",
+            finishedAt: "2026-04-22T00:00:10.000Z",
+            body: [{ text: "22222222" }]
+          }
+        }
+      ]
+    },
+    threadId: "thread-1",
+    liveSessionMeta: { resumeSessionId: "thread-1" },
+    threadMeta: { resumeSessionId: "thread-1" },
+    preferAuthoritativeSnapshot: true
+  });
+
+  assert.equal(snapshot.turns.length, 2);
+  assert.equal(snapshot.turns[0].id, "history-turn-1");
+  assert.equal(snapshot.turns[1].id, "live-turn-2");
+  assert.deepEqual(
+    snapshot.turns[1].items.map((item) => item.text),
+    ["回复：2222", "22222222"]
+  );
+});
+
 test("display state keeps authoritative current turn stable when runtime draft still exists locally", () => {
   const snapshot = buildDisplayedThreadSnapshot({
     persistedSnapshot: {
@@ -575,6 +794,38 @@ test("display state keeps a completed authoritative turn immutable when stale sa
     snapshot.turns[0].items.map((item) => item.text),
     ["历史问题", "已经提交的最终答案"]
   );
+});
+
+test("display state hides terminal turns that only contain a user message shell", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    authoritativeSnapshot: {
+      threadId: "thread-shell-1",
+      metadata: { name: "会话" },
+      turns: [
+        {
+          id: "turn-good-1",
+          status: "completed",
+          items: [
+            { id: "u1", kind: "UserMessage", text: "上一轮问题" },
+            { id: "a1", kind: "AgentMessage", text: "上一轮回答" }
+          ]
+        },
+        {
+          id: "turn-shell-1",
+          status: "completed",
+          items: [{ id: "u2", kind: "UserMessage", text: "回忆一下，今天做了什么" }]
+        }
+      ],
+      version: 3,
+      updatedAt: "2026-04-29T00:00:00.000Z"
+    },
+    threadId: "thread-shell-1",
+    liveSessionMeta: { resumeSessionId: "thread-shell-1" },
+    threadMeta: { resumeSessionId: "thread-shell-1" }
+  });
+
+  assert.equal(snapshot.turns.length, 1);
+  assert.equal(snapshot.turns[0].id, "turn-good-1");
 });
 
 test("display state deduplicates same historical turn when live conversation carries a different legacy turn id", () => {
@@ -691,5 +942,73 @@ test("display state does not let live conversation overwrite an existing authori
   assert.deepEqual(
     snapshot.turns[0].items.map((item) => item.text),
     ["回复：哈哈哈哈", "哈哈哈哈"]
+  );
+});
+
+test("display state lets active live conversation update an existing authoritative turn body", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    authoritativeSnapshot: {
+      threadId: "thread-live-active",
+      metadata: { name: "会话" },
+      turns: [
+        {
+          id: "turn-active",
+          status: "inProgress",
+          startedAt: "2026-04-22T00:00:00.000Z",
+          items: [
+            { id: "u1", kind: "UserMessage", text: "写一段长回复" },
+            { id: "a1", kind: "AgentMessage", text: "第一段" }
+          ]
+        }
+      ],
+      version: 2,
+      updatedAt: "2026-04-22T00:00:05.000Z"
+    },
+    liveConversation: {
+      status: "running",
+      activeTurnId: "turn-active",
+      turns: [
+        {
+          id: "turn-active",
+          user: { text: "写一段长回复", ts: "2026-04-22T00:00:00.000Z" },
+          assistant: {
+            status: "running",
+            startedAt: "2026-04-22T00:00:00.000Z",
+            body: [{ text: "第一段，第二段" }]
+          }
+        }
+      ]
+    },
+    threadId: "thread-live-active",
+    liveSessionMeta: { resumeSessionId: "thread-live-active" },
+    threadMeta: { resumeSessionId: "thread-live-active" }
+  });
+
+  const agentMessage = snapshot.turns[0].items.find((item) => item.kind === "AgentMessage");
+  assert.equal(agentMessage.text, "第一段，第二段");
+});
+
+test("persisted thread sync can be forced while json input waits for history polling", () => {
+  assert.equal(
+    shouldSyncPersistedThread({
+      routeThreadId: "thread-json-input",
+      threadMeta: { resumeSessionId: "thread-json-input" },
+      liveSessionId: "live-json-input",
+      liveSessionMeta: { resumeSessionId: "thread-json-input" },
+      hasAuthoritativeLiveData: true
+    }),
+    false
+  );
+
+  assert.equal(
+    shouldSyncPersistedThread({
+      routeThreadId: "thread-json-input",
+      threadMeta: { resumeSessionId: "thread-json-input" },
+      liveSessionId: "live-json-input",
+      liveSessionMeta: { resumeSessionId: "thread-json-input" },
+      hasAuthoritativeLiveData: true,
+      forceSync: true
+    }),
+    true
   );
 });

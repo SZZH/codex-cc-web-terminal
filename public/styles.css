@@ -16,6 +16,7 @@
 
 * {
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
 }
 
 html,
@@ -300,10 +301,6 @@ pre {
   opacity: 0.6;
 }
 
-.session-row:active {
-  background: rgba(47, 109, 246, 0.06);
-}
-
 .session-row-body {
   display: grid;
   gap: 3px;
@@ -367,6 +364,7 @@ pre {
 .message-stream {
   flex: 1;
   padding: 10px 12px 124px;
+  padding-bottom: 0;
   overflow-y: auto;
   display: grid;
   gap: 10px;

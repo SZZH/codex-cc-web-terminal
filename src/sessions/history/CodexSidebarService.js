@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { filterSidebarSessionsByRecency } from "./sessionSidebarSnapshot.js";
 
 function readJsonFile(filePath, fallbackValue) {
   try {
@@ -182,7 +183,9 @@ export class CodexSidebarService {
 
     return projectRoots.map((projectRoot) => {
       const group = groups.get(projectRoot);
-      group.sessions.sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+      group.sessions = filterSidebarSessionsByRecency(group.sessions).sort((left, right) =>
+        String(right.updatedAt).localeCompare(String(left.updatedAt))
+      );
       return group;
     });
   }

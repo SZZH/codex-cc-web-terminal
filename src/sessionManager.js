@@ -7,6 +7,14 @@ import pty from "node-pty";
 import { HistoricalSessionService } from "./sessions/history/HistoricalSessionService.js";
 import { CodexSidebarService } from "./sessions/history/CodexSidebarService.js";
 import {
+  buildLiveHistoryContinuation,
+  buildThreadSnapshotBundle
+} from "./sessions/history/liveHistoryRuntime.js";
+import {
+  buildSidebarSnapshotFromGroups,
+  mergeProjectGroupsWithLiveSessions
+} from "./sessions/history/sessionSidebarSnapshot.js";
+import {
   createTurnCompletedDelta,
   createTurnCreatedDelta,
   createTurnStatusDelta,
@@ -20,12 +28,19 @@ import {
   buildLegacyConversationSnapshotPayload
 } from "./sessions/conversation/protocol.js";
 import {
+  applyConversationDeltas as applyConversationStateDeltas,
   buildConversationStateFromThreadSnapshot,
   createConversationState
 } from "./sessions/conversation/state.js";
 import {
   nowIso
 } from "./sessions/shared/text.js";
+import {
+  applyComposerOptionOverrides,
+  extractComposerOptions,
+  sessionRequiresJsonExec
+} from "./sessions/shared/composerOptions.js";
+import { CodexThreadStateStore } from "./sessions/state/CodexThreadStateStore.js";
 import {
   buildCodexJsonExecArgs,
   enqueueRunnerInput,
@@ -50,43 +65,111 @@ function normalizeName(value, fallback) {
   return text || fallback;
 }
 
-function normalizeComparablePath(value) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return "";
+function readCodexModelsFromCache(filePath = "") {
+  const targetPath = String(filePath || "").trim();
+  if (!targetPath || !fs.existsSync(targetPath)) {
+    return [];
   }
   try {
-    return path.resolve(text);
+    const parsed = JSON.parse(fs.readFileSync(targetPath, "utf8"));
+    const models = Array.isArray(parsed?.models) ? parsed.models : Array.isArray(parsed) ? parsed : [];
+    const result = [];
+    const seen = new Set();
+    for (const model of models) {
+      const slug = String(model?.slug || "").trim();
+      const label = String(model?.display_name || slug).trim();
+      const visibility = String(model?.visibility || "").trim().toLowerCase();
+      if (!slug || seen.has(slug)) {
+        continue;
+      }
+      if (visibility && visibility !== "list") {
+        continue;
+      }
+      if (model?.supported_in_api === false) {
+        continue;
+      }
+      seen.add(slug);
+      result.push({
+        value: slug,
+        label: label || slug,
+        priority: Number.isFinite(Number(model?.priority)) ? Number(model.priority) : Number.MAX_SAFE_INTEGER
+      });
+    }
+    return result
+      .sort((left, right) => left.priority - right.priority || left.label.localeCompare(right.label))
+      .map(({ value, label }) => ({ value, label }));
   } catch {
-    return text;
+    return [];
   }
-}
-
-function isSubpathOf(targetPath, rootPath) {
-  const target = normalizeComparablePath(targetPath);
-  const root = normalizeComparablePath(rootPath);
-  if (!target || !root) {
-    return false;
-  }
-  if (target === root) {
-    return true;
-  }
-  const relative = path.relative(root, target);
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
-function bestProjectRootForCwd(cwd, projectRoots) {
-  const matches = projectRoots.filter((rootPath) => isSubpathOf(cwd, rootPath));
-  return matches.sort((left, right) => right.length - left.length)[0] || "";
-}
-
-function byUpdatedAtDesc(left, right) {
-  return String(right?.updatedAt || "").localeCompare(String(left?.updatedAt || ""));
 }
 
 function isManuallyNamedSession(session) {
   const titleSource = String(session?.titleSource || "").trim().toLowerCase();
   return titleSource === "custom_name" || titleSource === "user_provided";
+}
+
+function buildThreadTurnSignature(turn = null) {
+  if (!turn || typeof turn !== "object") {
+    return "";
+  }
+  const items = Array.isArray(turn.items)
+    ? turn.items.map((item) => ({
+        id: String(item?.id || ""),
+        kind: String(item?.kind || ""),
+        text: String(item?.text || ""),
+        type: String(item?.type || ""),
+        status: String(item?.status || "")
+      }))
+    : [];
+  return JSON.stringify({
+    id: String(turn.id || ""),
+    status: String(turn.status || ""),
+    items
+  });
+}
+
+function hasThreadSnapshotMeaningfulAdvance(incomingSnapshot, currentSnapshot) {
+  if (!incomingSnapshot || typeof incomingSnapshot !== "object") {
+    return false;
+  }
+  if (!currentSnapshot || typeof currentSnapshot !== "object") {
+    return true;
+  }
+
+  const incomingTurns = Array.isArray(incomingSnapshot.turns) ? incomingSnapshot.turns : [];
+  const currentTurns = Array.isArray(currentSnapshot.turns) ? currentSnapshot.turns : [];
+
+  if (incomingTurns.length !== currentTurns.length) {
+    return true;
+  }
+
+  const currentById = new Map(currentTurns.map((turn) => [String(turn?.id || "").trim(), turn]));
+  for (const incomingTurn of incomingTurns) {
+    const incomingTurnId = String(incomingTurn?.id || "").trim();
+    const currentTurn = currentById.get(incomingTurnId);
+    if (!currentTurn) {
+      return true;
+    }
+    if (buildThreadTurnSignature(incomingTurn) !== buildThreadTurnSignature(currentTurn)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function parseSnapshotUpdatedAt(snapshot) {
+  const value = String(snapshot?.updatedAt || "").trim();
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function snapshotHasTurn(snapshot, turnId = "") {
+  const targetTurnId = String(turnId || "").trim();
+  if (!targetTurnId) {
+    return false;
+  }
+  return Array.isArray(snapshot?.turns) && snapshot.turns.some((turn) => String(turn?.id || "").trim() === targetTurnId);
 }
 
 function buildThreadProjection(session) {
@@ -134,14 +217,19 @@ export class SessionManager {
   }
 
   providerCatalog() {
-    return [...this.providers.values()].map((provider) => ({
-      id: provider.id,
-      label: provider.label,
-      cliLabel: provider.cliLabel,
-      historyLabel: provider.historyLabel,
-      defaultModel: provider.defaultModel || "",
-      models: provider.models || []
-    }));
+    const codexCacheModels = readCodexModelsFromCache(this.config.codexModelsCachePath);
+    return [...this.providers.values()].map((provider) => {
+      const isCodex = provider.id === "codex";
+      const providerModels = isCodex && codexCacheModels.length ? codexCacheModels : provider.models || [];
+      return {
+        id: provider.id,
+        label: provider.label,
+        cliLabel: provider.cliLabel,
+        historyLabel: provider.historyLabel,
+        defaultModel: provider.defaultModel || "",
+        models: providerModels
+      };
+    });
   }
 
   getProvider(providerId = "codex") {
@@ -179,50 +267,16 @@ export class SessionManager {
     return [...liveSessions, ...historySessions].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   }
 
+  listSidebarSnapshot() {
+    return buildSidebarSnapshotFromGroups(this.listAll(), this.listProjectGroups());
+  }
+
   listArchived() {
     return this.listHistoricalSessions({ archived: true });
   }
 
   listProjectGroups() {
-    const baseGroups = this.codexSidebarService.listProjectGroups();
-    if (!baseGroups.length) {
-      return [];
-    }
-
-    const groups = baseGroups.map((group) => ({
-      ...group,
-      sessions: Array.isArray(group.sessions) ? [...group.sessions] : []
-    }));
-    const projectRoots = groups.map((group) => String(group.projectRoot || group.cwd || "").trim()).filter(Boolean);
-    const groupsByRoot = new Map(groups.map((group) => [String(group.projectRoot || group.cwd || "").trim(), group]));
-
-    for (const session of this.listLiveSessions()) {
-      const projectRoot = bestProjectRootForCwd(session.cwd, projectRoots);
-      if (!projectRoot) {
-        continue;
-      }
-      const group = groupsByRoot.get(projectRoot);
-      if (!group) {
-        continue;
-      }
-      group.sessions.push(session);
-    }
-
-    for (const group of groups) {
-      const deduped = new Map();
-      for (const session of group.sessions) {
-        const identity = `${String(session.provider || "codex").trim()}:${String(
-          session.resumeSessionId || session.threadId || session.id || ""
-        ).trim()}`;
-        const existing = deduped.get(identity);
-        if (!existing || byUpdatedAtDesc(session, existing) < 0) {
-          deduped.set(identity, session);
-        }
-      }
-      group.sessions = [...deduped.values()].sort(byUpdatedAtDesc);
-    }
-
-    return groups.sort((left, right) => byUpdatedAtDesc(left.sessions[0], right.sessions[0]));
+    return mergeProjectGroupsWithLiveSessions(this.codexSidebarService.listProjectGroups(), this.listLiveSessions());
   }
 
   get(id) {
@@ -320,10 +374,21 @@ export class SessionManager {
     return this.getProvider(preferredProviderId || "codex");
   }
 
-  ensureLiveSessionForThread(threadId, { providerId = "", cwd = "", model = "", name = "" } = {}) {
+  ensureLiveSessionForThread(threadId, options = {}) {
     const targetThreadId = String(threadId || "").trim();
     if (!targetThreadId) {
       throw new Error("threadId is required");
+    }
+    const { providerId = "", cwd = "", model = "", name = "", reasoningEffort = "", permissionMode = "" } = options;
+    const composerOverrides = {};
+    if (Object.prototype.hasOwnProperty.call(options, "model")) {
+      composerOverrides.model = model;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, "reasoningEffort")) {
+      composerOverrides.reasoningEffort = reasoningEffort;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, "permissionMode")) {
+      composerOverrides.permissionMode = permissionMode;
     }
 
     const resolvedProvider = this.resolveProviderForThread(targetThreadId, providerId);
@@ -331,43 +396,68 @@ export class SessionManager {
       this.findLiveSessionByThreadId(targetThreadId, { providerId: resolvedProvider.id }) ||
       this.findLiveSessionByThreadId(targetThreadId);
     if (existing) {
+      this.updateSessionOptions(existing, composerOverrides);
       return existing;
     }
 
     const created = this.create({
       provider: resolvedProvider.id,
       cwd,
-      model,
+      ...composerOverrides,
       name,
       resumeSessionId: targetThreadId
     });
     return this.get(created.id);
   }
 
-  create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "" } = {}) {
+  preferredCodexRunnerMode({ resumeSessionId = "", permissionMode = "default" } = {}) {
+    return Boolean(
+      this.config.codexAppServerEnabled &&
+        this.appServerBridge &&
+        !sessionRequiresJsonExec({ permissionMode })
+    )
+      ? "app_server"
+      : "json_exec";
+  }
+
+  create({ cwd = "", name = "", resumeSessionId = "", provider = "codex", model = "", reasoningEffort = "", permissionMode = "" } = {}) {
     const resolvedProvider = this.getProvider(provider);
     const id = crypto.randomUUID();
-    const resolvedCwd = this.resolveCwd(cwd);
+    const normalizedResumeSessionId = String(resumeSessionId || "").trim();
+    let nextCwd = cwd;
+    let nextModel = model;
+    let nextReasoningEffort = reasoningEffort;
+    let nextPermissionMode = permissionMode;
+
+    if (resolvedProvider.id === "codex" && normalizedResumeSessionId) {
+      const threadState = new CodexThreadStateStore(this.config).getThreadComposerState(normalizedResumeSessionId);
+      if (threadState) {
+        nextCwd = String(nextCwd || "").trim() || threadState.cwd || nextCwd;
+        nextModel = String(nextModel || "").trim() || threadState.model || nextModel;
+        nextReasoningEffort = String(nextReasoningEffort || "").trim() || threadState.reasoningEffort || nextReasoningEffort;
+        nextPermissionMode = String(nextPermissionMode || "").trim() || threadState.permissionMode || nextPermissionMode;
+      }
+    }
+
+    const resolvedCwd = this.resolveCwd(nextCwd);
     const fallbackName = `${resolvedProvider.fallbackPrefix}-${this.sessions.size + 1}`;
     const sessionName =
       resolvedProvider.id === "codex" && !String(name || "").trim()
         ? ""
         : normalizeName(name, fallbackName);
+    const composerOptions = extractComposerOptions({ model: nextModel, reasoningEffort: nextReasoningEffort, permissionMode: nextPermissionMode });
     const spawnSpec = resolvedProvider.buildSpawnSpec({
-      resumeSessionId: String(resumeSessionId || "").trim() || null,
+      resumeSessionId: normalizedResumeSessionId || null,
       name: sessionName,
-      model: String(model || "").trim()
+      model: composerOptions.model,
+      permissionMode: composerOptions.permissionMode
     });
 
     if (resolvedProvider.id === "codex") {
-      // App-server bridge does not yet provide a reliable resumed-thread turn lifecycle
-      // (notifications can stall after userMessage without a terminal turn event), so
-      // thread continuation must stay on the stable json_exec runner until the adapter
-      // contract is completed end-to-end.
       const preferAppServer = Boolean(
         this.config.codexAppServerEnabled &&
           this.appServerBridge &&
-          !String(resumeSessionId || "").trim()
+          !sessionRequiresJsonExec({ permissionMode: composerOptions.permissionMode })
       );
       const session = {
         id,
@@ -389,10 +479,12 @@ export class SessionManager {
         sawBootstrapCommand: true,
         bootstrapNames: resolvedProvider.bootstrapNames,
         claudeStartupStage: 2,
-        resumeSessionId: String(resumeSessionId || "").trim() || null,
+        resumeSessionId: normalizedResumeSessionId || null,
         resumeBootstrapComplete: true,
         pendingResumeInput: "",
-        model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+        model: composerOptions.model || resolvedProvider.defaultModel || "",
+        reasoningEffort: composerOptions.reasoningEffort,
+        permissionMode: composerOptions.permissionMode,
         titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
         runnerMode: preferAppServer ? "app_server" : "json_exec",
         turnRunning: false,
@@ -401,9 +493,11 @@ export class SessionManager {
         runningProcess: null,
         queuedInputs: [],
         queuedTurnIds: [],
+        pendingLocalTurnIds: new Set(),
+        activePendingTurnId: "",
         conversationState: createConversationState({
           sessionId: id,
-          threadId: String(resumeSessionId || "").trim(),
+          threadId: normalizedResumeSessionId,
           status: "idle"
         }),
         threadSnapshot: null,
@@ -411,6 +505,9 @@ export class SessionManager {
         threadCanonicalizerState: createCanonicalizerState(),
         threadProjection: null,
         currentTurnId: "",
+        activeTypedItems: new Map(),
+        turnIdAliases: new Map(),
+        turnAliasSources: new Map(),
         sessionType: "main",
         parentThreadId: "",
         agentRole: "",
@@ -454,14 +551,16 @@ export class SessionManager {
       sawBootstrapCommand: false,
       bootstrapNames: resolvedProvider.bootstrapNames,
       claudeStartupStage: 0,
-      resumeSessionId: String(resumeSessionId || "").trim() || null,
-      resumeBootstrapComplete: !String(resumeSessionId || "").trim(),
+      resumeSessionId: normalizedResumeSessionId || null,
+      resumeBootstrapComplete: !normalizedResumeSessionId,
       pendingResumeInput: "",
-      model: String(model || "").trim() || resolvedProvider.defaultModel || "",
+      model: String(nextModel || "").trim() || resolvedProvider.defaultModel || "",
+      reasoningEffort: composerOptions.reasoningEffort,
+      permissionMode: composerOptions.permissionMode,
       titleSource: String(name || "").trim() ? "user_provided" : "auto_generated",
       conversationState: createConversationState({
         sessionId: id,
-        threadId: String(resumeSessionId || "").trim(),
+        threadId: normalizedResumeSessionId,
         status: "idle"
       }),
       threadSnapshot: null,
@@ -469,7 +568,12 @@ export class SessionManager {
       threadCanonicalizerState: createCanonicalizerState(),
       threadProjection: null,
       currentTurnId: "",
+      activeTypedItems: new Map(),
+      turnIdAliases: new Map(),
+      turnAliasSources: new Map(),
       queuedTurnIds: [],
+      pendingLocalTurnIds: new Set(),
+      activePendingTurnId: "",
       sessionType: "main",
       parentThreadId: "",
       agentRole: "",
@@ -483,6 +587,32 @@ export class SessionManager {
     this.seedConversationStateFromHistory(session, resolvedProvider);
     this.sessions.set(id, session);
     return this.serialize(session);
+  }
+
+  updateSessionOptions(target, input = {}) {
+    const session = typeof target === "string" ? this.get(target) : target;
+    if (!session) {
+      throw new Error(`Session not found: ${typeof target === "string" ? target : ""}`);
+    }
+
+    applyComposerOptionOverrides(session, input);
+    if (!String(session.model || "").trim()) {
+      session.model = this.getProvider(session.provider).defaultModel || "";
+    }
+    if (!String(session.reasoningEffort || "").trim()) {
+      session.reasoningEffort = "medium";
+    }
+    if (!String(session.permissionMode || "").trim()) {
+      session.permissionMode = "default";
+    }
+    if (session.provider === "codex") {
+      session.runnerMode = this.preferredCodexRunnerMode({
+        resumeSessionId: session.resumeSessionId,
+        permissionMode: session.permissionMode
+      });
+    }
+    session.updatedAt = nowIso();
+    return session;
   }
 
   pushSessionBuffer(session, text = "") {
@@ -670,11 +800,18 @@ export class SessionManager {
     if (!session) {
       return [];
     }
-    this.syncConversationStateFromThreadSnapshot(session);
+    const previous = createConversationState(session.conversationState);
+    const normalizedDeltas = (Array.isArray(deltas) ? deltas : []).filter(Boolean);
+    const { state, applied } = applyConversationStateDeltas(previous, normalizedDeltas);
+    session.conversationState = createConversationState({
+      ...state,
+      sessionId: String(session.id || state.sessionId || ""),
+      threadId: String(session.resumeSessionId || state.threadId || "")
+    });
     if (shouldBroadcast) {
-      this.broadcastConversationSnapshot(session);
+      this.broadcastConversationDelta(session, applied);
     }
-    return [];
+    return applied;
   }
 
   broadcastDerivedConversationDelta(session, previousState = null) {
@@ -702,14 +839,19 @@ export class SessionManager {
     ]);
   }
 
-  createConversationTurn(session, userText, timestamp = nowIso()) {
+  createConversationTurn(session, userText, timestamp = nowIso(), { activate = true } = {}) {
     if (!session) {
       return null;
     }
     session.turnSequence = Math.max(0, Number(session.turnSequence) || 0) + 1;
     const suffix = typeof crypto.randomUUID === "function" ? crypto.randomUUID().slice(0, 8) : String(Date.now());
     const turnId = `${session.id}-turn-${Date.now()}-${session.turnSequence}-${suffix}`;
-    session.currentTurnId = turnId;
+    if (activate) {
+      session.currentTurnId = turnId;
+      session.activePendingTurnId = turnId;
+    }
+    session.pendingLocalTurnIds ||= new Set();
+    session.pendingLocalTurnIds.add(turnId);
     const previous = createConversationState(session.conversationState);
     this.applyThreadRawRecord(
       session,
@@ -728,21 +870,132 @@ export class SessionManager {
     return turnId;
   }
 
+  bindConversationTurnAlias(session, clientTurnId = "", serverTurnId = "", { source = "unknown" } = {}) {
+    const clientId = String(clientTurnId || "").trim();
+    const serverId = String(serverTurnId || "").trim();
+    if (!session || !clientId || !serverId) {
+      return false;
+    }
+    if (clientId === serverId) {
+      return true;
+    }
+
+    session.turnIdAliases ||= new Map();
+    session.turnAliasSources ||= new Map();
+    const existingServer = session.turnIdAliases.get(clientId);
+    const existingClient = [...session.turnIdAliases.entries()].find(
+      ([leftClientId, rightServerId]) => rightServerId === serverId && leftClientId !== clientId
+    )?.[0];
+    if ((existingServer && existingServer !== serverId) || existingClient) {
+      console.warn(
+        `[conversation] turn alias conflict sessionId=${session.id || ""} clientTurnId=${clientId} serverTurnId=${serverId}`
+      );
+      return false;
+    }
+
+    session.turnIdAliases.set(clientId, serverId);
+    session.turnAliasSources.set(`${clientId}->${serverId}`, String(source || "unknown"));
+    session.pendingLocalTurnIds?.delete(clientId);
+    session.pendingLocalTurnIds?.add(serverId);
+
+    const renameTurns = (turns = []) =>
+      (Array.isArray(turns) ? turns : []).map((turn) =>
+        String(turn?.id || "").trim() === clientId
+          ? {
+              ...turn,
+              id: serverId
+            }
+          : turn
+      );
+
+    if (session.threadSnapshot) {
+      session.threadSnapshot = {
+        ...session.threadSnapshot,
+        activeTurnId: String(session.threadSnapshot.activeTurnId || "") === clientId ? serverId : session.threadSnapshot.activeTurnId,
+        turns: renameTurns(session.threadSnapshot.turns)
+      };
+      buildThreadProjection(session);
+      syncProjectedThreadState(session, { previousSnapshot: session.threadSnapshot });
+    }
+
+    if (session.conversationState) {
+      session.conversationState = createConversationState({
+        ...session.conversationState,
+        activeTurnId: String(session.conversationState.activeTurnId || "") === clientId ? serverId : session.conversationState.activeTurnId,
+        turns: renameTurns(session.conversationState.turns)
+      });
+    }
+
+    if (String(session.currentTurnId || "") === clientId) {
+      session.currentTurnId = serverId;
+    }
+    if (String(session.activePendingTurnId || "") === clientId) {
+      session.activePendingTurnId = serverId;
+    }
+    session.queuedTurnIds = (Array.isArray(session.queuedTurnIds) ? session.queuedTurnIds : []).map((turnId) =>
+      String(turnId || "") === clientId ? serverId : turnId
+    );
+    return true;
+  }
+
   applyConversationRecord(session, record, { turnId = session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || "" } = {}) {
     if (!session || !turnId) {
       return [];
     }
     const previous = createConversationState(session.conversationState);
+    const explicitDeltas = normalizeRecordToDeltas(record, { turnId }).map((delta) => ({
+      ...delta,
+      sessionId: String(session.id || ""),
+      threadId: String(session.resumeSessionId || session.conversationState?.threadId || ""),
+      clientTurnId: String(record?.clientTurnId || ""),
+      aliasSource: String(record?.aliasSource || "")
+    }));
     this.applyThreadRawRecord(session, record, { turnId });
-    this.broadcastDerivedConversationDelta(session, previous);
-    this.broadcastConversationSnapshot(session);
-    return [];
+    this.syncConversationStateFromThreadSnapshot(session);
+    if (explicitDeltas.length) {
+      const after = createConversationState(session.conversationState);
+      const finalVersion = Math.max(after.version, previous.version + explicitDeltas.length);
+      const applied = explicitDeltas.map((delta, index) => ({
+        delta,
+        fromVersion: previous.version + index,
+        toVersion: index === explicitDeltas.length - 1 ? finalVersion : previous.version + index + 1,
+        timestamp: delta.timestamp || delta.block?.ts || delta.event?.ts || record?.timestamp || after.updatedAt
+      }));
+      this.broadcastConversationDelta(session, applied);
+    } else {
+      this.broadcastDerivedConversationDelta(session, previous);
+    }
+    if (String(record?.phase || "").toLowerCase() !== "streaming") {
+      this.broadcastConversationSnapshot(session);
+    }
+    return explicitDeltas;
   }
 
-  finalizeConversationTurn(session, status = "completed", timestamp = nowIso()) {
-    const targetTurnId = String(session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || "");
+  hasConversationTurn(session, turnId = "") {
+    const targetTurnId = String(turnId || "").trim();
+    if (!session || !targetTurnId) {
+      return false;
+    }
+    return Boolean(
+      (Array.isArray(session.threadSnapshot?.turns) &&
+        session.threadSnapshot.turns.some((turn) => String(turn?.id || "").trim() === targetTurnId)) ||
+        (Array.isArray(session.conversationState?.turns) &&
+          session.conversationState.turns.some((turn) => String(turn?.id || "").trim() === targetTurnId))
+    );
+  }
+
+  finalizeConversationTurn(session, status = "completed", timestamp = nowIso(), options = {}) {
+    const hasExplicitTurnId = Object.prototype.hasOwnProperty.call(options || {}, "turnId");
+    const targetTurnId = String(
+      hasExplicitTurnId
+        ? options?.turnId || ""
+        : session?.currentTurnId || session?.threadSnapshot?.activeTurnId || session?.conversationState?.activeTurnId || ""
+    ).trim();
     if (!targetTurnId) {
-      return;
+      return false;
+    }
+    if (hasExplicitTurnId && !this.hasConversationTurn(session, targetTurnId)) {
+      return false;
     }
     const previous = createConversationState(session.conversationState);
     this.applyThreadRawRecord(
@@ -757,9 +1010,16 @@ export class SessionManager {
       },
       { turnId: targetTurnId }
     );
-    session.currentTurnId = "";
+    if (String(session.currentTurnId || "").trim() === targetTurnId) {
+      session.currentTurnId = "";
+    }
+    if (String(session.activePendingTurnId || "").trim() === targetTurnId) {
+      session.activePendingTurnId = "";
+    }
+    session.pendingLocalTurnIds?.delete(targetTurnId);
     this.broadcastDerivedConversationDelta(session, previous);
     this.broadcastConversationSnapshot(session);
+    return true;
   }
 
   updateConversationTurnStatus(session, status = "running", timestamp = nowIso()) {
@@ -796,9 +1056,24 @@ export class SessionManager {
         }
         const currentSnapshot = this.ensureThreadSnapshot(live);
         const incomingSnapshot = historical?.threadSnapshot || null;
+        const currentUpdatedAt = parseSnapshotUpdatedAt(currentSnapshot);
+        const incomingUpdatedAt = parseSnapshotUpdatedAt(incomingSnapshot);
+        const protectedTurnId = String(
+          live.currentTurnId ||
+          currentSnapshot?.activeTurnId ||
+          live.conversationState?.activeTurnId ||
+          ""
+        ).trim();
+        if (protectedTurnId && snapshotHasTurn(currentSnapshot, protectedTurnId) && !snapshotHasTurn(incomingSnapshot, protectedTurnId)) {
+          return;
+        }
+        if (incomingUpdatedAt && currentUpdatedAt && incomingUpdatedAt < currentUpdatedAt) {
+          return;
+        }
         const shouldReplace =
           Number(incomingSnapshot?.lastEventSeq || 0) > Number(currentSnapshot?.lastEventSeq || 0) ||
-          Number(incomingSnapshot?.version || 0) > Number(currentSnapshot?.version || 0);
+          Number(incomingSnapshot?.version || 0) > Number(currentSnapshot?.version || 0) ||
+          hasThreadSnapshotMeaningfulAdvance(incomingSnapshot, currentSnapshot);
         if (!shouldReplace) {
           return;
         }
@@ -1003,6 +1278,8 @@ export class SessionManager {
       inputPreview: session.inputPreview,
       resumeSessionId: session.resumeSessionId,
       model: session.model || "",
+      reasoningEffort: session.reasoningEffort || "medium",
+      permissionMode: session.permissionMode || "default",
       titleSource: session.titleSource || "",
       sessionType: session.sessionType || "main",
       parentThreadId: session.parentThreadId || "",
@@ -1030,63 +1307,23 @@ export class SessionManager {
 
   getThreadSnapshotBundle(providerId, resumeSessionId) {
     const provider = this.getProvider(providerId);
-    let historical = null;
-    try {
-      historical = this.historyService.getHistoricalMessages(provider, resumeSessionId);
-    } catch {
-      historical = null;
-    }
-    return {
-      session: historical?.session || null,
-      threadSnapshot: historical?.threadSnapshot || null,
-      liveOverlay: historical?.liveOverlay || null,
-      conversation: historical?.conversation || null,
-      conversationSnapshot: historical?.conversationSnapshot || null
-    };
+    return buildThreadSnapshotBundle(this.historyService, provider, resumeSessionId);
   }
 
   getLiveHistoryContinuation(providerId, resumeSessionId) {
     const provider = this.getProvider(providerId);
-    const targetResumeId = String(resumeSessionId || "").trim();
-    if (!targetResumeId) {
-      return null;
-    }
-    const liveSession = [...this.sessions.values()]
-      .filter(
-        (session) =>
-          session.provider === provider.id &&
-          session.status !== "exited" &&
-          String(session.resumeSessionId || "").trim() === targetResumeId
-      )
-      .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))[0];
-    if (!liveSession) {
-      return null;
-    }
-    let baseSnapshot = null;
-    try {
-      baseSnapshot = this.historyService.getHistoricalMessages(provider, targetResumeId)?.threadSnapshot || null;
-    } catch {
-      baseSnapshot = null;
-    }
-    const currentSnapshot = this.ensureThreadSnapshot(liveSession);
-    const currentConversation = this.ensureConversationState(liveSession);
-    buildThreadProjection(liveSession);
-    const mergedSnapshot =
-      (currentSnapshot?.turns?.length || 0) >= (currentConversation?.turns?.length || 0)
-        ? currentSnapshot
-        : deriveThreadSnapshotFromConversationState(currentConversation, {
-            threadId: targetResumeId,
-            metadata: currentSnapshot?.metadata || baseSnapshot?.metadata || {},
-            baseSnapshot: baseSnapshot || currentSnapshot || null
-          });
-    liveSession.threadSnapshot = mergedSnapshot;
-    syncProjectedThreadState(liveSession, { previousSnapshot: mergedSnapshot });
-    return {
-      session: this.serialize(liveSession),
-      conversation: currentConversation,
-      threadSnapshot: mergedSnapshot,
-      liveOverlay: liveSession.liveOverlay || null
-    };
+    return buildLiveHistoryContinuation({
+      sessions: this.sessions.values(),
+      provider,
+      resumeSessionId,
+      historyService: this.historyService,
+      ensureThreadSnapshot: (session) => this.ensureThreadSnapshot(session),
+      ensureConversationState: (session) => this.ensureConversationState(session),
+      buildThreadProjection,
+      deriveThreadSnapshotFromConversationState,
+      syncProjectedThreadState,
+      serialize: (session) => this.serialize(session)
+    });
   }
 
   getThreadContinuation(providerId, resumeSessionId) {
@@ -1240,7 +1477,8 @@ export class SessionManager {
     return provider.buildCommand({
       resumeSessionId: session.resumeSessionId,
       name: session.autoNamed ? "" : session.name,
-      model: session.model || ""
+      model: session.model || "",
+      permissionMode: session.permissionMode || "default"
     });
   }
 }

@@ -65,9 +65,12 @@ function resolveThreadRuntime(session, payload = {}) {
 }
 
 function pickTurnById(turns, turnId) {
-  const targetTurnId = String(turnId || "").trim();
-  if (!targetTurnId || !Array.isArray(turns)) {
+  if (!Array.isArray(turns)) {
     return [];
+  }
+  const targetTurnId = String(turnId || "").trim();
+  if (!targetTurnId) {
+    return turns;
   }
   return turns.filter((turn) => String(turn?.id || "").trim() === targetTurnId);
 }
@@ -190,6 +193,11 @@ export function buildConversationDeltaPayload(session, appliedDeltas = []) {
     return null;
   }
   const conversation = deriveConversation(session);
+  const deltas = normalizedApplied.map((entry) => ({
+    ...entry.delta,
+    version: entry.toVersion,
+    timestamp: entry.delta?.timestamp || entry.timestamp
+  }));
   return {
     type: "conversation.delta",
     protocolVersion: CONVERSATION_PROTOCOL_VERSION,
@@ -199,19 +207,9 @@ export function buildConversationDeltaPayload(session, appliedDeltas = []) {
     fromVersion: normalizedApplied[0].fromVersion,
     toVersion: normalizedApplied[normalizedApplied.length - 1].toVersion,
     conversationStatus: conversation.status,
-    conversation,
     continuation: buildContinuationRuntime(session, null, conversation),
-    thread: {
-      snapshot: session?.threadSnapshot || null,
-      continuation: buildContinuationRuntime(session, null, conversation)
-    },
-    threadSnapshot: session?.threadSnapshot || null,
     liveOverlay: session?.liveOverlay || null,
-    deltas: normalizedApplied.map((entry) => ({
-      ...entry.delta,
-      version: entry.toVersion,
-      timestamp: entry.delta?.timestamp || entry.timestamp
-    }))
+    deltas
   };
 }
 

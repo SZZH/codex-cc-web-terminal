@@ -122,6 +122,10 @@ export const config = {
   codexSessionsDir: env("CODEX_SESSIONS_DIR", path.join(home, ".codex", "sessions")),
   codexArchivedSessionsDir: env("CODEX_ARCHIVED_SESSIONS_DIR", path.join(home, ".codex", "archived_sessions")),
   codexSessionIndexPath: env("CODEX_SESSION_INDEX_PATH", path.join(home, ".codex", "session_index.jsonl")),
+  codexModelsCachePath: env("CODEX_MODELS_CACHE_PATH", path.join(home, ".codex", "models_cache.json")),
+  codexConfigPath: env("CODEX_CONFIG_PATH", path.join(home, ".codex", "config.toml")),
+  codexGlobalStatePath: env("CODEX_GLOBAL_STATE_PATH", path.join(home, ".codex", ".codex-global-state.json")),
+  codexStateDbPath: env("CODEX_STATE_DB_PATH", path.join(home, ".codex", "state_5.sqlite")),
   ccSessionsDir: env("CC_SESSIONS_DIR", path.join(home, ".claude", "projects")),
   timezone: env("DISPLAY_TIMEZONE", "UTC")
 };

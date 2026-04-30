@@ -324,6 +324,12 @@ function normalizeEventMsgRecord(record, turnId) {
       })
     ];
   }
+  if (type === "taskcomplete" || type === "turncompleted") {
+    return [createTurnCompletedDelta(turnId, payload.status || "completed", ts)];
+  }
+  if (type === "taskfailed") {
+    return [createTurnCompletedDelta(turnId, payload.status || "failed", ts)];
+  }
   if (type === "agentreasoning") {
     const text = compactText(payload.text || payload.message);
     if (!text) {
@@ -478,7 +484,7 @@ function normalizeItemCompletedRecord(record, turnId) {
     if (!text) {
       return [];
     }
-    return [createBodyDelta(turnId, { text, ts, payload: { phase: "completed" }, mergeMode: "paragraph" })];
+    return [createBodyDelta(turnId, { text, ts, payload: { phase: "completed" }, mergeMode: "stream_replace" })];
   }
   const eventPart = buildEventPartFromItem(item);
   if (!eventPart) {

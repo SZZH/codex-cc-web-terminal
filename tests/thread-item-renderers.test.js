@@ -107,6 +107,29 @@ test("thread item renderer summarizes process counts by type", () => {
   assert.match(summary.label, /工具 1/);
 });
 
+test("thread item renderer marks historical dump command output as diagnostic dump", () => {
+  const item = normalizeThreadItem({
+    id: "cmd-dump-1",
+    kind: "CommandExecution",
+    status: "completed",
+    summary: "exec_command",
+    text: [
+      "Command: curl http://localhost:3210/api/history-messages?provider=codex&resumeSessionId=abc",
+      "{",
+      '  "session": "history:codex:abc",',
+      '  "conversation.turns": [',
+      '    { "role": "user", "text": "提交代码" },',
+      '    { "role": "assistant", "text": "已提交，commit 是 e949854" }',
+      "  ]",
+      "}",
+      "/Users/demo/.codex/sessions/2026/04/28/rollout-2026-04-28T00-38-22-abc.jsonl"
+    ].join("\n")
+  });
+
+  assert.equal(item.isDiagnosticDump, true);
+  assert.equal(item.summary, "会话历史调试输出");
+});
+
 test("thread view model collapses process segments for terminal turns", () => {
   const viewModel = buildThreadViewModel({
     turns: [
@@ -142,6 +165,91 @@ test("thread view model collapses process segments for terminal turns", () => {
   assert.equal(historyProcess.defaultCollapsed, true);
   assert.equal(runningProcess.defaultCollapsed, false);
   assert.equal(completedProcess.defaultCollapsed, true);
+});
+
+test("thread view model collapses process segments that contain diagnostic dumps", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-diagnostic",
+        status: "inProgress",
+        items: [
+          {
+            id: "cmd-dump-2",
+            kind: "CommandExecution",
+            status: "completed",
+            summary: "exec_command",
+            text: [
+              "Command: node dump-history.js",
+              "{",
+              '  "threadSnapshot": {',
+              '    "turns": [',
+              '      { "kind": "UserMessage", "text": "提交代码" },',
+              '      { "kind": "AgentMessage", "text": "已提交，commit 是 e949854" }',
+              "    ]",
+              "  }",
+              "}"
+            ].join("\n")
+          }
+        ]
+      }
+    ]
+  });
+
+  const processSegment = viewModel.turns[0].segments.find((segment) => segment.kind === "process");
+  assert.equal(processSegment.hasDiagnosticDump, true);
+  assert.equal(processSegment.defaultCollapsed, true);
+  assert.match(processSegment.processSummary.label, /调试输出 1/);
+});
+
+test("thread view model does not append live overlay text on top of committed turn items", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-live-overlay",
+        status: "completed",
+        items: [
+          { id: "user-1", kind: "UserMessage", text: "你好" },
+          { id: "assistant-1", kind: "AgentMessage", text: "正式回复" }
+        ]
+      }
+    ]
+  }, {
+    liveOverlay: {
+      turnId: "turn-live-overlay",
+      text: "正式回复"
+    }
+  });
+
+  const items = viewModel.turns[0].segments.flatMap((segment) => segment.items);
+  assert.equal(items.filter((item) => item.kind === "agentmessage").length, 1);
+});
+
+test("thread view model keeps a process segment renderable even before primary text materializes", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-process-only",
+        status: "inProgress",
+        items: [
+          {
+            id: "proc-early-1",
+            kind: "CommandExecution",
+            status: "running",
+            summary: "npm run check",
+            payload: { command: "npm run check" }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(viewModel.turns[0].hasPrimary, false);
+  assert.equal(viewModel.turns[0].hasProcess, true);
+  assert.equal(viewModel.turns[0].segments.length, 1);
+  assert.equal(viewModel.turns[0].segments[0].kind, "process");
+  assert.equal(viewModel.turns[0].segments[0].items[0].label, "命令执行");
+  assert.equal(viewModel.turns[0].segments[0].defaultCollapsed, false);
 });
 
 test("thread view model keeps workspace changes anchored to the file-change turn", () => {

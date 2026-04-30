@@ -14,8 +14,45 @@ function collectAssistantBodyText(turn = {}) {
     .trim();
 }
 
+function mapAssistantProcessEventToThreadItem(turn = {}, event = {}, index = 0) {
+  const type = String(event?.type || "Reasoning").trim();
+  const normalizedType = type.toLowerCase();
+  let kind = "DynamicToolCall";
+  if (normalizedType.includes("reason")) {
+    kind = "Reasoning";
+  } else if (normalizedType.includes("command")) {
+    kind = "CommandExecution";
+  } else if (normalizedType.includes("file")) {
+    kind = "FileChange";
+  } else if (normalizedType.includes("mcp")) {
+    kind = "McpToolCall";
+  } else if (normalizedType.includes("subagent")) {
+    kind = "CollabAgentToolCall";
+  }
+  return {
+    id: String(event?.id || `${turn.id || "turn"}-process-${index + 1}`),
+    kind,
+    status: String(event?.phase || turn?.assistant?.status || "completed"),
+    text: String(event?.content || event?.summary || event?.title || "").trim(),
+    summary: String(event?.summary || event?.title || "").trim(),
+    payload: JSON.parse(JSON.stringify(event?.payload || {})),
+    timestamp: String(event?.ts || "").trim()
+  };
+}
+
+function parseItemTimestamp(item = {}) {
+  const candidates = [item?.timestamp, item?.ts, item?.payload?.timestamp, item?.payload?.ts];
+  for (const candidate of candidates) {
+    const parsed = Date.parse(String(candidate || ""));
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
 function mapConversationTurnToThreadTurn(turn = {}) {
-  const items = [];
+  const orderedItems = [];
   const userText = String(turn?.user?.text || "").trim();
   const userPayload = {
     content: Array.isArray(turn?.user?.content) ? JSON.parse(JSON.stringify(turn.user.content)) : [],
@@ -23,13 +60,19 @@ function mapConversationTurnToThreadTurn(turn = {}) {
     local_images: Array.isArray(turn?.user?.local_images) ? JSON.parse(JSON.stringify(turn.user.local_images)) : []
   };
   if (userText || userPayload.content.length || userPayload.images.length || userPayload.local_images.length) {
-    items.push({
+    orderedItems.push({
       id: `${turn.id || "turn"}-user`,
       kind: "UserMessage",
       text: userText,
       status: "completed",
-      payload: userPayload
+      payload: userPayload,
+      timestamp: String(turn?.user?.ts || "").trim()
     });
+  }
+
+  const assistantProcess = Array.isArray(turn?.assistant?.process) ? turn.assistant.process : [];
+  for (const [index, event] of assistantProcess.entries()) {
+    orderedItems.push(mapAssistantProcessEventToThreadItem(turn, event, index));
   }
 
   const assistantBody = Array.isArray(turn?.assistant?.body) ? turn.assistant.body : [];
@@ -38,12 +81,13 @@ function mapConversationTurnToThreadTurn(turn = {}) {
   for (const block of assistantBody) {
     const blockKind = String(block?.kind || "markdown").trim().toLowerCase();
     if (blockKind === "image" && String(block?.payload?.url || "").trim()) {
-      items.push({
-        id: String(block?.id || `${turn.id || "turn"}-assistant-image-${items.length}`),
+      orderedItems.push({
+        id: String(block?.id || `${turn.id || "turn"}-assistant-image-${orderedItems.length}`),
         kind: "ImageView",
         status: String(turn?.assistant?.status || "completed"),
         payload: JSON.parse(JSON.stringify(block?.payload || {})),
-        summary: String(block?.payload?.alt || "image")
+        summary: String(block?.payload?.alt || "image"),
+        timestamp: String(block?.ts || "").trim()
       });
       continue;
     }
@@ -55,13 +99,30 @@ function mapConversationTurnToThreadTurn(turn = {}) {
     assistantTextIndex += 1;
   }
   if (assistantText) {
-    items.push({
+    orderedItems.push({
       id: `${turn.id || "turn"}-assistant-${assistantTextIndex || "body"}`,
       kind: "AgentMessage",
       text: assistantText,
-      status: String(turn?.assistant?.status || "completed")
+      status: String(turn?.assistant?.status || "completed"),
+      timestamp: String(assistantBody[assistantBody.length - 1]?.ts || "").trim()
     });
   }
+
+  const items = orderedItems
+    .map((item, index) => ({ ...item, __index: index, __ts: parseItemTimestamp(item) }))
+    .sort((left, right) => {
+      if (left.__ts && right.__ts && left.__ts !== right.__ts) {
+        return left.__ts - right.__ts;
+      }
+      if (left.__ts && !right.__ts) {
+        return -1;
+      }
+      if (!left.__ts && right.__ts) {
+        return 1;
+      }
+      return left.__index - right.__index;
+    })
+    .map(({ __index, __ts, ...item }) => item);
 
   return {
     id: String(turn?.id || ""),
@@ -342,7 +403,7 @@ function mergeLiveConversationIntoSnapshot(snapshot, conversation, liveSessionMe
     }
     const existingIndex = nextTurns.findIndex((turn) => String(turn?.id || "") === mappedTurn.id);
     if (existingIndex >= 0) {
-      if (preserveExistingTurns && extractTurnAssistantText(nextTurns[existingIndex])) {
+      if ((preserveExistingTurns || isTerminalThreadTurn(nextTurns[existingIndex])) && extractTurnAssistantText(nextTurns[existingIndex])) {
         continue;
       }
       nextTurns[existingIndex] = mergeThreadTurns(nextTurns[existingIndex], mappedTurn);
@@ -350,7 +411,7 @@ function mergeLiveConversationIntoSnapshot(snapshot, conversation, liveSessionMe
     }
     const equivalentIndex = nextTurns.findIndex((turn) => areEquivalentTurns(turn, mappedTurn));
     if (equivalentIndex >= 0) {
-      if (preserveExistingTurns && extractTurnAssistantText(nextTurns[equivalentIndex])) {
+      if ((preserveExistingTurns || isTerminalThreadTurn(nextTurns[equivalentIndex])) && extractTurnAssistantText(nextTurns[equivalentIndex])) {
         continue;
       }
       nextTurns[equivalentIndex] = mergeThreadTurns(nextTurns[equivalentIndex], mappedTurn);
@@ -408,6 +469,15 @@ function appendRuntimeDraftTurn(snapshot, messages, context = {}) {
     }
     return baseSnapshot;
   }
+  const sameTypedTurn = nextTurns.find((turn) => {
+    const turnItems = Array.isArray(turn?.items) ? turn.items : [];
+    const userText = String(turnItems.find((item) => item?.kind === "UserMessage")?.text || "").trim();
+    const draftUserText = String(draftTurn.items.find((item) => item?.kind === "UserMessage")?.text || "").trim();
+    return Boolean(draftUserText && userText === draftUserText);
+  });
+  if (sameTypedTurn) {
+    return baseSnapshot;
+  }
   const existingIndex = nextTurns.findIndex((turn) => String(turn?.id || "") === draftTurn.id);
   if (existingIndex >= 0) {
     nextTurns[existingIndex] = draftTurn;
@@ -420,6 +490,43 @@ function appendRuntimeDraftTurn(snapshot, messages, context = {}) {
     turns: nextTurns,
     updatedAt: new Date().toISOString()
   };
+}
+
+function isTerminalUserOnlyTurn(turn = {}) {
+  const status = String(turn?.status || "").trim().toLowerCase();
+  if (!["completed", "failed", "aborted", "interrupted"].includes(status)) {
+    return false;
+  }
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  if (items.length !== 1) {
+    return false;
+  }
+  const item = items[0] || {};
+  const content = Array.isArray(item?.payload?.content) ? item.payload.content : [];
+  const hasNonTextContent = content.some((part) => String(part?.type || "").trim() && !/text/i.test(String(part?.type || "")));
+  return String(item?.kind || "").trim() === "UserMessage" && !hasNonTextContent;
+}
+
+function isTerminalThreadTurn(turn = {}) {
+  return ["completed", "failed", "aborted", "interrupted"].includes(String(turn?.status || "").trim().toLowerCase());
+}
+
+function isLiveConversationActive(conversation) {
+  if (!conversation || typeof conversation !== "object") {
+    return false;
+  }
+  if (String(conversation.status || "").toLowerCase() === "running") {
+    return true;
+  }
+  const activeTurnId = String(conversation.activeTurnId || "").trim();
+  return Boolean(
+    activeTurnId ||
+      (Array.isArray(conversation.turns) &&
+        conversation.turns.some((turn) => {
+          const status = String(turn?.assistant?.status || turn?.status || "").toLowerCase();
+          return status === "running" || status === "inprogress" || status === "in_progress";
+        }))
+  );
 }
 
 export function buildDisplayedThreadSnapshot({
@@ -455,11 +562,10 @@ export function buildDisplayedThreadSnapshot({
         }
       : null);
 
-  const canMergeLiveConversation =
-    includeLiveConversation && (!preferAuthoritativeSnapshot || !hasAuthoritativeSnapshot);
+  const canMergeLiveConversation = includeLiveConversation;
   if (canMergeLiveConversation && liveConversation && Array.isArray(liveConversation.turns) && liveConversation.turns.length) {
     snapshot = mergeLiveConversationIntoSnapshot(snapshot, liveConversation, liveSessionMeta || { resumeSessionId: resolvedThreadId }, {
-      preserveExistingTurns: Boolean(authoritativeSnapshot)
+      preserveExistingTurns: hasAuthoritativeSnapshot && !isLiveConversationActive(liveConversation)
     });
   }
 
@@ -468,6 +574,10 @@ export function buildDisplayedThreadSnapshot({
       threadId: resolvedThreadId,
       liveSessionMeta: liveSessionMeta || { resumeSessionId: resolvedThreadId }
     });
+  }
+
+  if (snapshot && Array.isArray(snapshot.turns)) {
+    snapshot.turns = snapshot.turns.filter((turn) => !isTerminalUserOnlyTurn(turn));
   }
 
   return snapshot;
@@ -500,11 +610,15 @@ export function shouldSyncPersistedThread({
   threadMeta = null,
   liveSessionId = "",
   liveSessionMeta = null,
-  hasAuthoritativeLiveData = false
+  hasAuthoritativeLiveData = false,
+  forceSync = false
 } = {}) {
   const targetThreadId = String(routeThreadId || threadMeta?.resumeSessionId || "").trim();
   if (!targetThreadId) {
     return false;
+  }
+  if (forceSync) {
+    return true;
   }
   if (!String(liveSessionId || "").trim()) {
     return true;

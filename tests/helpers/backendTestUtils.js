@@ -60,6 +60,8 @@ export function createBaseConfig(rootDir, overrides = {}) {
     codexSessionsDir,
     codexArchivedSessionsDir,
     codexSessionIndexPath: overrides.codexSessionIndexPath || path.join(rootDir, ".codex", "session_index.jsonl"),
+    codexModelsCachePath: overrides.codexModelsCachePath || path.join(rootDir, ".codex", "models_cache.json"),
+    codexStateDbPath: overrides.codexStateDbPath || path.join(rootDir, ".codex", "state_5.sqlite"),
     ccSessionsDir,
     timezone: "UTC",
     ...overrides

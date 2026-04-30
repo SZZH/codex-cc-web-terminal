@@ -281,14 +281,16 @@ export class AppServerBridge extends EventEmitter {
       await this.request("thread/resume", {
         threadId: session.resumeSessionId,
         cwd: session.cwd,
-        model: session.model || null
+        model: session.model || null,
+        reasoningEffort: session.reasoningEffort || null
       });
       return session.resumeSessionId;
     }
     const result = await this.request("thread/start", {
       cwd: session.cwd,
       model: session.model || null,
-      experimentalRawEvents: false,
+      reasoningEffort: session.reasoningEffort || null,
+      experimentalRawEvents: true,
       persistExtendedHistory: true
     });
     const threadId = String(result?.thread?.id || "").trim();

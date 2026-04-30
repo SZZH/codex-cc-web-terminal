@@ -9,11 +9,16 @@ function normalizeWorkspacePath(cwd) {
   return resolved ? path.resolve(resolved) : "";
 }
 
-function assertWorkspace(cwd) {
+function assertWorkspaceDirectory(cwd) {
   const workspace = normalizeWorkspacePath(cwd);
   if (!workspace || !fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
     throw new Error("Invalid workspace path");
   }
+  return workspace;
+}
+
+function assertWorkspace(cwd) {
+  const workspace = assertWorkspaceDirectory(cwd);
   execFileSync("git", ["rev-parse", "--show-toplevel"], {
     cwd: workspace,
     encoding: "utf8",
@@ -188,6 +193,123 @@ function revertWorkspaceChanges(cwd, paths) {
   };
 }
 
+function normalizeBranchName(value) {
+  const branch = String(value || "").trim();
+  if (!branch || branch.startsWith("-") || /[\0-\x1f\x7f\s~^:?*\[]/.test(branch) || branch.includes("..") || branch.includes("@{")) {
+    throw new Error("Invalid branch name");
+  }
+  return branch;
+}
+
+function probeWorkspaceRepo(cwd) {
+  const workspace = assertWorkspaceDirectory(cwd);
+  const result = runGit(workspace, ["rev-parse", "--show-toplevel"], { allowFailure: true });
+  if (result.status !== 0) {
+    return {
+      cwd: workspace,
+      isGitRepo: false
+    };
+  }
+  return {
+    cwd: String(result.stdout || "").trim() || workspace,
+    isGitRepo: true
+  };
+}
+
+function listGitBranches(cwd) {
+  const repo = probeWorkspaceRepo(cwd);
+  if (!repo.isGitRepo) {
+    return {
+      ok: true,
+      cwd: repo.cwd,
+      isGitRepo: false,
+      currentBranch: "",
+      dirty: false,
+      branches: []
+    };
+  }
+
+  const workspace = repo.cwd;
+  const currentBranch = runGit(workspace, ["branch", "--show-current"], { allowFailure: true }).stdout.trim();
+  const branchLines = runGit(
+    workspace,
+    ["for-each-ref", "--format=%(refname:short)\t%(refname)\t%(HEAD)", "refs/heads", "refs/remotes"],
+    { allowFailure: true }
+  ).stdout;
+  const branches = branchLines
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [name, fullRef, headMarker] = line.split("\t");
+      return {
+        name: String(name || "").trim(),
+        current: String(headMarker || "").trim() === "*",
+        remote: String(fullRef || "").includes("refs/remotes/")
+      };
+    })
+    .filter((branch) => {
+      const name = String(branch?.name || "").trim();
+      return Boolean(name) && !name.endsWith("/HEAD") && name !== "origin";
+    });
+  branches.sort((left, right) => {
+    if (left.current && !right.current) {
+      return -1;
+    }
+    if (!left.current && right.current) {
+      return 1;
+    }
+    return left.name.localeCompare(right.name);
+  });
+  const dirty = Boolean(runGit(workspace, ["status", "--porcelain"], { allowFailure: true }).stdout.trim());
+  return {
+    ok: true,
+    cwd: workspace,
+    isGitRepo: true,
+    currentBranch,
+    dirty,
+    branches
+  };
+}
+
+function checkoutGitBranch(cwd, branch) {
+  const targetBranch = normalizeBranchName(branch);
+  const state = listGitBranches(cwd);
+  if (!state.isGitRepo) {
+    throw new Error("Workspace is not a git repository");
+  }
+  if (state.currentBranch === targetBranch) {
+    return state;
+  }
+  if (state.dirty) {
+    const error = new Error("Workspace has uncommitted changes");
+    error.code = "DIRTY_WORKTREE";
+    throw error;
+  }
+  runGit(state.cwd, ["switch", targetBranch]);
+  return listGitBranches(state.cwd);
+}
+
+function createGitBranch(cwd, branch, { checkout = true, startPoint = "" } = {}) {
+  const targetBranch = normalizeBranchName(branch);
+  const state = listGitBranches(cwd);
+  if (!state.isGitRepo) {
+    throw new Error("Workspace is not a git repository");
+  }
+  if (checkout && state.dirty) {
+    const error = new Error("Workspace has uncommitted changes");
+    error.code = "DIRTY_WORKTREE";
+    throw error;
+  }
+  const args = checkout ? ["switch", "-c", targetBranch] : ["branch", targetBranch];
+  const normalizedStartPoint = String(startPoint || "").trim();
+  if (normalizedStartPoint) {
+    args.push(normalizedStartPoint);
+  }
+  runGit(state.cwd, args);
+  return listGitBranches(state.cwd);
+}
+
 export async function handleWorkspaceChangesRoute(ctx, runtime) {
   if (ctx.path === "/api/workspace-changes" && ctx.method === "GET") {
     if (runtime.forbidCrossOrigin(ctx)) {
@@ -223,11 +345,64 @@ export async function handleWorkspaceChangesRoute(ctx, runtime) {
     return true;
   }
 
+  if (ctx.path === "/api/workspace-git" && ctx.method === "GET") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+    try {
+      const url = new URL(ctx.url, "http://localhost");
+      runtime.json(ctx, 200, listGitBranches(url.searchParams.get("cwd")));
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err) });
+    }
+    return true;
+  }
+
+  if (ctx.path === "/api/workspace-git/checkout" && ctx.method === "POST") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+    try {
+      const body = runtime.parseJson(await runtime.readBody(ctx.req));
+      runtime.json(ctx, 200, checkoutGitBranch(body.cwd, body.branch));
+    } catch (err) {
+      const status = err?.code === "DIRTY_WORKTREE" ? 409 : 400;
+      runtime.json(ctx, status, { error: err?.message || String(err), dirty: err?.code === "DIRTY_WORKTREE" });
+    }
+    return true;
+  }
+
+  if (ctx.path === "/api/workspace-git/branches" && ctx.method === "POST") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+    try {
+      const body = runtime.parseJson(await runtime.readBody(ctx.req));
+      runtime.json(ctx, 200, createGitBranch(body.cwd, body.branch, { checkout: body.checkout !== false, startPoint: body.startPoint }));
+    } catch (err) {
+      const status = err?.code === "DIRTY_WORKTREE" ? 409 : 400;
+      runtime.json(ctx, status, { error: err?.message || String(err), dirty: err?.code === "DIRTY_WORKTREE" });
+    }
+    return true;
+  }
+
   return false;
 }
 
 export const workspaceChangesInternals = {
   listWorkspaceChanges,
   revertWorkspaceChanges,
-  parseStatusEntries
+  parseStatusEntries,
+  listGitBranches,
+  checkoutGitBranch,
+  createGitBranch
 };

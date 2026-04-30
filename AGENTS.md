@@ -25,8 +25,13 @@
 ## Engineering Rules
 
 - Prefer minimal, local changes.
+- 任何代码改动默认同时考虑：架构边界、长期维护、文件体量、复用空间；不要为了赶功能把复杂逻辑继续堆进一个超大文件。
+- 前后端代码默认模块化：避免把会话流、接口拼装、渲染逻辑、状态管理长期堆在单个大文件里；新增逻辑优先按职责拆成可复用模块、组件、工具函数或服务层。
+- 发现通用逻辑时，优先抽公共函数或组件，命名与边界要服务复用、维护和测试，而不是只为当前页面临时拼接。
+- 当单文件已经明显偏大或职责超过单一边界时，后续改动应优先先拆再改，不能继续在原文件上打补丁式扩张。
 - Avoid broad refactors unless explicitly requested.
 - Validate changes with the smallest relevant checks before closing a task.
+- 单元测试是行为契约，默认新增/补齐用例来覆盖改动，不要为了让改动通过而轻易修改既有测试；只有在需求或真实行为发生变化时，才允许连同测试一起调整，并在交付里说明原因。
 - Do not include secrets, personal paths, screenshots, temp files, or local debug artifacts in commits.
 
 ## Git Rules

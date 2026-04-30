@@ -47,6 +47,10 @@ npm run check
 ## Scope Guidelines
 
 - Prefer minimal, local changes.
+- Every code change should consider architecture boundaries, maintainability, file size, and reuse up front; do not keep expanding already oversized files with patch-on-patch logic.
+- Keep frontend and backend code modular by default: if logic is reusable or independently testable, extract it into a focused component, helper, service, or route module instead of growing one large file.
+- If a file is already clearly oversized or mixes multiple responsibilities, prefer splitting it before adding more behavior.
+- Treat tests as contracts. Add or extend unit tests for behavior changes, and do not casually rewrite existing test cases just to fit an implementation; only update them when the intended behavior truly changed.
 - Do not include secrets, personal paths, or local debug artifacts in commits.
 - Keep `web/dist/` out of git history (already ignored).
 

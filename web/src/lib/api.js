@@ -116,6 +116,25 @@ export async function requestWorkspaceChanges(cwd) {
   return request(`/api/workspace-changes?${params.toString()}`);
 }
 
+export async function requestWorkspaceGit(cwd) {
+  const params = new URLSearchParams({ cwd: String(cwd || "") });
+  return request(`/api/workspace-git?${params.toString()}`);
+}
+
+export async function requestWorkspaceGitCheckout(cwd, branch) {
+  return request("/api/workspace-git/checkout", {
+    method: "POST",
+    body: JSON.stringify({ cwd, branch })
+  });
+}
+
+export async function requestWorkspaceGitBranchCreate(cwd, branch) {
+  return request("/api/workspace-git/branches", {
+    method: "POST",
+    body: JSON.stringify({ cwd, branch, checkout: true })
+  });
+}
+
 export async function revertWorkspaceChanges(cwd, paths = []) {
   return request("/api/workspace-changes/revert", {
     method: "POST",
@@ -175,6 +194,19 @@ function parseSseEvent(block) {
   return event;
 }
 
+function yieldToRenderer() {
+  if (typeof window === "undefined") {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => resolve());
+      return;
+    }
+    window.setTimeout(resolve, 0);
+  });
+}
+
 export async function requestSessionInputStream(sessionId, body, { onPayload, signal } = {}) {
   const id = String(sessionId || "").trim();
   if (!id) {
@@ -229,9 +261,21 @@ export async function requestSessionInputStream(sessionId, body, { onPayload, si
       }
       if (typeof onPayload === "function") {
         onPayload(payload, event.event || payload?.type || "");
+        await yieldToRenderer();
       }
     }
   }
+}
+
+export async function requestSessionInput(sessionId, body) {
+  const id = String(sessionId || "").trim();
+  if (!id) {
+    throw new Error("Session id is required");
+  }
+  return request(`/api/sessions/${encodeURIComponent(id)}/input`, {
+    method: "POST",
+    body: JSON.stringify(body || {})
+  });
 }
 
 export async function requestThreadInputStream(provider, threadId, body, { onPayload, signal } = {}) {
@@ -289,7 +333,41 @@ export async function requestThreadInputStream(provider, threadId, body, { onPay
       }
       if (typeof onPayload === "function") {
         onPayload(payload, event.event || payload?.type || "");
+        await yieldToRenderer();
       }
     }
   }
+}
+
+export async function requestThreadInput(provider, threadId, body) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    throw new Error("Thread id is required");
+  }
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/input`, {
+    method: "POST",
+    body: JSON.stringify(body || {})
+  });
+}
+
+export async function requestThreadComposerState(provider, threadId) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    throw new Error("Thread id is required");
+  }
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state`);
+}
+
+export async function patchThreadComposerState(provider, threadId, patch = {}) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    throw new Error("Thread id is required");
+  }
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state`, {
+    method: "PATCH",
+    body: JSON.stringify(patch || {})
+  });
 }

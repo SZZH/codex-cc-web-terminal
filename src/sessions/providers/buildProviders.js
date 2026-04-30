@@ -1,4 +1,5 @@
 import path from "node:path";
+import { buildCodexPermissionArgs } from "../shared/composerOptions.js";
 
 function quotePosix(value) {
   return `'${String(value || "").replace(/'/g, "'\\''")}'`;
@@ -62,9 +63,10 @@ export function buildProviders(config) {
   const ccBootstrapNames = uniqueStrings(["cc", "claude", commandBaseName(config.ccBin)]);
   const codexModelOptions = uniqueTrimmedStrings([config.codexModel, ...(config.codexModels || [])]);
   const ccModelOptions = uniqueTrimmedStrings([config.ccModel, ...(config.ccModels || [])]);
-  const codexArgs = ({ resumeSessionId, model }) => {
+  const codexArgs = ({ resumeSessionId, model, permissionMode }) => {
     const args = [];
     const selectedModel = selectModel(model, config.codexModel);
+    const isResume = Boolean(String(resumeSessionId || "").trim());
     if (resumeSessionId) {
       args.push("resume", "--all", resumeSessionId);
     }
@@ -77,8 +79,8 @@ export function buildProviders(config) {
     if (config.codexNoAltScreen) {
       args.push("--no-alt-screen");
     }
-    if (config.codexFullAccess) {
-      args.push("--dangerously-bypass-approvals-and-sandbox");
+    if (!isResume) {
+      args.push(...buildCodexPermissionArgs(permissionMode || "default", config));
     }
     if (config.codexExtraArgs.length > 0) {
       args.push(...config.codexExtraArgs);
@@ -118,14 +120,14 @@ export function buildProviders(config) {
       bootstrapNames: codexBootstrapNames,
       defaultModel: config.codexModel,
       models: codexModelOptions,
-      buildSpawnSpec({ resumeSessionId, model }) {
+      buildSpawnSpec({ resumeSessionId, model, permissionMode }) {
         return {
           file: config.codexBin,
-          args: codexArgs({ resumeSessionId, model })
+          args: codexArgs({ resumeSessionId, model, permissionMode })
         };
       },
-      buildCommand({ resumeSessionId, model }) {
-        const parts = [config.codexBin, ...codexArgs({ resumeSessionId, model })];
+      buildCommand({ resumeSessionId, model, permissionMode }) {
+        const parts = [config.codexBin, ...codexArgs({ resumeSessionId, model, permissionMode })];
         return buildShellCommand(parts, config.shellQuoteStyle);
       }
     },

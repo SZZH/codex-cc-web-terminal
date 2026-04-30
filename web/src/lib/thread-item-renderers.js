@@ -8,6 +8,14 @@ function compactText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function truncateText(value, maxLength = 160) {
+  const text = String(value || "").trim();
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
 function preserveBlockText(value) {
   return String(value || "")
     .replace(/\r\n/g, "\n")
@@ -81,6 +89,20 @@ const STATUS_LABELS = {
   canceled: "已取消",
   pending: "等待中"
 };
+
+const DIAGNOSTIC_DUMP_PATTERNS = [
+  /history:codex:/i,
+  /threadSnapshot/i,
+  /conversation\.turns/i,
+  /rollout-\d{4}-\d{2}-\d{2}T/i,
+  /"\s*kind\s*":\s*"UserMessage"/i,
+  /"\s*kind\s*":\s*"AgentMessage"/i,
+  /"\s*role\s*":\s*"assistant"/i,
+  /"\s*role\s*":\s*"user"/i,
+  /\/Users\/[^/\n]+\/\.codex\/sessions\//,
+  /Codex 会话权限同步并改为只读展示/,
+  /fatal: Unable to create '.git\/index\.lock'/i
+];
 
 export function inferThreadItemKind(item = {}) {
   const directKind = normalizeKind(firstDefined(item.kind, item.itemKind, item.item_type, item.type));
@@ -330,6 +352,29 @@ function buildBody(kind, item = {}, payload = {}) {
   ]);
 }
 
+function detectDiagnosticDump(kind, body = "", summary = "") {
+  if (kind !== "commandexecution" && kind !== "dynamictoolcall" && kind !== "mcptoolcall") {
+    return false;
+  }
+  const text = `${String(summary || "").trim()}\n${String(body || "").trim()}`.trim();
+  if (!text) {
+    return false;
+  }
+  const lineCount = text.split(/\r?\n/).length;
+  return lineCount >= 8 && DIAGNOSTIC_DUMP_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function buildDiagnosticSummary(body = "", summary = "") {
+  const compactBody = compactText(body);
+  if (/git commit/i.test(body) && /\.git\/index\.lock/i.test(body)) {
+    return "Git 提交失败调试输出";
+  }
+  if (/history:codex:/i.test(body) || /threadSnapshot/i.test(body) || /conversation\.turns/i.test(body)) {
+    return "会话历史调试输出";
+  }
+  return truncateText(summary || compactBody || "调试输出", 48);
+}
+
 export function getThreadItemCategory(item = {}) {
   const kind = inferThreadItemKind(item);
   if (USER_KINDS.has(kind)) {
@@ -351,6 +396,7 @@ export function normalizeThreadItem(item = {}, options = {}) {
   const category = getThreadItemCategory(item);
   const body = buildBody(kind, item, payload);
   const summary = extractSummary(kind, item, payload);
+  const isDiagnosticDump = detectDiagnosticDump(kind, body, summary);
   const imageItems = extractImageItems(item, payload);
   const imageUrl = imageItems[0]?.url || "";
   const imageAlt = imageItems[0]?.alt || extractImageAlt(item, payload);
@@ -364,7 +410,11 @@ export function normalizeThreadItem(item = {}, options = {}) {
     status,
     statusLabel: humanizeStatus(status),
     title: DISPLAY_LABELS[kind] || DISPLAY_LABELS.unknown,
-    summary: compactText(summary) === compactText(body) ? "" : summary,
+    summary: isDiagnosticDump
+      ? buildDiagnosticSummary(body, summary)
+      : compactText(summary) === compactText(body)
+        ? ""
+        : summary,
     body,
     imageUrl,
     imageAlt,
@@ -372,6 +422,7 @@ export function normalizeThreadItem(item = {}, options = {}) {
     details: [],
     timestamp: firstDefined(item.timestamp, item.ts, payload?.timestamp, payload?.ts, ""),
     isUnknown: kind === "unknown",
+    isDiagnosticDump,
     isLiveOverlay: Boolean(options.isLiveOverlay || item.isLiveOverlay),
     speakerName:
       category === "user"
@@ -388,13 +439,16 @@ export function summarizeProcessItems(items = []) {
     fileChange: 0,
     tool: 0,
     collab: 0,
-    other: 0
+    other: 0,
+    diagnosticDump: 0
   };
 
   for (const item of items) {
     counts.total += 1;
     const kind = inferThreadItemKind(item);
-    if (kind === "reasoning") {
+    if (item?.isDiagnosticDump) {
+      counts.diagnosticDump += 1;
+    } else if (kind === "reasoning") {
       counts.reasoning += 1;
     } else if (kind === "commandexecution") {
       counts.command += 1;
@@ -415,6 +469,7 @@ export function summarizeProcessItems(items = []) {
   if (counts.fileChange) parts.push(`文件 ${counts.fileChange}`);
   if (counts.tool) parts.push(`工具 ${counts.tool}`);
   if (counts.collab) parts.push(`子代理 ${counts.collab}`);
+  if (counts.diagnosticDump) parts.push(`调试输出 ${counts.diagnosticDump}`);
   if (counts.other) parts.push(`其他 ${counts.other}`);
 
   return {

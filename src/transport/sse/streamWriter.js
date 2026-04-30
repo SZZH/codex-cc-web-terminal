@@ -7,13 +7,26 @@ function normalizeTypedTransportPayload(payload = {}) {
   const typedEvents = new Set([
     "thread.snapshot",
     "thread.overlay",
+    "conversation.snapshot",
+    "conversation.delta",
     "canonical.event",
     "keepalive",
     "error",
     "message.delta",
     "message.completed",
+    "reasoning.started",
+    "reasoning.delta",
+    "reasoning.completed",
+    "process.started",
+    "process.delta",
+    "process.completed",
     "session.updated",
+    "thread.status.updated",
+    "thread.metrics.updated",
+    "turn.started",
     "turn.completed",
+    "turn.failed",
+    "turn.interrupted",
     "transport.error"
   ]);
 
@@ -26,6 +39,14 @@ function normalizeTypedTransportPayload(payload = {}) {
       event: SSE_TRANSPORT_EVENTS.SNAPSHOT,
       payload,
       id: payload.version || undefined
+    };
+  }
+
+  if (type === "conversation.snapshot" || type === "conversation.delta") {
+    return {
+      event: type,
+      payload,
+      id: payload.toVersion || payload.version || payload?.conversation?.version || undefined
     };
   }
 
@@ -45,6 +66,22 @@ function normalizeTypedTransportPayload(payload = {}) {
     };
   }
 
+  if (type === "reasoning.started" || type === "reasoning.delta" || type === "reasoning.completed") {
+    return {
+      event: type,
+      payload,
+      id: payload?.ts || undefined
+    };
+  }
+
+  if (type === "process.started" || type === "process.delta" || type === "process.completed") {
+    return {
+      event: type,
+      payload,
+      id: payload?.ts || undefined
+    };
+  }
+
   if (type === "session.updated") {
     return {
       event: "session.updated",
@@ -55,9 +92,25 @@ function normalizeTypedTransportPayload(payload = {}) {
 
   if (type === "turn.completed") {
     return {
-      event: "turn.completed",
+      event: type,
       payload,
       id: payload?.turnId || payload?.ts || undefined
+    };
+  }
+
+  if (type === "turn.started" || type === "turn.failed" || type === "turn.interrupted") {
+    return {
+      event: type,
+      payload,
+      id: payload?.turnId || payload?.ts || undefined
+    };
+  }
+
+  if (type === "thread.status.updated" || type === "thread.metrics.updated") {
+    return {
+      event: type,
+      payload,
+      id: payload?.ts || undefined
     };
   }
 
