@@ -9,9 +9,9 @@ import {
   requestHistoryMessages,
   patchThreadComposerState,
   requestSessionById,
-  requestSessionInputStream,
+  requestSessionInput,
   requestThreadComposerState,
-  requestThreadInputStream,
+  requestThreadInput,
   requestWorkspaceGit,
   requestWorkspaceGitBranchCreate,
   requestWorkspaceGitCheckout
@@ -138,8 +138,29 @@ const {
   threadMismatch,
   canRenderChatView
 } = selectors;
+function isDisplayedThreadRunning(snapshot = null) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return false;
+  }
+  if (String(snapshot.status || "").trim().toLowerCase() === "running") {
+    return true;
+  }
+  if (String(snapshot.activeTurnId || "").trim()) {
+    return true;
+  }
+  return (Array.isArray(snapshot.turns) ? snapshot.turns : []).some((turn) => {
+    const status = String(turn?.status || turn?.assistant?.status || "").trim().toLowerCase();
+    return status === "running" || status === "inprogress" || status === "in_progress";
+  });
+}
 const canSend = computed(() => {
   if (state.loading || !Boolean(activeThreadId.value || displayedSessionMeta.value)) {
+    return false;
+  }
+  if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
+    return false;
+  }
+  if (isDisplayedThreadRunning(displayedThreadSnapshot.value)) {
     return false;
   }
   return canSendComposerMessage(composerDraft.value, composerOptions.value.attachments || []);
@@ -155,6 +176,9 @@ const canInterrupt = computed(() => {
     return true;
   }
   if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
+    return true;
+  }
+  if (isDisplayedThreadRunning(displayedThreadSnapshot.value)) {
     return true;
   }
   if (String(state.liveView.streamBuffer || "").trim()) {
@@ -435,6 +459,7 @@ const {
   refreshSessions,
   stopHistorySyncLoop,
   startHistorySyncLoop,
+  syncActiveThreadSession,
   openSessionItem,
   createSessionInGroup,
   ensureLiveSession,
@@ -597,7 +622,6 @@ async function submitInput() {
   try {
     state.loading = true;
     setStatus("正在发送…");
-    stopHistorySyncLoop();
     closeSocket({ silent: true });
     if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
       throw new Error(
@@ -633,37 +657,17 @@ async function submitInput() {
       state.liveView.replayGuardPrompt = submissionText;
     }
     setStatus("等待 Codex 回复…");
-    state.liveView.activeInputStream = true;
     if (targetThreadId) {
-      await requestThreadInputStream(
+      await requestThreadInput(
         targetProvider,
         targetThreadId,
-        requestBody,
-        {
-          onPayload(payload) {
-            handleLivePayload(payload);
-          }
-        }
+        requestBody
       );
     } else {
-      await requestSessionInputStream(
+      await requestSessionInput(
         liveSessionId,
-        requestBody,
-        {
-          onPayload(payload) {
-            handleLivePayload(payload);
-          }
-        }
+        requestBody
       );
-    }
-    const finalPayload = targetThreadId
-      ? await requestConversationSnapshotByThread(targetProvider, targetThreadId)
-      : await requestConversationSnapshotBySessionId(liveSessionId);
-    if (finalPayload) {
-      handleLivePayload(finalPayload);
-    }
-    if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
-      setStatus("");
     }
   } catch (error) {
     updateComposerOptions({ attachments: attachmentsSnapshot });
@@ -680,8 +684,9 @@ async function submitInput() {
     }
     setStatus(error.message || String(error));
   } finally {
-    state.liveView.activeInputStream = false;
     state.loading = false;
+    await syncActiveThreadSession({ silent: true }).catch(() => {});
+    startHistorySyncLoop();
   }
 }
 
@@ -714,25 +719,15 @@ async function interruptActiveSession() {
     closeSocket({ silent: true });
     setStatus("已发送中断指令。");
     if (targetThreadId) {
-      await requestThreadInputStream(
+      await requestThreadInput(
         targetProvider,
         targetThreadId,
-        { type: "interrupt", reason: "user_interrupt" },
-        {
-          onPayload(payload) {
-            handleLivePayload(payload);
-          }
-        }
+        { type: "interrupt", reason: "user_interrupt" }
       );
     } else {
-      await requestSessionInputStream(
+      await requestSessionInput(
         liveSessionId,
-        { type: "interrupt", reason: "user_interrupt" },
-        {
-          onPayload(payload) {
-            handleLivePayload(payload);
-          }
-        }
+        { type: "interrupt", reason: "user_interrupt" }
       );
     }
   } catch (error) {
@@ -869,12 +864,6 @@ if (typeof window !== 'undefined') {
 
     <template v-else>
       <section v-if="route.name === 'sessions'" class="mobile-shell">
-        <header class="mobile-header list">
-          <div class="header-copy">
-            <h1>会话</h1>
-          </div>
-        </header>
-
         <SessionListView
           :groups="groupedSessions"
           :active-session-id="state.routeSessionId"

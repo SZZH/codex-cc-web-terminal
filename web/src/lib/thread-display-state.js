@@ -403,7 +403,7 @@ function mergeLiveConversationIntoSnapshot(snapshot, conversation, liveSessionMe
     }
     const existingIndex = nextTurns.findIndex((turn) => String(turn?.id || "") === mappedTurn.id);
     if (existingIndex >= 0) {
-      if (preserveExistingTurns && extractTurnAssistantText(nextTurns[existingIndex])) {
+      if ((preserveExistingTurns || isTerminalThreadTurn(nextTurns[existingIndex])) && extractTurnAssistantText(nextTurns[existingIndex])) {
         continue;
       }
       nextTurns[existingIndex] = mergeThreadTurns(nextTurns[existingIndex], mappedTurn);
@@ -411,7 +411,7 @@ function mergeLiveConversationIntoSnapshot(snapshot, conversation, liveSessionMe
     }
     const equivalentIndex = nextTurns.findIndex((turn) => areEquivalentTurns(turn, mappedTurn));
     if (equivalentIndex >= 0) {
-      if (preserveExistingTurns && extractTurnAssistantText(nextTurns[equivalentIndex])) {
+      if ((preserveExistingTurns || isTerminalThreadTurn(nextTurns[equivalentIndex])) && extractTurnAssistantText(nextTurns[equivalentIndex])) {
         continue;
       }
       nextTurns[equivalentIndex] = mergeThreadTurns(nextTurns[equivalentIndex], mappedTurn);
@@ -501,7 +501,32 @@ function isTerminalUserOnlyTurn(turn = {}) {
   if (items.length !== 1) {
     return false;
   }
-  return String(items[0]?.kind || "").trim() === "UserMessage";
+  const item = items[0] || {};
+  const content = Array.isArray(item?.payload?.content) ? item.payload.content : [];
+  const hasNonTextContent = content.some((part) => String(part?.type || "").trim() && !/text/i.test(String(part?.type || "")));
+  return String(item?.kind || "").trim() === "UserMessage" && !hasNonTextContent;
+}
+
+function isTerminalThreadTurn(turn = {}) {
+  return ["completed", "failed", "aborted", "interrupted"].includes(String(turn?.status || "").trim().toLowerCase());
+}
+
+function isLiveConversationActive(conversation) {
+  if (!conversation || typeof conversation !== "object") {
+    return false;
+  }
+  if (String(conversation.status || "").toLowerCase() === "running") {
+    return true;
+  }
+  const activeTurnId = String(conversation.activeTurnId || "").trim();
+  return Boolean(
+    activeTurnId ||
+      (Array.isArray(conversation.turns) &&
+        conversation.turns.some((turn) => {
+          const status = String(turn?.assistant?.status || turn?.status || "").toLowerCase();
+          return status === "running" || status === "inprogress" || status === "in_progress";
+        }))
+  );
 }
 
 export function buildDisplayedThreadSnapshot({
@@ -540,7 +565,7 @@ export function buildDisplayedThreadSnapshot({
   const canMergeLiveConversation = includeLiveConversation;
   if (canMergeLiveConversation && liveConversation && Array.isArray(liveConversation.turns) && liveConversation.turns.length) {
     snapshot = mergeLiveConversationIntoSnapshot(snapshot, liveConversation, liveSessionMeta || { resumeSessionId: resolvedThreadId }, {
-      preserveExistingTurns: hasAuthoritativeSnapshot
+      preserveExistingTurns: hasAuthoritativeSnapshot && !isLiveConversationActive(liveConversation)
     });
   }
 
@@ -585,11 +610,15 @@ export function shouldSyncPersistedThread({
   threadMeta = null,
   liveSessionId = "",
   liveSessionMeta = null,
-  hasAuthoritativeLiveData = false
+  hasAuthoritativeLiveData = false,
+  forceSync = false
 } = {}) {
   const targetThreadId = String(routeThreadId || threadMeta?.resumeSessionId || "").trim();
   if (!targetThreadId) {
     return false;
+  }
+  if (forceSync) {
+    return true;
   }
   if (!String(liveSessionId || "").trim()) {
     return true;

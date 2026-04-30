@@ -187,6 +187,6 @@ export class CodexSidebarService {
         String(right.updatedAt).localeCompare(String(left.updatedAt))
       );
       return group;
-    }).filter((group) => group.sessions.length > 0);
+    });
   }
 }

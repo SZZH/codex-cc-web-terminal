@@ -172,7 +172,8 @@ test("listProjectGroups sorts groups by latest session activity including live s
   const groups = manager.listProjectGroups();
 
   assert.deepEqual(groups.map((group) => group.name), ["alpha", "beta"]);
-  assert.deepEqual(groups[0].sessions.map((session) => session.name), ["alpha live", "旧 alpha"]);
+  assert.deepEqual(groups[0].sessions.map((session) => session.name), ["alpha live"]);
+  assert.deepEqual(groups[1].sessions, []);
 });
 
 test("listSidebarSnapshot reuses project groups and appends unmatched live sessions", () => {
@@ -230,7 +231,7 @@ test("listSidebarSnapshot reuses project groups and appends unmatched live sessi
   assert.equal(snapshot.sessions[0].name, "gamma live");
 });
 
-test("listSidebarSnapshot excludes stale sessions older than two weeks but keeps running live sessions", () => {
+test("listSidebarSnapshot excludes archived sessions and sessions not used within seven days", () => {
   const realNow = Date.now;
   Date.now = () => Date.parse("2026-04-29T12:00:00.000Z");
   try {
@@ -298,11 +299,16 @@ test("listSidebarSnapshot excludes stale sessions older than two weeks but keeps
     live.updatedAt = "2026-04-01T10:00:00.000Z";
     live.status = "running";
 
+    const archivedLive = manager.get(manager.create({ provider: "codex", cwd: alphaRoot, name: "archived live" }).id);
+    archivedLive.updatedAt = "2026-04-25T10:00:00.000Z";
+    archivedLive.status = "archived";
+
     const snapshot = manager.listSidebarSnapshot();
 
-    assert.deepEqual(snapshot.projectGroups[0].sessions.map((session) => session.name), ["recent history", "running live"]);
+    assert.deepEqual(snapshot.projectGroups[0].sessions.map((session) => session.name), ["recent history"]);
     assert.equal(snapshot.sessions.some((session) => session.name === "old history"), false);
-    assert.equal(snapshot.sessions.some((session) => session.name === "running live"), true);
+    assert.equal(snapshot.sessions.some((session) => session.name === "running live"), false);
+    assert.equal(snapshot.sessions.some((session) => session.name === "archived live"), false);
   } finally {
     Date.now = realNow;
   }
@@ -543,7 +549,13 @@ test("codex live session auto-renames and streams app-server replies", async () 
   assert.equal(live.name, "整理一个回归测试计划");
   assert.equal(live.titleSource, "first_user_input");
   assert.match(live.buffer, /reply:整理一个回归测试计划/);
-  assert.ok(sentPayloads.some((payload) => payload.type === "message_part"));
+  assert.ok(
+    sentPayloads.some(
+      (payload) =>
+        payload.type === "conversation.delta" &&
+        (payload.deltas || []).some((delta) => delta.kind === "body_appended" && /reply:整理一个回归测试计划/.test(delta.block?.text || ""))
+    )
+  );
   assert.equal(live.turnRunning, false);
   assert.equal(live.conversationState.turns[0].assistant.status, "completed");
   assert.ok(
@@ -870,6 +882,7 @@ test("app-server message delta notifications emit typed message events directly"
 
   const live = manager.get(session.id);
   live.currentTurnId = manager.createConversationTurn(live, "测试文本增量", "2026-04-14T00:00:00.000Z");
+  const payloadCountBeforeDelta = sentPayloads.length;
 
   manager.handleAppServerNotification({
     method: "item/agentMessage/delta",
@@ -881,6 +894,15 @@ test("app-server message delta notifications emit typed message events directly"
   });
 
   assert.ok(sentPayloads.some((payload) => payload.type === "message.delta" && payload.text === "第一段增量"));
+  const streamingDeltaPayload = sentPayloads.find(
+    (payload) =>
+      payload.type === "conversation.delta" &&
+      payload.deltas?.some((delta) => delta.kind === "body_appended" && delta.block?.text === "第一段增量")
+  );
+  assert.ok(streamingDeltaPayload);
+  assert.equal(Object.prototype.hasOwnProperty.call(streamingDeltaPayload, "conversation"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(streamingDeltaPayload, "threadSnapshot"), false);
+  assert.equal(sentPayloads.slice(payloadCountBeforeDelta).some((payload) => payload.type === "conversation.snapshot"), false);
   assert.ok(
     sentPayloads.some(
       (payload) =>
@@ -896,7 +918,7 @@ test("app-server message delta notifications emit typed message events directly"
   );
 });
 
-test("app-server message delta without a server turn id does not write conversation.delta to the current turn", () => {
+test("app-server message delta without a server turn id streams into the active pending turn", () => {
   const { manager } = createManager();
   const session = manager.create({ provider: "codex", cwd: process.cwd(), resumeSessionId: "thread-missing-turn-id-events" });
   const live = manager.get(session.id);
@@ -920,8 +942,8 @@ test("app-server message delta without a server turn id does not write conversat
     }
   });
 
-  assert.equal(live.conversationState.turns[0].assistant.body.length, 0);
-  assert.equal(
+  assert.equal(live.conversationState.turns[0].assistant.body[0].text, "不能写到 current turn");
+  assert.ok(
     sentPayloads.some(
       (payload) =>
         payload.type === "conversation.delta" &&
@@ -931,8 +953,7 @@ test("app-server message delta without a server turn id does not write conversat
             delta.turnId === live.currentTurnId &&
             delta.block?.text === "不能写到 current turn"
         )
-    ),
-    false
+    )
   );
 });
 
@@ -1814,11 +1835,9 @@ test("codex sidebar keeps all non-archived threads and empty saved projects", ()
     groups[0].sessions.map((session) => session.name),
     ["回复在吗"]
   );
-  assert.equal(groups[1].sessions.length, 1);
+  assert.deepEqual(groups[1].sessions, []);
   assert.equal(groups[1].collapsed, true);
-  assert.equal(groups[1].sessions[0].name, "旧 project-b 线程");
-  assert.equal(groups[2].sessions.length, 1);
-  assert.equal(groups[2].sessions[0].name, "旧 ai 线程");
+  assert.deepEqual(groups[2].sessions, []);
   assert.equal(groups[3].sessions.length, 1);
   assert.equal(groups[3].sessions[0].name, "改为透传");
 });

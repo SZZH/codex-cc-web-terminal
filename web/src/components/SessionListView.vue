@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, ref, watch } from "vue";
+import { ref, watch } from "vue";
 
 const props = defineProps({
   groups: { type: Array, default: () => [] },
@@ -10,11 +10,6 @@ const props = defineProps({
 
 const emit = defineEmits(["open", "create-group-session"]);
 const expandedGroups = ref(new Set());
-const openMenuGroupName = ref("");
-const openMenuPoint = ref({ x: 0, y: 0 });
-const longPressTimer = ref(null);
-const longPressGroupName = ref("");
-const suppressToggleUntil = ref(0);
 
 function buildInitialExpandedSet(groups, activeSessionId) {
   const next = new Set();
@@ -50,9 +45,6 @@ function isExpanded(name) {
 }
 
 function toggleGroup(name) {
-  if (Date.now() < suppressToggleUntil.value) {
-    return;
-  }
   const next = new Set(expandedGroups.value);
   if (next.has(name)) {
     next.delete(name);
@@ -69,106 +61,53 @@ function groupSubtitle(group) {
   return latestText ? `最近 ${latestText}` : count ? `${count} 个会话` : "";
 }
 
-function closeMenu() {
-  openMenuGroupName.value = "";
-}
-
-function clearLongPressTimer() {
-  if (longPressTimer.value) {
-    window.clearTimeout(longPressTimer.value);
-    longPressTimer.value = null;
-  }
-}
-
-function onGroupPointerDown(group, event) {
-  const clientX = Number(event?.clientX || 0);
-  const clientY = Number(event?.clientY || 0);
-  openMenuPoint.value = { x: clientX, y: clientY };
-  clearLongPressTimer();
-  longPressGroupName.value = group.name;
-  longPressTimer.value = window.setTimeout(() => {
-    openMenuGroupName.value = group.name;
-    suppressToggleUntil.value = Date.now() + 260;
-    longPressTimer.value = null;
-  }, 500);
-}
-
-function onGroupPointerUp() {
-  clearLongPressTimer();
-}
-
-function onGlobalPointerDown(event) {
-  if (!openMenuGroupName.value) {
-    return;
-  }
-  const target = event.target;
-  if (!(target instanceof Element)) {
-    closeMenu();
-    return;
-  }
-  if (target.closest(".group-action-popover")) {
-    return;
-  }
-  closeMenu();
+function isCreatingGroup(group) {
+  const cwd = String(group?.cwd || "").trim();
+  return Boolean(cwd && props.pendingSessionId === `__creating__:${cwd}`);
 }
 
 function createGroupSession(group) {
-  if (!group) {
-    closeMenu();
+  if (!group || isCreatingGroup(group)) {
     return;
   }
-  closeMenu();
   emit("create-group-session", group);
 }
-
-function menuStyle() {
-  const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 390;
-  const x = Number(openMenuPoint.value?.x || 0);
-  const y = Number(openMenuPoint.value?.y || 0);
-  const clampedX = Math.max(12, Math.min(x, viewportWidth - 12));
-  return {
-    left: `${clampedX}px`,
-    top: `${Math.max(8, y - 10)}px`
-  };
-}
-
-if (typeof window !== "undefined") {
-  window.addEventListener("pointerdown", onGlobalPointerDown, true);
-}
-
-onBeforeUnmount(() => {
-  clearLongPressTimer();
-  if (typeof window !== "undefined") {
-    window.removeEventListener("pointerdown", onGlobalPointerDown, true);
-  }
-});
 </script>
 
 <template>
   <main class="session-screen">
     <section v-if="groups.length" class="session-groups">
       <section v-for="group in groups" :key="group.name" class="session-group">
-        <button
-          class="session-group-head"
-          type="button"
-          @click="toggleGroup(group.name)"
-          @pointerdown="onGroupPointerDown(group, $event)"
-          @pointerup="onGroupPointerUp"
-          @pointercancel="onGroupPointerUp"
-          @pointerleave="onGroupPointerUp"
-        >
-          <div class="session-group-head-main">
-            <span class="folder-icon" aria-hidden="true"></span>
-            <div class="session-group-copy">
-              <div class="session-group-title-row">
-                <h2>{{ group.name }}</h2>
-                <span class="session-group-count">{{ group.sessions.length }}</span>
+        <div class="session-group-head">
+          <button
+            class="session-group-toggle-area"
+            type="button"
+            @click="toggleGroup(group.name)"
+          >
+            <div class="session-group-head-main">
+              <span class="folder-icon" aria-hidden="true"></span>
+              <div class="session-group-copy">
+                <div class="session-group-title-row">
+                  <h2>{{ group.name }}</h2>
+                  <span class="session-group-count">{{ group.sessions.length }}</span>
+                </div>
+                <p class="session-group-subtitle">{{ groupSubtitle(group) }}</p>
               </div>
-              <p class="session-group-subtitle">{{ groupSubtitle(group) }}</p>
             </div>
-          </div>
-          <span class="session-group-toggle" :class="{ expanded: isExpanded(group.name) }" aria-hidden="true">⌄</span>
-        </button>
+          </button>
+          <button
+            class="session-group-add"
+            :class="{ loading: isCreatingGroup(group) }"
+            type="button"
+            :aria-label="`在 ${group.name} 新增会话`"
+            title="新增会话"
+            :disabled="isCreatingGroup(group)"
+            :aria-busy="isCreatingGroup(group) ? 'true' : undefined"
+            @click.stop="createGroupSession(group)"
+          >
+            <span class="session-group-add-label" aria-hidden="true">+</span>
+          </button>
+        </div>
         <div v-show="isExpanded(group.name)" class="session-group-body">
           <p v-if="!group.sessions.length" class="session-row-placeholder">暂无对话</p>
           <button
@@ -187,20 +126,6 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </section>
-    <div
-      v-if="openMenuGroupName"
-      class="group-action-popover floating"
-      :style="menuStyle()"
-    >
-      <button
-        type="button"
-        class="group-action-btn"
-        @click.stop="createGroupSession(groups.find((item) => item.name === openMenuGroupName))"
-      >
-        新增会话
-      </button>
-    </div>
-
     <div v-if="!groups.length" class="empty-state">还没有可展示的会话。</div>
   </main>
 </template>
@@ -230,42 +155,6 @@ onBeforeUnmount(() => {
   box-shadow: 0 12px 30px rgba(120, 101, 84, 0.05);
 }
 
-.group-action-popover {
-  position: absolute;
-  left: 14px;
-  top: 8px;
-  transform: translateY(-100%);
-  z-index: 5;
-  border: 1px solid rgba(206, 193, 179, 0.78);
-  border-radius: 12px;
-  background: rgba(255, 252, 248, 0.98);
-  box-shadow: 0 14px 26px rgba(84, 72, 58, 0.16);
-  padding: 6px;
-}
-
-.group-action-popover.floating {
-  position: fixed;
-  z-index: 2200;
-  transform: translate(-50%, -100%);
-}
-
-.group-action-btn {
-  border: 0;
-  border-radius: 9px;
-  background: transparent;
-  color: rgba(70, 58, 47, 0.95);
-  font-size: 13px;
-  line-height: 1.2;
-  font-weight: 600;
-  padding: 8px 10px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.group-action-btn:active {
-  background: rgba(171, 149, 126, 0.16);
-}
-
 .session-group-head {
   display: flex;
   align-items: center;
@@ -273,7 +162,16 @@ onBeforeUnmount(() => {
   gap: 12px;
   width: 100%;
   padding: 14px 14px 13px;
+}
+
+.session-group-toggle-area {
+  display: flex;
+  align-items: flex-start;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
   border: 0;
+  appearance: none;
   background: transparent;
   color: inherit;
   text-align: left;
@@ -285,14 +183,14 @@ onBeforeUnmount(() => {
     transform 0.16s ease;
 }
 
-.session-group-head:active {
-  background: rgba(161, 145, 129, 0.06);
+.session-group-toggle-area:active {
   transform: translateY(1px);
 }
 
-.session-group-head:focus-visible {
+.session-group-toggle-area:focus-visible {
   outline: 2px solid rgba(182, 160, 139, 0.34);
-  outline-offset: -2px;
+  outline-offset: 2px;
+  border-radius: 14px;
 }
 
 .session-group-head-main {
@@ -377,18 +275,64 @@ onBeforeUnmount(() => {
   line-height: 1.35;
 }
 
-.session-group-toggle {
-  flex: 0 0 auto;
-  align-self: center;
-  color: rgba(143, 127, 113, 0.82);
-  font-size: 15px;
-  line-height: 1;
-  transition: transform 0.2s ease, color 0.16s ease;
+.session-group-add {
+  position: relative;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(205, 193, 181, 0.72);
+  border-radius: 999px;
+  background: rgba(255, 252, 248, 0.86);
+  color: rgba(118, 100, 84, 0.92);
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 26px;
+  text-align: center;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.74);
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease;
 }
 
-.session-group-toggle.expanded {
-  transform: rotate(180deg);
-  color: rgba(155, 133, 112, 0.92);
+.session-group-add:hover {
+  border-color: rgba(178, 158, 138, 0.8);
+  background: rgba(255, 249, 243, 0.98);
+}
+
+.session-group-add:active {
+  transform: translateY(1px);
+}
+
+.session-group-add:focus-visible {
+  outline: 2px solid rgba(182, 160, 139, 0.34);
+  outline-offset: 2px;
+}
+
+.session-group-add:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.session-group-add.loading .session-group-add-label {
+  opacity: 0;
+}
+
+.session-group-add.loading::after {
+  content: "";
+  position: absolute;
+  inset: 7px;
+  border: 2px solid rgba(180, 163, 145, 0.32);
+  border-top-color: rgba(118, 100, 84, 0.92);
+  border-radius: 999px;
+  animation: group-add-spin 0.8s linear infinite;
+}
+
+@keyframes group-add-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .session-group-body {

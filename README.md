@@ -120,6 +120,15 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.3.0`
+
+Core updates since `v0.2.0`:
+
+- Tightened the session list to show only unarchived sessions used within the last 7 days while preserving Codex project groups even when they are empty.
+- Refined the mobile session list UI by removing the redundant title bar, replacing the group affordance with a plus action, and adding loading feedback while a new group session is being created.
+- Simplified the composer running state by hiding the interrupt action for now and locking further input while a submitted turn is still in progress.
+- Improved the input transport path around thread/session input handling, typed deltas, and history synchronization so active conversation state remains consistent after sends.
+
 ### `v0.2.0`
 
 Core updates since `v0.1.0`:

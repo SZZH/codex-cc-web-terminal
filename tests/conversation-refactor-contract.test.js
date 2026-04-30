@@ -243,6 +243,119 @@ test("version-gap payload resyncs to authoritative conversation snapshot instead
   assert.equal(conversation.turns[0].assistant.body[0].text, "同步后的正式答案");
 });
 
+test("version-gap payload still applies the current streaming delta after resync", () => {
+  const current = createConversationState({
+    sessionId: "session-gap-delta",
+    threadId: "thread-gap-delta",
+    version: 1,
+    turns: []
+  });
+
+  const { conversation, resynced } = applyConversationDeltaPayload(current, {
+    sessionId: "session-gap-delta",
+    threadId: "thread-gap-delta",
+    fromVersion: 3,
+    conversation: {
+      sessionId: "session-gap-delta",
+      threadId: "thread-gap-delta",
+      version: 3,
+      status: "running",
+      turns: [
+        {
+          id: "turn-gap-delta",
+          user: { id: "user-gap-delta", text: "继续", ts: "2026-04-29T00:00:00.000Z" },
+          assistant: {
+            status: "running",
+            startedAt: "2026-04-29T00:00:01.000Z",
+            finishedAt: "",
+            process: [],
+            body: []
+          }
+        }
+      ]
+    },
+    deltas: [
+      {
+        kind: "body_appended",
+        turnId: "turn-gap-delta",
+        timestamp: "2026-04-29T00:00:02.000Z",
+        block: {
+          id: "body-gap-delta",
+          kind: "markdown",
+          text: "实时增量",
+          mergeMode: "stream_append",
+          payload: {}
+        }
+      }
+    ]
+  });
+
+  assert.equal(resynced, true);
+  assert.equal(conversation.version, 4);
+  assert.equal(conversation.turns[0].assistant.body[0].text, "实时增量");
+});
+
+test("version-gap payload does not replay deltas already represented in the authoritative conversation", () => {
+  const current = createConversationState({
+    sessionId: "session-gap-replay",
+    threadId: "thread-gap-replay",
+    version: 1,
+    turns: []
+  });
+
+  const { conversation, resynced } = applyConversationDeltaPayload(current, {
+    sessionId: "session-gap-replay",
+    threadId: "thread-gap-replay",
+    fromVersion: 3,
+    conversation: {
+      sessionId: "session-gap-replay",
+      threadId: "thread-gap-replay",
+      version: 4,
+      status: "running",
+      turns: [
+        {
+          id: "turn-gap-replay",
+          user: { id: "user-gap-replay", text: "继续", ts: "2026-04-29T00:00:00.000Z" },
+          assistant: {
+            status: "running",
+            startedAt: "2026-04-29T00:00:01.000Z",
+            finishedAt: "",
+            process: [],
+            body: [
+              {
+                id: "body-gap-replay",
+                kind: "markdown",
+                text: "实时增量",
+                payload: {},
+                ts: "2026-04-29T00:00:02.000Z"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    deltas: [
+      {
+        kind: "body_appended",
+        turnId: "turn-gap-replay",
+        timestamp: "2026-04-29T00:00:02.000Z",
+        block: {
+          id: "body-gap-replay",
+          kind: "markdown",
+          text: "实时增量",
+          mergeMode: "stream_append",
+          payload: {}
+        }
+      }
+    ]
+  });
+
+  assert.equal(resynced, true);
+  assert.equal(conversation.version, 4);
+  assert.equal(conversation.turns[0].assistant.body.length, 1);
+  assert.equal(conversation.turns[0].assistant.body[0].text, "实时增量");
+});
+
 test("server turn id aliases the local optimistic turn before streaming body deltas land", () => {
   let state = createConversationState({
     sessionId: "session-alias",

@@ -194,6 +194,19 @@ function parseSseEvent(block) {
   return event;
 }
 
+function yieldToRenderer() {
+  if (typeof window === "undefined") {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => resolve());
+      return;
+    }
+    window.setTimeout(resolve, 0);
+  });
+}
+
 export async function requestSessionInputStream(sessionId, body, { onPayload, signal } = {}) {
   const id = String(sessionId || "").trim();
   if (!id) {
@@ -248,9 +261,21 @@ export async function requestSessionInputStream(sessionId, body, { onPayload, si
       }
       if (typeof onPayload === "function") {
         onPayload(payload, event.event || payload?.type || "");
+        await yieldToRenderer();
       }
     }
   }
+}
+
+export async function requestSessionInput(sessionId, body) {
+  const id = String(sessionId || "").trim();
+  if (!id) {
+    throw new Error("Session id is required");
+  }
+  return request(`/api/sessions/${encodeURIComponent(id)}/input`, {
+    method: "POST",
+    body: JSON.stringify(body || {})
+  });
 }
 
 export async function requestThreadInputStream(provider, threadId, body, { onPayload, signal } = {}) {
@@ -308,9 +333,22 @@ export async function requestThreadInputStream(provider, threadId, body, { onPay
       }
       if (typeof onPayload === "function") {
         onPayload(payload, event.event || payload?.type || "");
+        await yieldToRenderer();
       }
     }
   }
+}
+
+export async function requestThreadInput(provider, threadId, body) {
+  const providerId = String(provider || "codex").trim().toLowerCase() || "codex";
+  const id = String(threadId || "").trim();
+  if (!id) {
+    throw new Error("Thread id is required");
+  }
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/input`, {
+    method: "POST",
+    body: JSON.stringify(body || {})
+  });
 }
 
 export async function requestThreadComposerState(provider, threadId) {

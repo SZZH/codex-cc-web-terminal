@@ -944,3 +944,71 @@ test("display state does not let live conversation overwrite an existing authori
     ["回复：哈哈哈哈", "哈哈哈哈"]
   );
 });
+
+test("display state lets active live conversation update an existing authoritative turn body", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    authoritativeSnapshot: {
+      threadId: "thread-live-active",
+      metadata: { name: "会话" },
+      turns: [
+        {
+          id: "turn-active",
+          status: "inProgress",
+          startedAt: "2026-04-22T00:00:00.000Z",
+          items: [
+            { id: "u1", kind: "UserMessage", text: "写一段长回复" },
+            { id: "a1", kind: "AgentMessage", text: "第一段" }
+          ]
+        }
+      ],
+      version: 2,
+      updatedAt: "2026-04-22T00:00:05.000Z"
+    },
+    liveConversation: {
+      status: "running",
+      activeTurnId: "turn-active",
+      turns: [
+        {
+          id: "turn-active",
+          user: { text: "写一段长回复", ts: "2026-04-22T00:00:00.000Z" },
+          assistant: {
+            status: "running",
+            startedAt: "2026-04-22T00:00:00.000Z",
+            body: [{ text: "第一段，第二段" }]
+          }
+        }
+      ]
+    },
+    threadId: "thread-live-active",
+    liveSessionMeta: { resumeSessionId: "thread-live-active" },
+    threadMeta: { resumeSessionId: "thread-live-active" }
+  });
+
+  const agentMessage = snapshot.turns[0].items.find((item) => item.kind === "AgentMessage");
+  assert.equal(agentMessage.text, "第一段，第二段");
+});
+
+test("persisted thread sync can be forced while json input waits for history polling", () => {
+  assert.equal(
+    shouldSyncPersistedThread({
+      routeThreadId: "thread-json-input",
+      threadMeta: { resumeSessionId: "thread-json-input" },
+      liveSessionId: "live-json-input",
+      liveSessionMeta: { resumeSessionId: "thread-json-input" },
+      hasAuthoritativeLiveData: true
+    }),
+    false
+  );
+
+  assert.equal(
+    shouldSyncPersistedThread({
+      routeThreadId: "thread-json-input",
+      threadMeta: { resumeSessionId: "thread-json-input" },
+      liveSessionId: "live-json-input",
+      liveSessionMeta: { resumeSessionId: "thread-json-input" },
+      hasAuthoritativeLiveData: true,
+      forceSync: true
+    }),
+    true
+  );
+});

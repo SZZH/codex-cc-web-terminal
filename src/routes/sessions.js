@@ -67,6 +67,23 @@ async function openInputStream(ctx, runtime, session, events) {
   }
 }
 
+function postSessionInput(ctx, runtime, session, events) {
+  try {
+    const { lastInputTurnId } = applySessionInputEvents(runtime.sessionManager, session.id, events);
+    const liveSession = runtime.sessionManager.get(session.id) || session;
+    const serializedSession =
+      typeof runtime.sessionManager.serialize === "function" ? runtime.sessionManager.serialize(liveSession) : liveSession;
+    runtime.json(ctx, 202, {
+      ok: true,
+      session: serializedSession,
+      turnId: String(lastInputTurnId || liveSession.currentTurnId || "").trim()
+    });
+  } catch (err) {
+    runtime.json(ctx, 400, { error: err?.message || String(err) });
+  }
+  return true;
+}
+
 function resolveThreadBackedInputSession(runtime, session, { providerId = "", model = "", reasoningEffort = "", permissionMode = "" } = {}) {
   if (!session) {
     return null;
@@ -368,6 +385,108 @@ export async function handleSessionRoute(ctx, runtime) {
       }
 
       return await openInputStream(ctx, runtime, liveSession, events);
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err) });
+      return true;
+    }
+  }
+
+  if (ctx.path.startsWith("/api/sessions/") && ctx.path.endsWith("/input") && ctx.method === "POST") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+
+    const parts = ctx.path.split("/");
+    if (parts.length !== 5) {
+      runtime.json(ctx, 404, { error: "Not Found" });
+      return true;
+    }
+
+    const id = decodeURIComponent(parts[3] || "");
+    const compatibilitySession = runtime.sessionManager.get(id);
+    if (!compatibilitySession) {
+      runtime.json(ctx, 404, { error: "Session not found" });
+      return true;
+    }
+
+    try {
+      const body = runtime.parseJson(await runtime.readBody(ctx.req));
+      const events = normalizeSessionInputEvents(body);
+      const optionOverrides = extractSessionOptionOverrides(body);
+      if (!hasStreamTurnInput(events)) {
+        runtime.json(ctx, 400, { error: "input requires a non-empty input event" });
+        return true;
+      }
+
+      const liveSession = resolveThreadBackedInputSession(runtime, compatibilitySession, {
+        providerId: String(compatibilitySession.provider || "").trim(),
+        ...optionOverrides
+      });
+      if (!liveSession) {
+        runtime.json(ctx, 404, { error: "Session not found" });
+        return true;
+      }
+      if (typeof runtime.sessionManager.updateSessionOptions === "function") {
+        runtime.sessionManager.updateSessionOptions(liveSession, optionOverrides);
+      }
+
+      return postSessionInput(ctx, runtime, liveSession, events);
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err) });
+      return true;
+    }
+  }
+
+  if (ctx.path.startsWith("/api/threads/") && ctx.path.endsWith("/input") && ctx.method === "POST") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+
+    const parts = ctx.path.split("/");
+    if (parts.length !== 6) {
+      runtime.json(ctx, 404, { error: "Not Found" });
+      return true;
+    }
+
+    const providerId = decodeURIComponent(parts[3] || "").trim();
+    const threadId = decodeURIComponent(parts[4] || "").trim();
+    if (!threadId) {
+      runtime.json(ctx, 400, { error: "threadId is required" });
+      return true;
+    }
+
+    try {
+      const body = runtime.parseJson(await runtime.readBody(ctx.req));
+      const events = normalizeSessionInputEvents(body);
+      const optionOverrides = extractSessionOptionOverrides(body);
+      if (!hasStreamTurnInput(events)) {
+        runtime.json(ctx, 400, { error: "input requires a non-empty input event" });
+        return true;
+      }
+
+      const session = runtime.sessionManager.ensureLiveSessionForThread(threadId, {
+        providerId: String(body.provider || providerId || "").trim(),
+        cwd: body.cwd,
+        model: body.model,
+        name: body.name,
+        reasoningEffort: body.reasoningEffort,
+        permissionMode: body.permissionMode
+      });
+      if (!session) {
+        runtime.json(ctx, 404, { error: "Session not found" });
+        return true;
+      }
+      if (typeof runtime.sessionManager.updateSessionOptions === "function") {
+        runtime.sessionManager.updateSessionOptions(session, optionOverrides);
+      }
+
+      return postSessionInput(ctx, runtime, session, events);
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
       return true;

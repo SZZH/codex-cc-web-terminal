@@ -45,9 +45,9 @@ const fileInputEl = ref(null);
 const activePopover = ref("");
 const isTouchDevice = ref(false);
 
-const isRunning = computed(() => Boolean(props.canInterrupt));
-const primaryActionLabel = computed(() => (isRunning.value ? "中断" : "发送"));
-const canPrimaryAction = computed(() => (isRunning.value ? !props.loading : props.canSend && !props.loading));
+const inputLocked = computed(() => Boolean(props.loading || props.canInterrupt));
+const primaryActionLabel = computed(() => (inputLocked.value ? "发送中" : "发送"));
+const canPrimaryAction = computed(() => props.canSend && !inputLocked.value);
 const addDisabled = computed(() => props.loading || props.canInterrupt);
 const settingsDisabled = computed(() => props.loading || props.canInterrupt);
 const showPermissionMode = computed(() => String(props.providerId || "").trim().toLowerCase() === "codex");
@@ -105,15 +105,14 @@ function handleComposerKeydown(event) {
     !event.metaKey &&
     !isTouchDevice.value;
 
-  if (wantsSubmitShortcut && canSendComposerMessage(props.draft, props.composerOptions.attachments || [])) {
+  if (wantsSubmitShortcut && canPrimaryAction.value && canSendComposerMessage(props.draft, props.composerOptions.attachments || [])) {
     event.preventDefault();
     emit("submit");
   }
 }
 
 function handlePrimaryAction() {
-  if (isRunning.value) {
-    emit("interrupt");
+  if (!canPrimaryAction.value) {
     return;
   }
   if (onlyFileAttachments.value && !String(props.draft || "").trim()) {
@@ -262,7 +261,7 @@ defineExpose({
         class="chat-composer-draft"
         rows="1"
         :placeholder="isTouchDevice ? '给 Codex 发消息…' : 'Enter 发送，Shift + Enter 换行'"
-        :disabled="loading"
+        :disabled="inputLocked"
         :enterkeyhint="isTouchDevice ? 'enter' : 'send'"
         @input="handleInput"
         @keydown="handleComposerKeydown"
@@ -271,7 +270,7 @@ defineExpose({
 
       <AttachmentChips
         :attachments="composerOptions.attachments || []"
-        :disabled="loading"
+        :disabled="inputLocked"
         @remove="emit('remove-attachment', $event)"
         @retry="emit('retry-attachment', $event)"
       />
@@ -303,7 +302,7 @@ defineExpose({
         <button
           class="primary-button chat-composer-send"
           type="button"
-          :aria-label="isRunning ? '中断当前流程' : '发送消息'"
+          aria-label="发送消息"
           :disabled="!canPrimaryAction"
           @click="handlePrimaryAction"
         >

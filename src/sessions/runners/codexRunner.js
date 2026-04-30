@@ -269,14 +269,26 @@ function resolveSessionTurnId(session, params = {}) {
 }
 
 function resolveAppServerTurnId(manager, session, params = {}) {
-  const serverTurnId = String(params?.turnId || params?.turn_id || params?.turn?.id || params?.item?.turnId || "").trim();
-  if (!serverTurnId) {
-    return { turnId: "", clientTurnId: "", aliasSource: "" };
-  }
-
+  const serverTurnId = String(
+    params?.turnId ||
+      params?.turn_id ||
+      params?.turn?.id ||
+      params?.turn?.turnId ||
+      params?.turn?.turn_id ||
+      params?.item?.turnId ||
+      params?.item?.turn_id ||
+      ""
+  ).trim();
   const activePendingTurnId = String(session?.activePendingTurnId || "").trim();
   const currentTurnId = String(session?.currentTurnId || "").trim();
   const pendingLocalTurnIds = session?.pendingLocalTurnIds instanceof Set ? session.pendingLocalTurnIds : new Set();
+  if (!serverTurnId) {
+    if (session?.turnRunning && activePendingTurnId && activePendingTurnId === currentTurnId && pendingLocalTurnIds.has(activePendingTurnId)) {
+      return { turnId: activePendingTurnId, clientTurnId: "", aliasSource: "active-pending-turn-fallback" };
+    }
+    return { turnId: "", clientTurnId: "", aliasSource: "" };
+  }
+
   if (activePendingTurnId && activePendingTurnId === currentTurnId && pendingLocalTurnIds.has(activePendingTurnId)) {
     if (activePendingTurnId !== serverTurnId && session?.turnRunning) {
       const bound = manager.bindConversationTurnAlias?.(session, activePendingTurnId, serverTurnId, {
@@ -345,6 +357,33 @@ function broadcastTypedMessage(manager, session, params = {}, {
     ts,
     phase
   });
+}
+
+function splitStreamingText(text = "", chunkSize = 80) {
+  const chars = Array.from(String(text || ""));
+  const size = Math.max(20, Number(chunkSize) || 80);
+  const chunks = [];
+  for (let index = 0; index < chars.length; index += size) {
+    chunks.push(chars.slice(index, index + size).join(""));
+  }
+  return chunks.filter((chunk) => chunk.trim());
+}
+
+function streamCompletedMessageAsDeltas(manager, session, params = {}, text = "") {
+  const chunks = splitStreamingText(text);
+  if (chunks.length <= 1) {
+    return false;
+  }
+  for (const chunk of chunks) {
+    applyAppServerConversationRecord(manager, session, params, {
+      type: "message_part",
+      role: "assistant",
+      part: { type: "text", text: chunk, format: "markdown" },
+      phase: "streaming",
+      timestamp: nowIso()
+    });
+  }
+  return true;
 }
 
 function broadcastTypedTurnLifecycle(manager, session, params = {}, {
@@ -844,22 +883,20 @@ export function handleAppServerTurnResult(manager, session, result) {
       continue;
     }
     hadOutput = true;
+    const streamedCompletion = !session.turnHadVisibleOutput
+      ? streamCompletedMessageAsDeltas(manager, session, { turnId: session.currentTurnId }, text)
+      : false;
     session.turnHadVisibleOutput = true;
     manager.pushSessionBuffer(session, `${text}\n`);
-    manager.broadcast(session, {
-      type: "message_part",
-      role: "assistant",
-      part: { type: "text", text, format: "markdown" },
-      phase: "final",
-      timestamp: nowIso()
-    });
-    manager.applyConversationRecord(session, {
-      type: "message_part",
-      role: "assistant",
-      part: { type: "text", text, format: "markdown" },
-      phase: "final",
-      timestamp: nowIso()
-    });
+    if (!streamedCompletion) {
+      manager.applyConversationRecord(session, {
+        type: "message_part",
+        role: "assistant",
+        part: { type: "text", text, format: "markdown" },
+        phase: "final",
+        timestamp: nowIso()
+      });
+    }
   }
   if (!hadOutput) {
     console.warn(`[conversation] app-server turn items had no assistant text sessionId=${session?.id || ""} items=${summarizeTurnResult(items)}`);
@@ -931,19 +968,18 @@ export function handleCodexJsonEvent(manager, session, event) {
       }
       return false;
     }
+    const streamedCompletion = !session.turnHadVisibleOutput
+      ? streamCompletedMessageAsDeltas(manager, session, { turnId: session.currentTurnId }, text)
+      : false;
+    session.turnHadVisibleOutput = true;
     manager.pushSessionBuffer(session, `${text}\n`);
-    manager.broadcast(session, {
-      type: "message_part",
-      role: "assistant",
-      part: { type: "text", text, format: "markdown" },
-      phase: "final",
-      timestamp: nowIso()
-    });
-    manager.applyConversationRecord(session, {
-      type: "item.completed",
-      item,
-      timestamp: nowIso()
-    });
+    if (!streamedCompletion) {
+      manager.applyConversationRecord(session, {
+        type: "item.completed",
+        item,
+        timestamp: nowIso()
+      });
+    }
     return true;
   }
   return false;
@@ -1105,13 +1141,25 @@ export function handleAppServerNotification(manager, msg) {
     }
     if (directEvent?.type === "message.completed") {
       const item = params?.item || directEvent.payload || {};
-      if (!applyAppServerConversationRecord(manager, session, params, {
-        type: "item.completed",
-        item,
-        timestamp: nowIso()
-      })) {
+      const text = extractAgentTextFromItem(item) || String(directEvent.payload?.text || directEvent.summary || "").trim();
+      const streamedCompletion = !session.turnHadVisibleOutput && text
+        ? streamCompletedMessageAsDeltas(manager, session, params, text)
+        : false;
+      if (
+        !streamedCompletion &&
+        !applyAppServerConversationRecord(manager, session, params, {
+          type: "item.completed",
+          item,
+          timestamp: nowIso()
+        })
+      ) {
         continue;
       }
+      if (text) {
+        session.turnHadVisibleOutput = true;
+        manager.pushSessionBuffer(session, `${text}\n`);
+      }
+      continue;
     }
     if (String(directEvent?.type || "").startsWith("reasoning.")) {
       if (!applyTypedProcessToConversation(manager, session, params, directEvent)) {
@@ -1195,7 +1243,7 @@ export function handleAppServerNotification(manager, msg) {
       if (!isAgentMessageType(item?.type) && normalizeSymbolToken(item?.type) !== "functioncalloutput") {
         continue;
       }
-      const text = extractAgentTextFromItem(item);
+      const text = extractAgentTextFromItem(item) || summarizeRawNotificationPayload(item);
       if (!text) {
         const eventPart = buildEventPartFromItem(item);
         if (eventPart) {
@@ -1216,20 +1264,21 @@ export function handleAppServerNotification(manager, msg) {
         }
         continue;
       }
-      if (!applyAppServerConversationRecord(manager, session, params, {
-        type: "item.completed",
-        item,
-        timestamp: nowIso()
-      })) {
+      const streamedCompletion = !session.turnHadVisibleOutput
+        ? streamCompletedMessageAsDeltas(manager, session, params, text)
+        : false;
+      if (
+        !streamedCompletion &&
+        !applyAppServerConversationRecord(manager, session, params, {
+          type: "item.completed",
+          item,
+          timestamp: nowIso()
+        })
+      ) {
         continue;
       }
       session.turnHadVisibleOutput = true;
       manager.pushSessionBuffer(session, `${text}\n`);
-      broadcastTypedMessage(manager, session, params, {
-        type: "message.completed",
-        text,
-        phase: "final"
-      });
       continue;
     }
     if (method === "turn/started" || normalizedMethod === "turnstarted") {

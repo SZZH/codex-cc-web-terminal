@@ -588,6 +588,41 @@ function applyConversationDelta(state, delta) {
   }
 }
 
+function findConversationTurn(state, turnId) {
+  const id = String(turnId || "").trim();
+  if (!id) {
+    return null;
+  }
+  return asArray(state?.turns).find((turn) => String(turn?.id || "").trim() === id) || null;
+}
+
+function isDeltaAlreadyRepresented(state, delta) {
+  const kind = String(delta?.kind || "");
+  const turn = findConversationTurn(state, delta?.turnId);
+  if (!turn) {
+    return false;
+  }
+  if (kind === "body_appended") {
+    const incoming = delta?.block || {};
+    const incomingId = String(incoming?.id || "").trim();
+    const incomingText = String(incoming?.text || "");
+    const body = asArray(turn?.assistant?.body);
+    if (incomingId && body.some((block) => String(block?.id || "").trim() === incomingId)) {
+      return true;
+    }
+    const lastText = String(body[body.length - 1]?.text || "");
+    return Boolean(incomingText && (lastText === incomingText || lastText.endsWith(incomingText)));
+  }
+  if (kind === "process_appended") {
+    const incoming = delta?.event || {};
+    return asArray(turn?.assistant?.process).some((event) => areProcessEventsEquivalent(event, incoming));
+  }
+  if (kind === "turn_status_changed" || kind === "turn_completed") {
+    return String(turn?.assistant?.status || "") === String(delta?.status || "");
+  }
+  return false;
+}
+
 function messageCore(message) {
   const partType = normalizedPartType(message?.partType);
   if (partType === "image") {
@@ -782,15 +817,11 @@ export function applyConversationDeltaPayload(currentConversation = {}, payload 
     (payload?.conversation && typeof payload.conversation === "object") || findAuthoritativeConversationDelta(payload?.deltas)
   );
 
-  if (hasVersionGap && hasAuthoritativeConversation) {
-    return {
-      conversation: fallbackConversation,
-      resynced: true
-    };
-  }
-
-  let next = base;
+  let next = hasVersionGap && hasAuthoritativeConversation ? fallbackConversation : base;
   for (const delta of asArray(payload?.deltas)) {
+    if (hasVersionGap && hasAuthoritativeConversation && isDeltaAlreadyRepresented(next, delta)) {
+      continue;
+    }
     const previousVersion = next.version;
     next = applyConversationDelta(next, delta);
     const explicitDeltaVersion = Number(delta?.version);

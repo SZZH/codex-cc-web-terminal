@@ -1,6 +1,6 @@
 import path from "node:path";
 
-const SIDEBAR_SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const SIDEBAR_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function normalizeComparablePath(value) {
   const text = String(value || "").trim();
@@ -46,8 +46,10 @@ function isRecentEnough(session, nowMs = Date.now()) {
 
 export function filterSidebarSessionsByRecency(sessions = [], { nowMs = Date.now() } = {}) {
   return (Array.isArray(sessions) ? sessions : []).filter((session) => {
-    if (String(session?.kind || "").trim().toLowerCase() === "live" && String(session?.status || "").trim() !== "exited") {
-      return true;
+    const kind = String(session?.kind || "").trim().toLowerCase();
+    const status = String(session?.status || "").trim().toLowerCase();
+    if (kind === "archived" || status === "archived" || session?.archived || session?.archivedAt) {
+      return false;
     }
     return isRecentEnough(session, nowMs);
   });
@@ -95,9 +97,7 @@ export function mergeProjectGroupsWithLiveSessions(baseGroups = [], liveSessions
     group.sessions = dedupeSessionsByIdentity(filterSidebarSessionsByRecency(group.sessions));
   }
 
-  return groups
-    .filter((group) => group.sessions.length > 0)
-    .sort((left, right) => byUpdatedAtDesc(left?.sessions?.[0], right?.sessions?.[0]));
+  return groups.sort((left, right) => byUpdatedAtDesc(left?.sessions?.[0], right?.sessions?.[0]));
 }
 
 export function buildSidebarSnapshotFromGroups(sessions = [], projectGroups = []) {

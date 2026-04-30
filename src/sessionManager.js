@@ -965,7 +965,9 @@ export class SessionManager {
     } else {
       this.broadcastDerivedConversationDelta(session, previous);
     }
-    this.broadcastConversationSnapshot(session);
+    if (String(record?.phase || "").toLowerCase() !== "streaming") {
+      this.broadcastConversationSnapshot(session);
+    }
     return explicitDeltas;
   }
 

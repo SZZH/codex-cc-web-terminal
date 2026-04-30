@@ -23,6 +23,26 @@ function normalizeBackendHost(rawHost) {
   return host;
 }
 
+function isAwaitingInputStatus(statusText = "") {
+  return statusText === "等待 Codex 回复…" || statusText === "正在发送…";
+}
+
+function isThreadSnapshotRunning(snapshot = null) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return false;
+  }
+  if (String(snapshot.status || "").trim().toLowerCase() === "running") {
+    return true;
+  }
+  if (String(snapshot.activeTurnId || "").trim()) {
+    return true;
+  }
+  return (Array.isArray(snapshot.turns) ? snapshot.turns : []).some((turn) => {
+    const status = String(turn?.status || turn?.assistant?.status || "").trim().toLowerCase();
+    return status === "running" || status === "inprogress" || status === "in_progress";
+  });
+}
+
 export function createSessionRuntimeController({
   state,
   route,
@@ -97,7 +117,8 @@ export function createSessionRuntimeController({
         threadMeta: state.threadView.meta,
         liveSessionId: state.liveView.liveSessionId,
         liveSessionMeta: state.liveView.sessionMeta,
-        hasAuthoritativeLiveData: Boolean(state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta)
+        hasAuthoritativeLiveData: Boolean(state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta),
+        forceSync: isAwaitingInputStatus(state.statusText)
       })
     ) {
       return null;
@@ -139,6 +160,9 @@ export function createSessionRuntimeController({
     const applied = JSON.stringify(state.threadView.persistedSnapshot || null) !== JSON.stringify(nextThreadSnapshot || null);
     if (applied) {
       setThreadSnapshot(nextThreadSnapshot);
+      if (isAwaitingInputStatus(state.statusText) && !isThreadSnapshotRunning(nextThreadSnapshot)) {
+        setStatus("");
+      }
     }
     if (state.threadView.meta && target.resumeSessionId === state.threadView.meta.resumeSessionId) {
       state.threadView.meta = {
@@ -370,8 +394,9 @@ export function createSessionRuntimeController({
       return;
     }
 
+    const pendingCreateId = `__creating__:${cwd}`;
     try {
-      state.pendingSessionId = "__creating__";
+      state.pendingSessionId = pendingCreateId;
       setStatus("正在创建会话…");
       const payload = await request("/api/sessions", {
         method: "POST",
@@ -392,7 +417,7 @@ export function createSessionRuntimeController({
     } catch (error) {
       setStatus(error?.message || String(error));
     } finally {
-      if (state.pendingSessionId === "__creating__") {
+      if (state.pendingSessionId === pendingCreateId) {
         state.pendingSessionId = "";
       }
     }

@@ -34,7 +34,7 @@ test("buildSessionSidebarPayload falls back to grouped + live session merge", ()
   assert.deepEqual(payload.sessions.map((session) => session.id), ["live-1", "history-1"]);
 });
 
-test("mergeProjectGroupsWithLiveSessions injects matching live sessions and keeps latest identities", () => {
+test("mergeProjectGroupsWithLiveSessions injects matching live sessions and preserves empty groups", () => {
   const groups = mergeProjectGroupsWithLiveSessions(
     [
       {
@@ -44,6 +44,12 @@ test("mergeProjectGroupsWithLiveSessions injects matching live sessions and keep
         sessions: [
           { id: "history-1", provider: "codex", resumeSessionId: "thread-1", updatedAt: "2026-04-27T10:00:00.000Z" }
         ]
+      },
+      {
+        id: "project:/workspace/empty",
+        projectRoot: "/workspace/empty",
+        cwd: "/workspace/empty",
+        sessions: [{ id: "history-old", provider: "codex", resumeSessionId: "thread-old", updatedAt: "2026-04-01T10:00:00.000Z" }]
       }
     ],
     [
@@ -52,11 +58,12 @@ test("mergeProjectGroupsWithLiveSessions injects matching live sessions and keep
     ]
   );
 
-  assert.equal(groups.length, 1);
+  assert.equal(groups.length, 2);
   assert.deepEqual(
     groups[0].sessions.map((session) => session.id),
     ["live-1", "live-2"]
   );
+  assert.deepEqual(groups[1].sessions, []);
 });
 
 test("buildSidebarSnapshotFromGroups appends sessions missing from project groups", () => {
@@ -76,19 +83,22 @@ test("buildSidebarSnapshotFromGroups appends sessions missing from project group
   assert.deepEqual(payload.sessions.map((session) => session.id), ["live-2", "history-1"]);
 });
 
-test("filterSidebarSessionsByRecency keeps only recent sessions but preserves active live sessions", () => {
+test("filterSidebarSessionsByRecency keeps only unarchived sessions used within seven days", () => {
   const nowMs = Date.parse("2026-04-29T12:00:00.000Z");
   const payload = filterSidebarSessionsByRecency(
     [
       { id: "recent-history", kind: "history", updatedAt: "2026-04-25T10:00:00.000Z" },
+      { id: "eight-days-old-history", kind: "history", updatedAt: "2026-04-21T10:00:00.000Z" },
       { id: "old-history", kind: "history", updatedAt: "2026-04-01T10:00:00.000Z" },
       { id: "running-live-old", kind: "live", status: "running", updatedAt: "2026-04-01T10:00:00.000Z" },
-      { id: "exited-live-old", kind: "live", status: "exited", updatedAt: "2026-04-01T10:00:00.000Z" }
+      { id: "exited-live-old", kind: "live", status: "exited", updatedAt: "2026-04-01T10:00:00.000Z" },
+      { id: "archived-history", kind: "archived", status: "archived", updatedAt: "2026-04-25T10:00:00.000Z" },
+      { id: "archived-live", kind: "live", archivedAt: "2026-04-25T11:00:00.000Z", updatedAt: "2026-04-25T10:00:00.000Z" }
     ],
     { nowMs }
   );
 
-  assert.deepEqual(payload.map((session) => session.id), ["recent-history", "running-live-old"]);
+  assert.deepEqual(payload.map((session) => session.id), ["recent-history"]);
 });
 
 test("history route helpers parse query and scoped routes", () => {
