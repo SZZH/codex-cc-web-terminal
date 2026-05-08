@@ -251,7 +251,7 @@ function synthesizePatch(file = {}) {
   ].join("\n");
 }
 
-function buildReversePatchPayload(files = []) {
+function buildPatchPayload(files = []) {
   const patches = [];
   for (const file of Array.isArray(files) ? files : []) {
     const patch = synthesizePatch(file);
@@ -278,25 +278,153 @@ function assertPatchPaths(workspace, files = []) {
   }
 }
 
-function reversePatchWorkspaceChanges(cwd, files) {
+
+function splitPatchHunks(diff = "") {
+  const lines = String(diff || "").split(/\r?\n/);
+  const hunks = [];
+  let current = null;
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      if (current) {
+        hunks.push(current);
+      }
+      current = [line];
+      continue;
+    }
+    if (current) {
+      if (line.startsWith("diff --git ") || line.startsWith("--- ") || line.startsWith("+++ ")) {
+        continue;
+      }
+      current.push(line);
+    }
+  }
+  if (current) {
+    hunks.push(current);
+  }
+  return hunks;
+}
+
+function hunkSideLines(hunk = [], side = "new") {
+  const lines = [];
+  for (const line of hunk.slice(1)) {
+    if (!line) {
+      lines.push("");
+      continue;
+    }
+    const marker = line[0];
+    const body = line.slice(1);
+    if (marker === "\\") {
+      continue;
+    }
+    if (marker === " ") {
+      lines.push(body);
+      continue;
+    }
+    if (side === "old" && marker === "-") {
+      lines.push(body);
+      continue;
+    }
+    if (side === "new" && marker === "+") {
+      lines.push(body);
+    }
+  }
+  return lines;
+}
+
+function findSubsequence(lines = [], needle = [], start = 0) {
+  if (!needle.length) {
+    return Math.max(0, start);
+  }
+  for (let index = Math.max(0, start); index <= lines.length - needle.length; index += 1) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset += 1) {
+      if (lines[index + offset] !== needle[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function applyHunkPatchToText(text = "", diff = "", direction = "reverse") {
+  const hasFinalNewline = String(text).endsWith("\n");
+  const lines = String(text).split(/\r?\n/);
+  if (lines.length && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  let cursor = 0;
+  for (const hunk of splitPatchHunks(diff)) {
+    const before = hunkSideLines(hunk, direction === "reverse" ? "new" : "old");
+    const after = hunkSideLines(hunk, direction === "reverse" ? "old" : "new");
+    const index = findSubsequence(lines, before, cursor);
+    if (index < 0) {
+      throw new Error("Patch context does not match current file content");
+    }
+    lines.splice(index, before.length, ...after);
+    cursor = index + after.length;
+  }
+  return `${lines.join("\n")}${hasFinalNewline ? "\n" : ""}`;
+}
+
+function applyPatchWithJsFallback(workspace, files, direction = "reverse") {
+  for (const file of Array.isArray(files) ? files : []) {
+    const relativePath = normalizePatchPath(file?.path);
+    const diff = String(file?.diff || "");
+    if (!relativePath || !diff) {
+      continue;
+    }
+    const absolute = path.resolve(workspace, relativePath);
+    const currentText = fs.existsSync(absolute) ? fs.readFileSync(absolute, "utf8") : "";
+    const nextText = applyHunkPatchToText(currentText, diff, normalizePatchDirection(direction));
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    fs.writeFileSync(absolute, nextText);
+  }
+}
+
+function normalizePatchDirection(direction = "reverse") {
+  const normalized = String(direction || "reverse").trim().toLowerCase();
+  if (normalized === "forward" || normalized === "apply" || normalized === "restore") {
+    return "forward";
+  }
+  return "reverse";
+}
+
+function applyPatchWorkspaceChanges(cwd, files, direction = "reverse") {
   const workspace = assertWorkspaceDirectory(cwd);
   assertPatchPaths(workspace, files);
-  const patch = buildReversePatchPayload(files);
+  const patch = buildPatchPayload(files);
   const repo = probeWorkspaceRepo(workspace);
+  const patchDirection = normalizePatchDirection(direction);
+  const gitArgs = patchDirection === "reverse" ? ["apply", "--reverse"] : ["apply"];
+  const patchArgs = patchDirection === "reverse" ? ["-R", "-p1"] : ["-p1"];
 
-  if (repo.isGitRepo) {
-    runGit(workspace, ["apply", "--reverse", "--check", "-"], { input: patch });
-    runGit(workspace, ["apply", "--reverse", "-"], { input: patch });
-  } else {
-    runCommand(workspace, "patch", ["-R", "-p1", "--dry-run"], { input: patch });
-    runCommand(workspace, "patch", ["-R", "-p1"], { input: patch });
+  try {
+    if (repo.isGitRepo) {
+      runGit(workspace, [...gitArgs, "--check", "-"], { input: patch });
+      runGit(workspace, [...gitArgs, "-"], { input: patch });
+    } else {
+      runCommand(workspace, "patch", [...patchArgs, "--dry-run"], { input: patch });
+      runCommand(workspace, "patch", patchArgs, { input: patch });
+    }
+  } catch (err) {
+    applyPatchWithJsFallback(workspace, files, patchDirection);
   }
 
   const result = repo.isGitRepo ? listWorkspaceChanges(workspace) : { cwd: workspace, total: 0, additions: 0, deletions: 0, files: [] };
   return {
     ...result,
-    reverted: (Array.isArray(files) ? files : []).map((file) => normalizePatchPath(file?.path)).filter(Boolean)
+    direction: patchDirection,
+    reverted: patchDirection === "reverse" ? (Array.isArray(files) ? files : []).map((file) => normalizePatchPath(file?.path)).filter(Boolean) : [],
+    restored: patchDirection === "forward" ? (Array.isArray(files) ? files : []).map((file) => normalizePatchPath(file?.path)).filter(Boolean) : []
   };
+}
+
+function reversePatchWorkspaceChanges(cwd, files) {
+  return applyPatchWorkspaceChanges(cwd, files, "reverse");
 }
 
 function normalizeBranchName(value) {
@@ -451,7 +579,7 @@ export async function handleWorkspaceChangesRoute(ctx, runtime) {
     return true;
   }
 
-  if (ctx.path === "/api/workspace-changes/reverse-patch" && ctx.method === "POST") {
+  if ((ctx.path === "/api/workspace-changes/reverse-patch" || ctx.path === "/api/workspace-changes/apply-patch") && ctx.method === "POST") {
     if (runtime.forbidCrossOrigin(ctx)) {
       return true;
     }
@@ -461,7 +589,7 @@ export async function handleWorkspaceChangesRoute(ctx, runtime) {
 
     try {
       const body = runtime.parseJson(await runtime.readBody(ctx.req));
-      runtime.json(ctx, 200, reversePatchWorkspaceChanges(body.cwd, body.files));
+      runtime.json(ctx, 200, applyPatchWorkspaceChanges(body.cwd, body.files, body.direction));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err), details: err?.stack || "" });
     }
@@ -525,6 +653,7 @@ export const workspaceChangesInternals = {
   listWorkspaceChanges,
   revertWorkspaceChanges,
   reversePatchWorkspaceChanges,
+  applyPatchWorkspaceChanges,
   parseStatusEntries,
   listGitBranches,
   checkoutGitBranch,

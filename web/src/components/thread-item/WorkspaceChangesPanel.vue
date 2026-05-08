@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
-import { requestWorkspaceChanges, reversePatchWorkspaceChanges } from "../../lib/api.js";
+import { applyPatchWorkspaceChanges, requestWorkspaceChanges, reversePatchWorkspaceChanges } from "../../lib/api.js";
 
 const props = defineProps({
   cwd: { type: String, default: "" },
@@ -15,7 +15,7 @@ const reverting = ref(false);
 const error = ref("");
 const changes = ref({ files: [] });
 const expanded = ref(new Set());
-const revertedPaths = ref(new Set());
+const toggledPaths = ref(new Set());
 
 const sourceFiles = computed(() => {
   if (Array.isArray(props.files) && props.files.length > 0) {
@@ -27,10 +27,14 @@ const hasHistoricalFiles = computed(() => Array.isArray(props.files) && props.fi
 const files = computed(() =>
   hasHistoricalFiles.value
     ? sourceFiles.value
-    : sourceFiles.value.filter((file) => !revertedPaths.value.has(fileKey(file)))
+    : sourceFiles.value.filter((file) => !toggledPaths.value.has(fileKey(file)))
 );
 const hasChanges = computed(() => files.value.length > 0);
 const totalLabel = computed(() => `${files.value.length} 个文件已更改`);
+const allVisibleFilesToggled = computed(() =>
+  hasHistoricalFiles.value && files.value.length > 0 && files.value.every((file) => hasToggledFile(file))
+);
+const actionLabel = computed(() => allVisibleFilesToggled.value ? "恢复" : "撤销");
 
 function fileKey(file) {
   return String(file?.path || "");
@@ -89,6 +93,10 @@ async function loadChanges({ silent = false } = {}) {
   }
 }
 
+function hasToggledFile(file) {
+  return toggledPaths.value.has(fileKey(file));
+}
+
 async function revertFiles(paths) {
   const cwd = String(props.cwd || "").trim();
   const selected = (Array.isArray(paths) ? paths : []).map((item) => String(item || "").trim()).filter(Boolean);
@@ -99,12 +107,17 @@ async function revertFiles(paths) {
   error.value = "";
   try {
     const selectedFiles = files.value.filter((file) => selected.includes(fileKey(file)));
-    changes.value = await reversePatchWorkspaceChanges(cwd, selectedFiles);
-    if (!hasHistoricalFiles.value) {
-      revertedPaths.value = new Set([...revertedPaths.value, ...selected]);
-    }
+    const direction = hasHistoricalFiles.value && selectedFiles.every((file) => hasToggledFile(file)) ? "forward" : "reverse";
+    changes.value = direction === "forward"
+      ? await applyPatchWorkspaceChanges(cwd, selectedFiles, direction)
+      : await reversePatchWorkspaceChanges(cwd, selectedFiles);
+    toggledPaths.value = direction === "forward"
+      ? new Set([...toggledPaths.value].filter((key) => !selected.includes(key)))
+      : new Set([...toggledPaths.value, ...selected]);
     expanded.value = new Set([...expanded.value].filter((key) => files.value.some((file) => file.path === key)));
-    emit("status", selected.length === 1 ? `已撤销 ${selected[0]}` : `已撤销 ${selected.length} 个文件`);
+    emit("status", direction === "forward"
+      ? (selected.length === 1 ? `已恢复 ${selected[0]}` : `已恢复 ${selected.length} 个文件`)
+      : (selected.length === 1 ? `已撤销 ${selected[0]}` : `已撤销 ${selected.length} 个文件`));
   } catch (err) {
     error.value = err?.message || String(err);
   } finally {
@@ -120,7 +133,7 @@ watch(
   () => `${props.cwd}:${props.interactive ? "1" : "0"}:${props.files.map((file) => fileKey(file)).join("\n")}`,
   () => {
     expanded.value = new Set();
-    revertedPaths.value = new Set();
+    toggledPaths.value = new Set();
     loadChanges();
   }
 );
@@ -139,7 +152,7 @@ onMounted(() => loadChanges());
         :disabled="reverting"
         @click="revertAll"
       >
-        撤销
+        {{ actionLabel }}
       </button>
     </header>
 

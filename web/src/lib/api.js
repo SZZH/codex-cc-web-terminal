@@ -142,6 +142,13 @@ export async function revertWorkspaceChanges(cwd, paths = []) {
   });
 }
 
+export async function applyPatchWorkspaceChanges(cwd, files = [], direction = "reverse") {
+  return request("/api/workspace-changes/apply-patch", {
+    method: "POST",
+    body: JSON.stringify({ cwd, files, direction })
+  });
+}
+
 export async function reversePatchWorkspaceChanges(cwd, files = []) {
   return request("/api/workspace-changes/reverse-patch", {
     method: "POST",
