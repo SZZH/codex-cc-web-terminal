@@ -142,6 +142,13 @@ export async function revertWorkspaceChanges(cwd, paths = []) {
   });
 }
 
+export async function reversePatchWorkspaceChanges(cwd, files = []) {
+  return request("/api/workspace-changes/reverse-patch", {
+    method: "POST",
+    body: JSON.stringify({ cwd, files })
+  });
+}
+
 export async function requestAuthSession(attempt = 0) {
   const response = await fetch("/api/auth/session", {
     credentials: "same-origin"

@@ -737,7 +737,6 @@ async function interruptActiveSession() {
   }
 }
 
-
 watch(
   () => route.name,
   async (name) => {

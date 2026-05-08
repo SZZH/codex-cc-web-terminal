@@ -27,7 +27,7 @@ const viewModel = computed(() =>
       :assistant-name="assistantName"
       :workspace-cwd="workspaceCwd"
       :show-workspace-changes="turn.id === viewModel.latestFileChangeTurnId"
-      :interactive-workspace-changes="turn.id === viewModel.latestFileChangeTurnId"
+      :interactive-workspace-changes="turn.id === viewModel.latestFileChangeTurnId || (turn.fileChanges || []).length > 0"
       @status="emit('status', $event)"
     />
   </div>

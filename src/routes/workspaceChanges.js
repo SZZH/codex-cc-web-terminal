@@ -27,18 +27,40 @@ function assertWorkspace(cwd) {
   return workspace;
 }
 
-function runGit(cwd, args, { allowFailure = false, maxBuffer = MAX_DIFF_BYTES } = {}) {
+function runGit(cwd, args, { allowFailure = false, maxBuffer = MAX_DIFF_BYTES, input = undefined } = {}) {
   const result = spawnSync("git", args, {
     cwd,
+    input,
     encoding: "utf8",
     maxBuffer,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"]
   });
   if (result.error) {
     throw result.error;
   }
   if (result.status !== 0 && !allowFailure) {
     throw new Error(String(result.stderr || result.stdout || `git ${args.join(" ")} failed`).trim());
+  }
+  return {
+    status: result.status ?? 0,
+    stdout: String(result.stdout || ""),
+    stderr: String(result.stderr || "")
+  };
+}
+
+function runCommand(cwd, command, args, { input = "", allowFailure = false, maxBuffer = MAX_DIFF_BYTES } = {}) {
+  const result = spawnSync(command, args, {
+    cwd,
+    input,
+    encoding: "utf8",
+    maxBuffer,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0 && !allowFailure) {
+    throw new Error(String(result.stderr || result.stdout || `${command} ${args.join(" ")} failed`).trim());
   }
   return {
     status: result.status ?? 0,
@@ -190,6 +212,90 @@ function revertWorkspaceChanges(cwd, paths) {
   return {
     ...listWorkspaceChanges(workspace),
     reverted: targets.map((file) => file.path)
+  };
+}
+
+function normalizePatchPath(filePath = "") {
+  const text = String(filePath || "").trim();
+  if (!text || path.isAbsolute(text) || text.includes("\0")) {
+    return "";
+  }
+  return text.replaceAll("\\", "/").replace(/^\.\/+/, "");
+}
+
+function patchNeedsHeader(diff = "") {
+  const text = String(diff || "");
+  return !/^---\s+/m.test(text) || !/^\+\+\+\s+/m.test(text);
+}
+
+function synthesizePatch(file = {}) {
+  const filePath = normalizePatchPath(file.path);
+  const diff = String(file.diff || "").trimEnd();
+  if (!filePath || !diff) {
+    return "";
+  }
+  if (!patchNeedsHeader(diff)) {
+    return `${diff}\n`;
+  }
+  const status = String(file.status || "").trim().toLowerCase();
+  const isAdded = status === "??" || status === "a" || status === "add" || status === "added" || status === "create" || status === "created";
+  const isDeleted = status === "d" || status === "delete" || status === "deleted" || status === "remove" || status === "removed";
+  const fromPath = isAdded ? "/dev/null" : `a/${filePath}`;
+  const toPath = isDeleted ? "/dev/null" : `b/${filePath}`;
+  return [
+    `diff --git a/${filePath} b/${filePath}`,
+    `--- ${fromPath}`,
+    `+++ ${toPath}`,
+    diff,
+    ""
+  ].join("\n");
+}
+
+function buildReversePatchPayload(files = []) {
+  const patches = [];
+  for (const file of Array.isArray(files) ? files : []) {
+    const patch = synthesizePatch(file);
+    if (patch) {
+      patches.push(patch);
+    }
+  }
+  if (!patches.length) {
+    throw new Error("No reversible file diff found");
+  }
+  return patches.join("\n");
+}
+
+function assertPatchPaths(workspace, files = []) {
+  for (const file of Array.isArray(files) ? files : []) {
+    const filePath = normalizePatchPath(file?.path);
+    if (!filePath) {
+      throw new Error(`Invalid file path: ${file?.path || ""}`);
+    }
+    const absolute = path.resolve(workspace, filePath);
+    if (!absolute.startsWith(`${workspace}${path.sep}`) && absolute !== workspace) {
+      throw new Error(`Refusing to patch path outside workspace: ${filePath}`);
+    }
+  }
+}
+
+function reversePatchWorkspaceChanges(cwd, files) {
+  const workspace = assertWorkspaceDirectory(cwd);
+  assertPatchPaths(workspace, files);
+  const patch = buildReversePatchPayload(files);
+  const repo = probeWorkspaceRepo(workspace);
+
+  if (repo.isGitRepo) {
+    runGit(workspace, ["apply", "--reverse", "--check", "-"], { input: patch });
+    runGit(workspace, ["apply", "--reverse", "-"], { input: patch });
+  } else {
+    runCommand(workspace, "patch", ["-R", "-p1", "--dry-run"], { input: patch });
+    runCommand(workspace, "patch", ["-R", "-p1"], { input: patch });
+  }
+
+  const result = repo.isGitRepo ? listWorkspaceChanges(workspace) : { cwd: workspace, total: 0, additions: 0, deletions: 0, files: [] };
+  return {
+    ...result,
+    reverted: (Array.isArray(files) ? files : []).map((file) => normalizePatchPath(file?.path)).filter(Boolean)
   };
 }
 
@@ -345,6 +451,23 @@ export async function handleWorkspaceChangesRoute(ctx, runtime) {
     return true;
   }
 
+  if (ctx.path === "/api/workspace-changes/reverse-patch" && ctx.method === "POST") {
+    if (runtime.forbidCrossOrigin(ctx)) {
+      return true;
+    }
+    if (!runtime.requireAuthorized(ctx)) {
+      return true;
+    }
+
+    try {
+      const body = runtime.parseJson(await runtime.readBody(ctx.req));
+      runtime.json(ctx, 200, reversePatchWorkspaceChanges(body.cwd, body.files));
+    } catch (err) {
+      runtime.json(ctx, 400, { error: err?.message || String(err), details: err?.stack || "" });
+    }
+    return true;
+  }
+
   if (ctx.path === "/api/workspace-git" && ctx.method === "GET") {
     if (runtime.forbidCrossOrigin(ctx)) {
       return true;
@@ -401,6 +524,7 @@ export async function handleWorkspaceChangesRoute(ctx, runtime) {
 export const workspaceChangesInternals = {
   listWorkspaceChanges,
   revertWorkspaceChanges,
+  reversePatchWorkspaceChanges,
   parseStatusEntries,
   listGitBranches,
   checkoutGitBranch,

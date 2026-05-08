@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
-import { requestWorkspaceChanges, revertWorkspaceChanges } from "../../lib/api.js";
+import { requestWorkspaceChanges, reversePatchWorkspaceChanges } from "../../lib/api.js";
 
 const props = defineProps({
   cwd: { type: String, default: "" },
@@ -15,13 +15,20 @@ const reverting = ref(false);
 const error = ref("");
 const changes = ref({ files: [] });
 const expanded = ref(new Set());
+const revertedPaths = ref(new Set());
 
-const files = computed(() => {
+const sourceFiles = computed(() => {
   if (Array.isArray(props.files) && props.files.length > 0) {
     return props.files;
   }
   return Array.isArray(changes.value?.files) ? changes.value.files : [];
 });
+const hasHistoricalFiles = computed(() => Array.isArray(props.files) && props.files.length > 0);
+const files = computed(() =>
+  hasHistoricalFiles.value
+    ? sourceFiles.value
+    : sourceFiles.value.filter((file) => !revertedPaths.value.has(fileKey(file)))
+);
 const hasChanges = computed(() => files.value.length > 0);
 const totalLabel = computed(() => `${files.value.length} 个文件已更改`);
 
@@ -91,7 +98,11 @@ async function revertFiles(paths) {
   reverting.value = true;
   error.value = "";
   try {
-    changes.value = await revertWorkspaceChanges(cwd, selected);
+    const selectedFiles = files.value.filter((file) => selected.includes(fileKey(file)));
+    changes.value = await reversePatchWorkspaceChanges(cwd, selectedFiles);
+    if (!hasHistoricalFiles.value) {
+      revertedPaths.value = new Set([...revertedPaths.value, ...selected]);
+    }
     expanded.value = new Set([...expanded.value].filter((key) => files.value.some((file) => file.path === key)));
     emit("status", selected.length === 1 ? `已撤销 ${selected[0]}` : `已撤销 ${selected.length} 个文件`);
   } catch (err) {
@@ -106,9 +117,10 @@ function revertAll() {
 }
 
 watch(
-  () => `${props.cwd}:${props.interactive ? "1" : "0"}`,
+  () => `${props.cwd}:${props.interactive ? "1" : "0"}:${props.files.map((file) => fileKey(file)).join("\n")}`,
   () => {
     expanded.value = new Set();
+    revertedPaths.value = new Set();
     loadChanges();
   }
 );
