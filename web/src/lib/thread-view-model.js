@@ -94,6 +94,7 @@ function createSegment(kind, items = [], turn = {}, index = 0) {
     id: `${turn?.id || "turn"}-segment-${index}-${kind}`,
     kind,
     items,
+    visibleItems: items,
     processSummary: null,
     defaultCollapsed: false
   };
@@ -113,6 +114,7 @@ function applySegmentCollapseDefaults(segments = [], turn = {}) {
     const hasPrimaryAfter = segments.slice(index + 1).some((candidate) => candidate.kind === "primary");
     const processSummary = summarizeProcessItems(segment.items);
     const hasDiagnosticDump = segment.items.some((item) => item.isDiagnosticDump);
+    const visibleItems = segment.items.filter((item) => !item.isNoisyProcess);
     const defaultCollapsed =
       hasDiagnosticDump
         ? true
@@ -123,6 +125,7 @@ function applySegmentCollapseDefaults(segments = [], turn = {}) {
           : false;
     return {
       ...segment,
+      visibleItems,
       processSummary,
       defaultCollapsed,
       hasDiagnosticDump

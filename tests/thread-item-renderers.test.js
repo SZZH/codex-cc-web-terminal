@@ -130,6 +130,98 @@ test("thread item renderer marks historical dump command output as diagnostic du
   assert.equal(item.summary, "会话历史调试输出");
 });
 
+test("thread item renderer marks empty successful command metadata as noisy process", () => {
+  const item = normalizeThreadItem({
+    id: "cmd-empty-1",
+    kind: "CommandExecution",
+    status: "completed",
+    summary: "exec_command",
+    payload: {
+      name: "exec_command",
+      exitCode: 0,
+      output: [
+        "bash   Chunk ID: 47814f",
+        "Wall time: 0.0000 seconds",
+        "Process exited with code 0",
+        "Original token count: 0",
+        "Output:"
+      ].join("\n")
+    }
+  });
+
+  assert.equal(item.isNoisyProcess, true);
+  assert.equal(item.category, "process");
+});
+
+test("thread item renderer keeps command output visible when it contains useful text", () => {
+  const item = normalizeThreadItem({
+    id: "cmd-useful-1",
+    kind: "CommandExecution",
+    status: "completed",
+    summary: "exec_command",
+    payload: {
+      name: "exec_command",
+      exitCode: 0,
+      output: [
+        "bash   Chunk ID: 47814f",
+        "Wall time: 0.0400 seconds",
+        "Process exited with code 0",
+        "Output:",
+        "1 test passed"
+      ].join("\n")
+    }
+  });
+
+  assert.equal(item.isNoisyProcess, false);
+  assert.match(item.body, /1 test passed/);
+});
+
+test("thread view model counts empty successful commands but hides them from expanded process details", () => {
+  const viewModel = buildThreadViewModel({
+    turns: [
+      {
+        id: "turn-noisy-process",
+        status: "inProgress",
+        items: [
+          {
+            id: "cmd-empty-2",
+            kind: "CommandExecution",
+            status: "completed",
+            summary: "exec_command",
+            payload: {
+              exitCode: 0,
+              output: [
+                "bash   Chunk ID: 32a54e",
+                "Wall time: 0.0000 seconds",
+                "Process exited with code 0",
+                "Original token count: 0",
+                "Output:"
+              ].join("\n")
+            }
+          },
+          {
+            id: "cmd-visible-1",
+            kind: "CommandExecution",
+            status: "completed",
+            summary: "exec_command",
+            payload: {
+              exitCode: 0,
+              output: "npm test 通过"
+            }
+          }
+        ]
+      }
+    ]
+  });
+
+  const processSegment = viewModel.turns[0].segments.find((segment) => segment.kind === "process");
+  assert.equal(processSegment.items.length, 2);
+  assert.equal(processSegment.visibleItems.length, 1);
+  assert.equal(processSegment.visibleItems[0].id, "cmd-visible-1");
+  assert.match(processSegment.processSummary.label, /执行过程 2 项/);
+  assert.match(processSegment.processSummary.label, /已略过空命令 1/);
+});
+
 test("thread view model collapses process segments for terminal turns", () => {
   const viewModel = buildThreadViewModel({
     turns: [

@@ -104,6 +104,16 @@ const DIAGNOSTIC_DUMP_PATTERNS = [
   /fatal: Unable to create '.git\/index\.lock'/i
 ];
 
+const EMPTY_COMMAND_OUTPUT_PATTERNS = [
+  /^bash\s+Chunk ID:\s*\S+/i,
+  /^Chunk ID:\s*\S+/i,
+  /^Wall time:\s*[\d.]+\s*seconds$/i,
+  /^Process exited with code 0$/i,
+  /^Original token count:\s*\d+$/i,
+  /^Output:\s*$/i,
+  /^Command:\s*.+$/i
+];
+
 export function inferThreadItemKind(item = {}) {
   const directKind = normalizeKind(firstDefined(item.kind, item.itemKind, item.item_type, item.type));
   if (directKind) {
@@ -375,6 +385,36 @@ function buildDiagnosticSummary(body = "", summary = "") {
   return truncateText(summary || compactBody || "调试输出", 48);
 }
 
+function isSuccessfulStatus(status = "") {
+  const key = normalizeStatus(status);
+  return !key || ["completed", "success", "succeeded"].includes(key);
+}
+
+function isZeroExitCode(value) {
+  return value === undefined || value === null || value === "" || Number(value) === 0;
+}
+
+function hasOnlyEmptyCommandMetadata(body = "") {
+  const lines = String(body || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) {
+    return true;
+  }
+  return lines.every((line) => EMPTY_COMMAND_OUTPUT_PATTERNS.some((pattern) => pattern.test(line)));
+}
+
+function detectNoisyProcessItem(kind, status, body = "", payload = {}) {
+  if (kind !== "commandexecution") {
+    return false;
+  }
+  if (!isSuccessfulStatus(status) || !isZeroExitCode(payload?.exitCode ?? payload?.exit_code)) {
+    return false;
+  }
+  return hasOnlyEmptyCommandMetadata(body);
+}
+
 export function getThreadItemCategory(item = {}) {
   const kind = inferThreadItemKind(item);
   if (USER_KINDS.has(kind)) {
@@ -397,6 +437,7 @@ export function normalizeThreadItem(item = {}, options = {}) {
   const body = buildBody(kind, item, payload);
   const summary = extractSummary(kind, item, payload);
   const isDiagnosticDump = detectDiagnosticDump(kind, body, summary);
+  const isNoisyProcess = detectNoisyProcessItem(kind, status, body, payload);
   const imageItems = extractImageItems(item, payload);
   const imageUrl = imageItems[0]?.url || "";
   const imageAlt = imageItems[0]?.alt || extractImageAlt(item, payload);
@@ -423,6 +464,7 @@ export function normalizeThreadItem(item = {}, options = {}) {
     timestamp: firstDefined(item.timestamp, item.ts, payload?.timestamp, payload?.ts, ""),
     isUnknown: kind === "unknown",
     isDiagnosticDump,
+    isNoisyProcess,
     isLiveOverlay: Boolean(options.isLiveOverlay || item.isLiveOverlay),
     speakerName:
       category === "user"
@@ -440,13 +482,16 @@ export function summarizeProcessItems(items = []) {
     tool: 0,
     collab: 0,
     other: 0,
-    diagnosticDump: 0
+    diagnosticDump: 0,
+    noisyCommand: 0
   };
 
   for (const item of items) {
     counts.total += 1;
     const kind = inferThreadItemKind(item);
-    if (item?.isDiagnosticDump) {
+    if (item?.isNoisyProcess && kind === "commandexecution") {
+      counts.noisyCommand += 1;
+    } else if (item?.isDiagnosticDump) {
       counts.diagnosticDump += 1;
     } else if (kind === "reasoning") {
       counts.reasoning += 1;
@@ -470,6 +515,7 @@ export function summarizeProcessItems(items = []) {
   if (counts.tool) parts.push(`工具 ${counts.tool}`);
   if (counts.collab) parts.push(`子代理 ${counts.collab}`);
   if (counts.diagnosticDump) parts.push(`调试输出 ${counts.diagnosticDump}`);
+  if (counts.noisyCommand) parts.push(`已略过空命令 ${counts.noisyCommand}`);
   if (counts.other) parts.push(`其他 ${counts.other}`);
 
   return {

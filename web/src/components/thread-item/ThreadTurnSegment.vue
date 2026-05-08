@@ -34,9 +34,9 @@ watch(
         </span>
       </button>
 
-      <div v-if="!collapsed" class="turn-process-items">
+      <div v-if="!collapsed && (segment.visibleItems || segment.items || []).length" class="turn-process-items">
         <ThreadItemRenderer
-          v-for="item in segment.items"
+          v-for="item in segment.visibleItems || segment.items"
           :key="item.id"
           :item="item"
           :assistant-name="assistantName"
