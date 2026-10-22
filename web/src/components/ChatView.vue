@@ -1,12 +1,11 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import MarkdownIt from "markdown-it";
-import DOMPurify from "dompurify";
-import hljs from "highlight.js";
 import ChatComposer from "./composer/ChatComposer.vue";
 import ThreadTurnTimeline from "./thread-item/ThreadTurnTimeline.vue";
+import { createMessageStreamScroll } from "../lib/message-stream-scroll.js";
+import { measureAppViewport } from "../lib/app-viewport.js";
+import { PERMISSION_MODE_OPTIONS } from "../lib/composer.js";
 
-const BOTTOM_THRESHOLD = 84;
 const props = defineProps({
   sessionKey: { type: String, default: "" },
   openToken: { type: [String, Number], default: 0 },
@@ -16,15 +15,28 @@ const props = defineProps({
   threadMismatch: { type: Boolean, default: false },
   assistantName: { type: String, default: "Codex" },
   threadSnapshot: { type: Object, default: null },
+  threadViewModel: { type: Object, default: null },
   workspaceCwd: { type: String, default: "" },
   draft: { type: String, default: "" },
   composerOptions: { type: Object, required: true },
   models: { type: Array, default: () => [] },
+  permissionModeOptions: { type: Array, default: () => PERMISSION_MODE_OPTIONS },
   gitState: { type: Object, required: true },
   providerId: { type: String, default: "codex" },
   canSend: Boolean,
   canInterrupt: Boolean,
+  allowFollowups: Boolean,
+  canSteer: Boolean,
+  runningTask: Boolean,
+  followUpMode: { type: String, default: "steer" },
+  canAnswerQuestions: Boolean,
+  interrupting: Boolean,
+  processExpanded: { type: Object, default: () => ({}) },
   loading: Boolean,
+  historyLoading: Boolean,
+  hasOlder: Boolean,
+  loadingOlder: Boolean,
+  onReachTop: { type: Function, default: null },
   statusText: { type: String, default: "" }
 });
 
@@ -33,322 +45,51 @@ const emit = defineEmits([
   "update:draft",
   "submit",
   "interrupt",
+  "process-toggle",
+  "turn-visibility",
+  "question-answer",
   "status",
   "update:composer-options",
   "add-attachments",
   "remove-attachment",
   "retry-attachment",
   "switch-git-branch",
-  "create-git-branch"
+  "create-git-branch",
+  "refresh-git"
 ]);
 const messageListEl = ref(null);
-const messageBottomEl = ref(null);
 const composerRef = ref(null);
 const composerHostEl = ref(null);
 const statusEl = ref(null);
-const viewportHeight = ref(0);
 const keyboardInset = ref(0);
 const composerHeight = ref(0);
 const statusHeight = ref(0);
-const isPinnedToBottom = ref(true);
-const lightboxImage = ref(null);
-const lightboxScale = ref(1);
-const lightboxTranslateX = ref(0);
-const lightboxTranslateY = ref(0);
-const lightboxGesture = {
-  mode: "",
-  startScale: 1,
-  startDistance: 0,
-  startTranslateX: 0,
-  startTranslateY: 0,
-  startTouchX: 0,
-  startTouchY: 0,
-  startMidpointX: 0,
-  startMidpointY: 0
-};
-let scrollAnimationFrame = 0;
-let initialScrollTimer = 0;
 let layoutResizeObserver = null;
+const streamScroll = createMessageStreamScroll({
+  getElement: () => messageListEl.value,
+  getContext: () => `${props.sessionKey}::${props.openToken}`,
+  getHasOlder: () => props.hasOlder,
+  getLoadingOlder: () => props.loadingOlder,
+  onReachTop: () => props.onReachTop?.(),
+  nextTick
+});
+const {
+  isNearBottom, scrollToBottom, handleStreamScroll, handleStreamWheel,
+  handleStreamTouchStart, handleStreamTouchMove, handleStreamTouchEnd,
+  handleStreamKeydown, handleStreamPointerDown, handleStreamPointerUp
+} = streamScroll;
 
 const chatShellStyle = computed(() => ({
-  "--chat-vh": viewportHeight.value ? `${viewportHeight.value}px` : undefined,
   "--chat-keyboard-inset": `${keyboardInset.value}px`
 }));
 const messageStreamStyle = computed(() => ({
   "--chat-bottom-space": `${Math.max(56, composerHeight.value + statusHeight.value + 24)}px`
 }));
-const lightboxImageStyle = computed(() => ({
-  transform: `translate3d(${lightboxTranslateX.value}px, ${lightboxTranslateY.value}px, 0) scale(${lightboxScale.value})`
-}));
-
-const PROCESS_PATTERNS = [
-  /^›/,
-  /^>/,
-  /^Working\(/i,
-  /^\d+% left/i,
-  /^tokens?\b/i,
-  /^subagent/i,
-  /^thinking\b/i,
-  /^•\s+/,
-  /^tool\b/i,
-  /^observation\b/i,
-  /^bash\b/i,
-  /^zsh\b/i,
-  /^pwd\b/i,
-  /^cd\b/i,
-  /^\/Users\//,
-  /^node_modules\//,
-  /^<subagent_notification>/i,
-  /^<\/subagent_notification>/i,
-  /^\{".*agent_path".*\}$/,
-  /esc to interrupt/i,
-  /dangerously-bypass-approvals-and-sandbox/i,
-  /codex resume/i,
-  /'codex'.*'resume'/i,
-  /current changes/i,
-  /\bworkdir\b/i
-];
-
-const LANGUAGE_ALIAS = {
-  sh: "bash",
-  shell: "bash",
-  zsh: "bash",
-  console: "bash",
-  env: "bash",
-  yml: "yaml",
-  conf: "ini",
-  config: "ini",
-  text: "plaintext",
-  plain: "plaintext",
-  md: "markdown"
-};
-
-function normalizeLanguageTag(lang) {
-  const key = String(lang || "")
-    .trim()
-    .toLowerCase();
-  if (!key) {
-    return "";
-  }
-  return LANGUAGE_ALIAS[key] || key;
-}
-
-function classifyLanguageFamily(language) {
-  const key = String(language || "").toLowerCase();
-  if (!key) {
-    return "plain";
-  }
-  if (["sql", "postgresql", "mysql", "plsql"].includes(key)) {
-    return "sql";
-  }
-  if (["bash", "shell", "zsh", "powershell", "pwsh", "fish", "sh"].includes(key)) {
-    return "shell";
-  }
-  if (
-    [
-      "javascript",
-      "typescript",
-      "tsx",
-      "jsx",
-      "json",
-      "yaml",
-      "toml",
-      "ini",
-      "xml",
-      "html",
-      "css",
-      "scss",
-      "less",
-      "dockerfile",
-      "nginx",
-      "markdown"
-    ].includes(key)
-  ) {
-    return "config";
-  }
-  return "code";
-}
-
-function renderCodeFence(sourceText, languageTag) {
-  const normalizedLanguage = normalizeLanguageTag(languageTag);
-  let highlighted = "";
-  let resolvedLanguage = "";
-
-  if (normalizedLanguage && hljs.getLanguage(normalizedLanguage)) {
-    highlighted = hljs.highlight(sourceText, {
-      language: normalizedLanguage,
-      ignoreIllegals: true
-    }).value;
-    resolvedLanguage = normalizedLanguage;
-  } else {
-    const auto = hljs.highlightAuto(sourceText);
-    highlighted = auto.value;
-    resolvedLanguage = String(auto.language || "plaintext").toLowerCase();
-  }
-
-  const family = classifyLanguageFamily(resolvedLanguage);
-  const languageLabel = resolvedLanguage === "plaintext" ? "text" : resolvedLanguage;
-  return [
-    `<pre class="code-block language-${resolvedLanguage} family-${family}">`,
-    `<span class="code-lang">${languageLabel}</span>`,
-    `<span class="code-scroll"><code class="hljs language-${resolvedLanguage}">${highlighted}</code></span>`,
-    "</pre>"
-  ].join("");
-}
-
-function isLocalFilePathHref(href) {
-  const value = String(href || "").trim();
-  if (!value) {
-    return false;
-  }
-  return (
-    /^\/(Users|Volumes|private|tmp|var|opt|Applications)\//.test(value) ||
-    /^[A-Za-z]:[\\/]/.test(value)
-  );
-}
-
-function isProcessLine(line) {
-  const compact = String(line || "").trim();
-  if (!compact) {
-    return true;
-  }
-  return PROCESS_PATTERNS.some((pattern) => pattern.test(compact));
-}
-
-const md = new MarkdownIt({
-  html: false,
-  breaks: true,
-  linkify: true,
-  highlight(code, language) {
-    return renderCodeFence(String(code || ""), language);
-  }
-});
-
-const sanitizerConfig = {
-  ALLOWED_TAGS: [
-    "p",
-    "br",
-    "pre",
-    "code",
-    "blockquote",
-    "ul",
-    "ol",
-    "li",
-    "a",
-    "strong",
-    "em",
-    "del",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "hr",
-    "img",
-    "span"
-  ],
-  ALLOWED_ATTR: ["href", "target", "rel", "class", "src", "alt", "title", "loading", "decoding", "referrerpolicy"],
-  FORBID_ATTR: ["style", "onerror", "onclick", "onload"]
-};
-
-function renderMarkdownToHtml(text) {
-  const source = preprocessDisplayMarkdown(String(text || ""));
-  if (!source.trim()) {
-    return "";
-  }
-  const rendered = md.render(source);
-  const sanitized = DOMPurify.sanitize(rendered, sanitizerConfig).trim();
-  if (typeof window === "undefined" || !sanitized) {
-    return sanitized;
-  }
-
-  const container = window.document.createElement("div");
-  container.innerHTML = sanitized;
-  for (const link of container.querySelectorAll("a[href]")) {
-    const href = String(link.getAttribute("href") || "").trim();
-    if (!isLocalFilePathHref(href)) {
-      continue;
-    }
-    const replacement = window.document.createElement("span");
-    replacement.className = "local-file-ref";
-    replacement.textContent = link.textContent || href;
-    link.replaceWith(replacement);
-  }
-  return container.innerHTML.trim();
-}
-
-function prettifyDirectiveLine(line) {
-  const match = String(line || "").trim().match(/^::([a-z0-9-]+)\{([\s\S]*)\}$/i);
-  if (!match) {
-    return null;
-  }
-
-  const action = match[1];
-  const payload = match[2].trim();
-  return [
-    `> 操作：\`${action}\``,
-    payload ? `> 参数：\`${payload}\`` : ""
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-function preprocessDisplayMarkdown(value) {
-  const lines = String(value || "").split("\n");
-  const output = [];
-  for (const raw of lines) {
-    const line = raw.trimEnd();
-    const directive = prettifyDirectiveLine(line);
-    if (directive) {
-      output.push("", directive, "");
-      continue;
-    }
-    output.push(line);
-  }
-  return output.join("\n").replace(/\n{3,}/g, "\n\n");
-}
-
-function extractFileMentions(value) {
-  const source = String(value || "");
-  if (!source) {
-    return [];
-  }
-  const matches = [...source.matchAll(/\[[^\]]+\]\((\/[^)\s]+)\)/g)];
-  const seen = new Set();
-  const files = [];
-  for (const match of matches) {
-    const rawPath = String(match[1] || "").trim();
-    if (!rawPath || seen.has(rawPath)) {
-      continue;
-    }
-    seen.add(rawPath);
-    const normalized = rawPath.replace(/#L\d+(C\d+)?$/i, "").replace(/:\d+(?::\d+)?$/i, "");
-    const label = normalized.split("/").filter(Boolean).slice(-3).join("/");
-    files.push({
-      path: rawPath,
-      label: label || rawPath
-    });
-  }
-  return files;
-}
-
-function compactText(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
 const hasThreadSnapshot = computed(
   () => props.threadSnapshot && Array.isArray(props.threadSnapshot.turns)
 );
-function isNearBottom(element, threshold = BOTTOM_THRESHOLD) {
-  if (!element) {
-    return true;
-  }
-  return element.scrollHeight - element.clientHeight - element.scrollTop <= threshold;
-}
-
 function resizeComposer(target, { keepBottom = false } = {}) {
-  const wasNearBottom = keepBottom && isNearBottom(messageListEl.value);
+  const wasNearBottom = keepBottom && streamScroll.isPinnedToBottom && isNearBottom(messageListEl.value);
   composerRef.value?.resizeComposer?.();
   syncBottomLayoutMetrics();
   if (wasNearBottom) {
@@ -362,151 +103,17 @@ function syncBottomLayoutMetrics() {
   statusHeight.value = statusEl.value ? Math.ceil(statusEl.value.getBoundingClientRect().height) : 0;
 }
 
-function scrollToBottom(force = false) {
-  nextTick(() => {
-    const el = messageListEl.value;
-    if (!el) {
-      return;
-    }
-    if (!force && !isPinnedToBottom.value) {
-      return;
-    }
-
-    el.scrollTop = el.scrollHeight;
-    messageBottomEl.value?.scrollIntoView({ block: "end" });
-    isPinnedToBottom.value = true;
-  });
-}
-
 function settleScrollToBottom(force = false) {
   scrollToBottom(force);
 }
 
 function settleInitialScrollToBottom() {
-  if (typeof window === "undefined") {
-    settleScrollToBottom(true);
-    return;
-  }
-  window.clearTimeout?.(initialScrollTimer);
-  initialScrollTimer = window.setTimeout(() => {
-    settleScrollToBottom(true);
-  }, 1000);
+  settleScrollToBottom();
 }
 
-function handleStreamScroll(event) {
-  const nearBottom = isNearBottom(event.target);
-  isPinnedToBottom.value = nearBottom;
-}
-
-function openLightboxImage(url, alt = "image") {
-  const imageUrl = String(url || "").trim();
-  if (!imageUrl) {
-    return;
-  }
-  lightboxImage.value = {
-    url: imageUrl,
-    alt: String(alt || "image").trim() || "image"
-  };
-  lightboxScale.value = 1;
-  lightboxTranslateX.value = 0;
-  lightboxTranslateY.value = 0;
-}
-
-function closeLightboxImage() {
-  lightboxImage.value = null;
-  lightboxScale.value = 1;
-  lightboxTranslateX.value = 0;
-  lightboxTranslateY.value = 0;
-  lightboxGesture.mode = "";
-}
-
-function handleMarkdownBodyClick(event) {
-  const target = event?.target;
-  if (!(target instanceof window.HTMLImageElement)) {
-    return;
-  }
-  openLightboxImage(target.currentSrc || target.src || "", target.alt || "image");
-}
-
-function getTouchDistance(touches) {
-  if (!touches || touches.length < 2) {
-    return 0;
-  }
-  const [a, b] = touches;
-  return Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
-}
-
-function getTouchMidpoint(touches) {
-  if (!touches || touches.length < 2) {
-    return { x: 0, y: 0 };
-  }
-  const [a, b] = touches;
-  return {
-    x: (a.clientX + b.clientX) / 2,
-    y: (a.clientY + b.clientY) / 2
-  };
-}
-
-function clampLightboxScale(value) {
-  return Math.min(4, Math.max(1, value));
-}
-
-function handleLightboxTouchStart(event) {
-  if (!lightboxImage.value) {
-    return;
-  }
-  if (event.touches.length >= 2) {
-    const midpoint = getTouchMidpoint(event.touches);
-    lightboxGesture.mode = "pinch";
-    lightboxGesture.startScale = lightboxScale.value;
-    lightboxGesture.startDistance = getTouchDistance(event.touches);
-    lightboxGesture.startTranslateX = lightboxTranslateX.value;
-    lightboxGesture.startTranslateY = lightboxTranslateY.value;
-    lightboxGesture.startMidpointX = midpoint.x;
-    lightboxGesture.startMidpointY = midpoint.y;
-    event.preventDefault();
-    return;
-  }
-  if (event.touches.length === 1 && lightboxScale.value > 1) {
-    const touch = event.touches[0];
-    lightboxGesture.mode = "pan";
-    lightboxGesture.startTouchX = touch.clientX;
-    lightboxGesture.startTouchY = touch.clientY;
-    lightboxGesture.startTranslateX = lightboxTranslateX.value;
-    lightboxGesture.startTranslateY = lightboxTranslateY.value;
-    event.preventDefault();
-  }
-}
-
-function handleLightboxTouchMove(event) {
-  if (!lightboxImage.value) {
-    return;
-  }
-  if (event.touches.length >= 2) {
-    const midpoint = getTouchMidpoint(event.touches);
-    const distance = getTouchDistance(event.touches);
-    const ratio = lightboxGesture.startDistance > 0 ? distance / lightboxGesture.startDistance : 1;
-    lightboxScale.value = clampLightboxScale(lightboxGesture.startScale * ratio);
-    lightboxTranslateX.value = lightboxGesture.startTranslateX + (midpoint.x - lightboxGesture.startMidpointX);
-    lightboxTranslateY.value = lightboxGesture.startTranslateY + (midpoint.y - lightboxGesture.startMidpointY);
-    event.preventDefault();
-    return;
-  }
-  if (event.touches.length === 1 && lightboxScale.value > 1) {
-    const touch = event.touches[0];
-    lightboxTranslateX.value = lightboxGesture.startTranslateX + (touch.clientX - lightboxGesture.startTouchX);
-    lightboxTranslateY.value = lightboxGesture.startTranslateY + (touch.clientY - lightboxGesture.startTouchY);
-    event.preventDefault();
-  }
-}
-
-function handleLightboxTouchEnd() {
-  if (lightboxScale.value <= 1) {
-    lightboxScale.value = 1;
-    lightboxTranslateX.value = 0;
-    lightboxTranslateY.value = 0;
-  }
-  lightboxGesture.mode = "";
+function handleProcessToggle(payload) {
+  if (payload?.expanded) streamScroll.inspect();
+  emit("process-toggle", payload);
 }
 
 function syncViewportMetrics() {
@@ -514,14 +121,7 @@ function syncViewportMetrics() {
     return;
   }
 
-  const viewport = window.visualViewport;
-  const height = viewport?.height ? Math.round(viewport.height) : window.innerHeight;
-  const inset = viewport
-    ? Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop))
-    : 0;
-
-  viewportHeight.value = height;
-  keyboardInset.value = inset;
+  keyboardInset.value = measureAppViewport(window).keyboardInset;
 }
 
 function handleViewportChange() {
@@ -534,19 +134,16 @@ function handleWindowResize() {
   resizeComposer(composerRef.value, { keepBottom: false });
 }
 
-function handleWindowKeydown(event) {
-  if (event.key === "Escape" && lightboxImage.value) {
-    closeLightboxImage();
-  }
-}
-
 function observeBottomLayout() {
   layoutResizeObserver?.disconnect();
   if (typeof ResizeObserver === "undefined") {
     return;
   }
+  const isCurrent = streamScroll.captureContext();
   layoutResizeObserver = new ResizeObserver(() => {
+    if (!isCurrent()) return;
     syncBottomLayoutMetrics();
+    if (streamScroll.isPinnedToBottom) scrollToBottom();
   });
   const composerElement = composerHostEl.value || composerRef.value?.$el || null;
   if (composerElement) {
@@ -555,6 +152,8 @@ function observeBottomLayout() {
   if (statusEl.value) {
     layoutResizeObserver.observe(statusEl.value);
   }
+  const timeline = messageListEl.value?.querySelector?.(".thread-turn-timeline");
+  if (timeline) layoutResizeObserver.observe(timeline);
 }
 
 watch(
@@ -574,8 +173,8 @@ watch(
 watch(
   () => `${props.sessionKey}::${props.openToken}`,
   () => {
-    isPinnedToBottom.value = true;
-    nextTick(() => {
+    streamScroll.reset();
+    streamScroll.schedule(() => {
       resizeComposer(composerRef.value, { keepBottom: false });
       observeBottomLayout();
       settleInitialScrollToBottom();
@@ -587,7 +186,7 @@ watch(
 watch(
   () => props.draft,
   () => {
-    nextTick(() => resizeComposer(composerRef.value, { keepBottom: true }));
+    streamScroll.schedule(() => resizeComposer(composerRef.value, { keepBottom: true }));
   },
   { flush: "post", immediate: true }
 );
@@ -595,13 +194,14 @@ watch(
 onMounted(() => {
   if (typeof window !== "undefined") {
     window.addEventListener("resize", handleWindowResize, { passive: true });
-    window.addEventListener("keydown", handleWindowKeydown);
+    window.addEventListener("pointerup", handleStreamPointerUp);
+    window.addEventListener("pointercancel", handleStreamPointerUp);
     window.visualViewport?.addEventListener("resize", handleViewportChange, { passive: true });
     window.visualViewport?.addEventListener("scroll", handleViewportChange, { passive: true });
   }
   syncViewportMetrics();
   syncBottomLayoutMetrics();
-  nextTick(() => {
+  streamScroll.schedule(() => {
     resizeComposer(composerRef.value, { keepBottom: false });
     observeBottomLayout();
     settleInitialScrollToBottom();
@@ -609,13 +209,13 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  streamScroll.dispose();
   if (typeof window !== "undefined") {
     window.removeEventListener("resize", handleWindowResize);
-    window.removeEventListener("keydown", handleWindowKeydown);
+    window.removeEventListener("pointerup", handleStreamPointerUp);
+    window.removeEventListener("pointercancel", handleStreamPointerUp);
     window.visualViewport?.removeEventListener("resize", handleViewportChange);
     window.visualViewport?.removeEventListener("scroll", handleViewportChange);
-    window.cancelAnimationFrame?.(scrollAnimationFrame);
-    window.clearTimeout?.(initialScrollTimer);
   }
   layoutResizeObserver?.disconnect();
 });
@@ -634,29 +234,51 @@ onBeforeUnmount(() => {
     </header>
 
     <main class="chat-screen">
-      <section ref="messageListEl" class="message-stream" :style="messageStreamStyle" @scroll="handleStreamScroll">
+      <section ref="messageListEl" class="message-stream" data-app-scroll :style="messageStreamStyle" tabindex="0" aria-label="聊天记录"
+        @scroll="handleStreamScroll" @wheel.passive="handleStreamWheel" @touchstart.passive="handleStreamTouchStart"
+        @touchmove.passive="handleStreamTouchMove" @touchend="handleStreamTouchEnd" @touchcancel="handleStreamTouchEnd"
+        @keydown="handleStreamKeydown" @pointerdown="handleStreamPointerDown">
+        <slot name="history-start" :load-older="() => streamScroll.loadOlder({ manual: true })" />
         <ThreadTurnTimeline
+          v-show="!historyLoading"
           :snapshot="threadSnapshot"
+          :thread-view-model="threadViewModel"
           :assistant-name="assistantName"
           :workspace-cwd="workspaceCwd"
+          :can-answer-questions="canAnswerQuestions"
+          :process-expanded="processExpanded"
           @status="emit('status', $event)"
-        />
-        <span ref="messageBottomEl" class="message-bottom-anchor" aria-hidden="true"></span>
+          @process-toggle="handleProcessToggle"
+          @turn-visibility="emit('turn-visibility', $event)"
+          @question-answer="emit('question-answer', $event)"
+        >
+          <template #turn-footer="slotProps"><slot name="turn-footer" v-bind="slotProps" /></template>
+          <template #item-footer="slotProps"><slot name="item-footer" v-bind="slotProps" /></template>
+        </ThreadTurnTimeline>
+        <span class="message-bottom-anchor" aria-hidden="true"></span>
       </section>
 
-      <div ref="composerHostEl" class="chat-composer-host">
+      <div ref="composerHostEl" class="chat-composer-host" data-app-scroll>
+        <p v-if="statusText" ref="statusEl" class="chat-status" role="status" aria-live="polite">{{ statusText }}</p>
+        <slot name="composer-top" />
         <ChatComposer
           ref="composerRef"
           :draft="draft"
           :composer-options="composerOptions"
           :models="models"
+          :permission-mode-options="permissionModeOptions"
           :git-state="gitState"
           :provider-id="providerId"
           :can-send="canSend"
           :can-interrupt="canInterrupt"
+          :allow-followups="allowFollowups"
+          :can-steer="canSteer"
+          :running-task="runningTask"
+          :follow-up-mode="followUpMode"
+          :interrupting="interrupting"
           :loading="loading"
           @update:draft="emit('update:draft', $event)"
-          @submit="emit('submit')"
+          @submit="emit('submit', $event)"
           @interrupt="emit('interrupt')"
           @status="emit('status', $event)"
           @update:composer-options="emit('update:composer-options', $event)"
@@ -665,37 +287,18 @@ onBeforeUnmount(() => {
           @retry-attachment="emit('retry-attachment', $event)"
           @switch-git-branch="emit('switch-git-branch', $event)"
           @create-git-branch="emit('create-git-branch', $event)"
+          @refresh-git="emit('refresh-git')"
         />
       </div>
     </main>
-
-    <div
-      v-if="lightboxImage"
-      class="image-lightbox"
-      @click="closeLightboxImage"
-      @touchstart="handleLightboxTouchStart"
-      @touchmove="handleLightboxTouchMove"
-      @touchend="handleLightboxTouchEnd"
-      @touchcancel="handleLightboxTouchEnd"
-    >
-      <button class="image-lightbox-close" type="button" aria-label="关闭预览" @click.stop="closeLightboxImage">×</button>
-      <img
-        class="image-lightbox-media"
-        :src="lightboxImage.url"
-        :alt="lightboxImage.alt"
-        :style="lightboxImageStyle"
-        loading="eager"
-        decoding="async"
-        @click.stop
-      >
-    </div>
   </section>
 </template>
 
 <style scoped>
 .chat-shell {
-  height: var(--chat-vh, 100dvh);
-  min-height: var(--chat-vh, 100dvh);
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -801,7 +404,12 @@ onBeforeUnmount(() => {
 
 .chat-composer-host {
   flex: 0 0 auto;
+  min-height: 0;
+  max-height: 70%;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
+.chat-composer-host :deep(.chat-composer-wrap) { position: relative; }
 
 .message-bottom-anchor {
   display: block;
@@ -1228,49 +836,6 @@ onBeforeUnmount(() => {
   cursor: zoom-in;
 }
 
-.image-lightbox {
-  position: fixed;
-  inset: 0;
-  z-index: 80;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  background: rgba(24, 19, 15, 0.76);
-  backdrop-filter: blur(8px);
-  touch-action: none;
-  overscroll-behavior: contain;
-}
-
-.image-lightbox-media {
-  max-width: min(100vw - 32px, 960px);
-  max-height: min(100vh - 48px, 88vh);
-  border-radius: 16px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
-  background: rgba(255, 255, 255, 0.96);
-  transform-origin: center center;
-  user-select: none;
-  -webkit-user-drag: none;
-  touch-action: none;
-  will-change: transform;
-}
-
-.image-lightbox-close {
-  position: absolute;
-  top: calc(env(safe-area-inset-top) + 12px);
-  right: 14px;
-  width: 36px;
-  height: 36px;
-  border: 0;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.9);
-  color: #3b3028;
-  font-size: 24px;
-  line-height: 1;
-  cursor: pointer;
-}
-
-
 .turn-thread {
   display: flex;
   flex-direction: column;
@@ -1309,6 +874,7 @@ onBeforeUnmount(() => {
   font-size: 12px;
   line-height: 1.45;
   color: #99897c;
+  overflow-wrap: anywhere;
 }
 
 .subagent-panel {

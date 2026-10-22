@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "kkVersion": "5.0.3",
+  "javaBin": "/absolute/preview-runtime/java/Contents/Home/bin/java",
+  "officeHome": "/absolute/preview-runtime/LibreOffice.app/Contents",
+  "jarPath": "/absolute/preview-runtime/kkFileView-5.0.3.jar",
+  "defaultsPath": "/absolute/preview-runtime/kkFileView/server/src/main/config/application.properties",
+  "dataDir": "/absolute/preview-runtime/data",
+  "logsDir": "/absolute/preview-runtime/logs",
+  "bridgeOrigin": "http://127.0.0.1:3211",
+  "label": "com.codex.preview.kkfileview"
+}

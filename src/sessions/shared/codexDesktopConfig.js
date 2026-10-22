@@ -104,6 +104,7 @@ export function readCodexDesktopDefaults(config = {}) {
 }
 
 export function writeCodexDesktopPermissionMode(config = {}, permissionMode = "") {
+  if (String(permissionMode || "").trim().toLowerCase() === "manual-review") return;
   const targetPath = String(config.codexGlobalStatePath || "").trim();
   if (!targetPath) {
     return;

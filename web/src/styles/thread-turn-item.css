@@ -33,38 +33,39 @@
 .turn-process-segment {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  border-radius: 20px;
-  border: 1px solid var(--process-border);
-  background: linear-gradient(180deg, rgba(255, 252, 249, 0.88), rgba(247, 242, 236, 0.78));
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.58),
-    0 4px 14px rgba(123, 103, 86, 0.03);
+  gap: 4px;
+  min-width: 0;
+  padding: 0 4px;
 }
 
 .turn-process-toggle {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   width: 100%;
-  min-height: 34px;
-  padding: 0 2px;
+  min-height: 36px;
+  padding: 4px 0;
   border: 0;
   background: transparent;
   color: var(--process-shell-text);
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.4;
-  font-weight: 550;
-  letter-spacing: 0.01em;
+  font-weight: 400;
+  letter-spacing: 0;
   text-align: left;
 }
 
+.turn-process-label { min-width: 0; overflow-wrap: anywhere; }
+.turn-process-state { flex: 0 0 12px; width: 12px; height: 12px; border: 1.5px solid #aaa096; border-radius: 3px; }
+.turn-process-state[data-running="true"] { border-top-color: #5f7866; border-bottom-color: #5f7866; }
+.turn-process-toggle:focus-visible { outline: 2px solid #9b8977; outline-offset: 3px; border-radius: 4px; }
+.turn-process-empty { margin: 0 0 8px 20px; font-size: 12px; color: #8c7f73; }
+
 .turn-process-toggle-icon {
   flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
+  width: 20px;
+  height: 20px;
+  margin-left: auto;
   display: inline-grid;
   place-items: center;
   color: var(--process-shell-icon);
@@ -102,8 +103,9 @@
   position: relative;
   overflow: visible;
   padding-right: 0;
-  padding-top: 2px;
-  padding-bottom: 2px;
+  margin-left: 5px;
+  padding: 4px 0 8px 14px;
+  border-left: 1px solid #ded6cd;
 }
 
 .thread-item-card {
@@ -129,6 +131,19 @@
 .thread-item-primary {
   align-self: flex-start;
   background: rgba(255, 252, 249, 0.96);
+}
+
+.thread-item-user.is-question-reply {
+  background: #eee9e3;
+  color: #342d28;
+}
+
+.thread-item-primary.is-question-transcript {
+  background: transparent;
+  border: 0;
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1.6;
 }
 
 .thread-item-process {
@@ -185,6 +200,47 @@
   word-break: break-word;
 }
 
+.thread-item-body.markdown-body .markdown-table-scroll {
+  min-width: 0;
+  max-width: 100%;
+  margin: 0 0 1em;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+}
+
+.thread-item-body.markdown-body .markdown-table-scroll:last-child {
+  margin-bottom: 0;
+}
+
+.thread-item-body.markdown-body .markdown-table-scroll:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+
+.thread-item-body.markdown-body table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+
+.thread-item-body.markdown-body th,
+.thread-item-body.markdown-body td {
+  min-width: 8rem;
+  max-width: 24rem;
+  padding: 8px 12px;
+  border: 1px solid rgba(217, 206, 196, 0.92);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.thread-item-body.markdown-body th {
+  font-weight: 600;
+  background: rgba(248, 243, 238, 0.72);
+}
+
 .thread-item-body.plain-body {
   margin: 0;
   white-space: pre-wrap;
@@ -216,6 +272,8 @@
 
 .workspace-changes {
   width: min(100%, 42rem);
+  min-width: 0;
+  max-width: 100%;
   align-self: flex-start;
   overflow: hidden;
   border-radius: 14px;
@@ -229,10 +287,62 @@
   align-items: center;
   gap: 12px;
   min-height: 44px;
-  padding: 0 14px;
+  padding: 10px 14px;
   background: rgba(249, 249, 248, 0.86);
   font-size: 15px;
   line-height: 1.4;
+}
+
+.workspace-changes-summary {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.workspace-changes-stats {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.workspace-changes-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 0;
+  border-top: 1px solid rgba(223, 220, 216, 0.88);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.workspace-changes-toggle:hover {
+  background: rgba(220, 218, 215, 0.4);
+}
+
+.workspace-changes-toggle:focus-visible {
+  outline: 2px solid #6f767d;
+  outline-offset: -3px;
+}
+
+.workspace-changes-toggle svg {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.workspace-changes-toggle svg.expanded {
+  transform: rotate(180deg);
 }
 
 .workspace-changes-action {
@@ -346,6 +456,9 @@
 }
 
 .workspace-change-diff {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   max-height: min(360px, 48vh);
   overflow: auto;
   border-top: 1px solid rgba(224, 221, 217, 0.88);

@@ -19,13 +19,14 @@ function asArray(value) {
   return Array.isArray(value) ? value : value == null ? [] : [value];
 }
 
-function sanitizeAssistantOutputText(value) {
-  const lines = String(value || "")
+function sanitizeAssistantOutputText(value, { preserveWhitespace = false } = {}) {
+  const source = String(value || "")
     .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
+    .replace(/\r/g, "\n");
+  const sourceLines = source.split("\n");
+  const lines = sourceLines
     .filter((line) => !/^::[a-z0-9-]+\{[\s\S]*\}$/i.test(String(line || "").trim()));
-  return lines.join("\n").trim();
+  return preserveWhitespace && lines.length === sourceLines.length ? source : lines.join("\n").trim();
 }
 
 function firstTextContent(content = []) {
@@ -100,7 +101,7 @@ function extractCanonicalUserRequest(value) {
     }
   }
 
-  return text.trim();
+  return text;
 }
 
 function buildCanonicalUserContent(payload = {}) {
@@ -684,7 +685,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
     const partType = String(part.type || "").toLowerCase();
 
     if (role === "assistant" && partType === "text" && text) {
-      const sanitizedText = sanitizeAssistantOutputText(text);
+      const sanitizedText = phase === "streaming" ? String(text) : sanitizeAssistantOutputText(text, { preserveWhitespace: true });
       if (!sanitizedText) {
         return [];
       }
@@ -698,6 +699,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
           sourceRecordId: record.id,
           payload: {
             text: sanitizedText,
+            messageId: record.raw?.messageId || record.raw?.itemId || "",
             source: phase === "streaming" ? "primary_output_text" : "primary_output_text",
             phase
           }
@@ -758,7 +760,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
     }
 
     if ((itemType === "agentmessage" || itemType === "message") && text) {
-      const sanitizedText = sanitizeAssistantOutputText(text);
+      const sanitizedText = sanitizeAssistantOutputText(text, { preserveWhitespace: true });
       if (!sanitizedText) {
         return [];
       }
@@ -770,7 +772,7 @@ export function canonicalizeRawRecord(record, state = createCanonicalizerState()
           eventType: "agent_message_recorded",
           eventTs: record.recordTs,
           sourceRecordId: record.id,
-          payload: { text: sanitizedText, source: "primary_output_text", phase: item.phase ?? null }
+          payload: { text: sanitizedText, messageId: String(item.id || ""), source: "primary_output_text", phase: item.phase ?? null }
         })
       ];
     }

@@ -52,6 +52,12 @@ function createHarness() {
   return { state, runtime, statusUpdates, messageUpdates };
 }
 
+test("live transport errors display the typed message rather than a generic unknown failure", () => {
+  const { runtime, state } = createHarness();
+  runtime.handleLivePayload({ type: "transport.error", code: "warning", message: "connection retry details" });
+  assert.equal(state.statusText, "connection retry details");
+});
+
 test("live-session-runtime: thread.snapshot merges authoritative conversation patches into live state", () => {
   const { state, runtime } = createHarness();
   state.liveView.conversation = {

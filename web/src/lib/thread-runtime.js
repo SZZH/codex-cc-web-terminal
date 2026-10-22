@@ -15,6 +15,53 @@ export function createThreadRuntimeController({
   setStatus,
   syncThreadViewFromInteraction
 } = {}) {
+  function isSyntheticPartId(id = "") {
+    return /^(?:historymsg[_:]|live(?:message|overlay|image)[_:]|agent-message:|message[-:]|overlay[-:])/i.test(String(id));
+  }
+
+  function isTerminalTurn(turn = {}) {
+    return ["completed", "failed", "aborted", "interrupted"].includes(String(turn.status || turn.assistant?.status || "").toLowerCase());
+  }
+
+  function reconcileCompletedSnapshot(snapshot) {
+    const completed = new Map((snapshot?.turns || []).filter(isTerminalTurn).map((turn) => [turn.id, turn]));
+    if (!completed.size) return;
+    const hasRunningTurn = (turns = []) => turns.some((turn) => !completed.has(turn.id) && !isTerminalTurn(turn));
+    const authoritative = state.threadView.authoritativeSnapshot;
+    let settledActiveTurn = false;
+    if (authoritative?.threadId === snapshot.threadId) {
+      const turns = (authoritative.turns || []).map((turn) => completed.get(turn.id) || turn);
+      const activeCompleted = completed.has(authoritative.activeTurnId);
+      const settle = activeCompleted && !hasRunningTurn(turns) && !hasRunningTurn(snapshot.turns);
+      settledActiveTurn ||= settle;
+      state.threadView.authoritativeSnapshot = { ...authoritative,
+        turns, ...(settle ? { activeTurnId: null, status: completed.get(authoritative.activeTurnId).status } : {}) };
+    }
+    const conversation = state.liveView.conversation;
+    if (conversation?.threadId !== snapshot.threadId) return;
+    const turns = (conversation.turns || []).map((turn) => {
+      const official = completed.get(turn.id);
+      if (!official) return turn;
+      const body = (official.items || []).filter((item) => ["AgentMessage", "Plan", "ImageView", "ImageGeneration"].includes(item.kind)).map((item) => ({
+        id: item.id, kind: ["ImageView", "ImageGeneration"].includes(item.kind) ? "image" : "markdown",
+        text: item.text || "", payload: item.payload || {}, ts: item.updatedAt || item.createdAt || ""
+      }));
+      return { ...turn, status: official.status, assistant: { ...turn.assistant, body, status: official.status === "aborted" ? "interrupted" : official.status } };
+    });
+    const settleConversation = completed.has(conversation.activeTurnId) && !hasRunningTurn(turns) && !hasRunningTurn(snapshot.turns);
+    settledActiveTurn ||= settleConversation;
+    setConversation({ ...conversation, turns, ...(settleConversation ? { activeTurnId: "", status: completed.get(conversation.activeTurnId).status } : {}) }, { force: true });
+    if (completed.has(state.liveView.liveOverlay?.turnId)) setLiveOverlay(null);
+    const inputCompleted = completed.has(state.liveView.inputTurnId);
+    if ((settledActiveTurn || inputCompleted) && !hasRunningTurn(turns) && !hasRunningTurn(snapshot.turns) &&
+      !(state.threadView.authoritativeSnapshot?.activeTurnId && !completed.has(state.threadView.authoritativeSnapshot.activeTurnId))) {
+      state.liveView.activeInputStream = false;
+      state.liveView.interruptInFlight = false;
+      state.liveView.streamBuffer = "";
+      state.loading = false;
+      if (["等待 Codex 回复…", "正在发送…"].includes(state.statusText)) setStatus?.("");
+    }
+  }
   function buildAssistantState(turn = {}) {
     return {
       body: Array.isArray(turn?.assistant?.body) ? [...turn.assistant.body] : [],
@@ -43,7 +90,9 @@ export function createThreadRuntimeController({
 
       const assistant = buildAssistantState(turn);
       const existingIndex = assistant.body.findIndex(
-        (item) => (messageId && String(item?.id || "").trim() === messageId) || (!messageId && String(item?.kind || "").trim().toLowerCase() === "markdown")
+        (item) => (messageId && String(item?.id || "").trim() === messageId) ||
+          ((isSyntheticPartId(messageId) || isSyntheticPartId(item.id)) && String(item.text || "").trim() === text) ||
+          (!messageId && String(item?.kind || "").trim().toLowerCase() === "markdown")
       );
       const previousText = existingIndex >= 0 ? String(assistant.body[existingIndex]?.text || "") : "";
       const nextText = phase === "final"
@@ -52,7 +101,9 @@ export function createThreadRuntimeController({
           ? text
           : `${previousText}${text}`;
       const bodyItem = {
-        id: messageId || assistant.body[existingIndex]?.id || `message-${turnId}-${assistant.body.length + 1}`,
+        id: existingIndex >= 0 && !isSyntheticPartId(assistant.body[existingIndex]?.id)
+          ? assistant.body[existingIndex].id
+          : messageId || assistant.body[existingIndex]?.id || `message-${turnId}-${assistant.body.length + 1}`,
         kind: "markdown",
         text: nextText,
         payload: {},
@@ -262,6 +313,7 @@ export function createThreadRuntimeController({
         ""
     ).trim();
     setLiveOverlay(liveOverlay);
+    if (!partial && snapshot) reconcileCompletedSnapshot(snapshot);
     syncThreadViewFromInteraction?.();
   }
 
@@ -303,6 +355,7 @@ export function createThreadRuntimeController({
   function setThreadSnapshot(snapshot = null) {
     state.threadView.persistedSnapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
     state.threadView.threadId = String(snapshot?.threadId || state.threadView.authoritativeSnapshot?.threadId || "").trim();
+    if (snapshot) reconcileCompletedSnapshot(snapshot);
     syncThreadViewFromInteraction?.();
   }
 

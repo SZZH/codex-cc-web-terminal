@@ -256,6 +256,7 @@ export function buildConversationStateFromThreadSnapshot(snapshot = {}, options 
             : null,
           assistant: {
             status: mapThreadTurnStatus(turn?.status),
+            error: turn?.error ? JSON.parse(JSON.stringify(turn.error)) : null,
             startedAt: turn?.startedAt || "",
             finishedAt: turn?.completedAt || "",
             process: items.map(mapThreadTurnItemToProcessEvent).filter(Boolean),

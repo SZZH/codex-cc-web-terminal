@@ -1,16 +1,13 @@
+function ignoreDrainedRequestError() {}
+
+function drainRejectedRequest(req) {
+  req.on("error", ignoreDrainedRequestError);
+  req.once("close", () => req.off("error", ignoreDrainedRequestError));
+  req.resume();
+}
+
 export function installRequestBodyRuntime(runtime) {
-  runtime.readBody = (req) =>
-    new Promise((resolve, reject) => {
-      let body = "";
-      req.on("data", (chunk) => {
-        body += chunk;
-        if (body.length > 2_000_000) {
-          reject(new Error("Request body too large."));
-        }
-      });
-      req.on("end", () => resolve(body));
-      req.on("error", reject);
-    });
+  runtime.readBody = async (req) => (await runtime.readBodyBuffer(req)).toString("utf8");
 
   runtime.readBodyBuffer = (req, limitBytes = 2_000_000) =>
     new Promise((resolve, reject) => {
@@ -41,6 +38,7 @@ export function installRequestBodyRuntime(runtime) {
         }
         settled = true;
         cleanup();
+        chunks.length = 0;
         reject(error);
       };
 
@@ -49,11 +47,7 @@ export function installRequestBodyRuntime(runtime) {
         total += buffer.length;
         if (total > limitBytes) {
           finishReject(new Error("Request body too large."));
-          try {
-            req.destroy();
-          } catch {
-            // no-op
-          }
+          drainRejectedRequest(req);
           return;
         }
         chunks.push(buffer);

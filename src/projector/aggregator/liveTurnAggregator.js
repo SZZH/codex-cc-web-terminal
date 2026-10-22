@@ -46,6 +46,28 @@ function ensureTool(overlay, payload, ts) {
 
 export function createLiveTurnAggregator({ threadId, turnId }) {
   let overlay = createLiveTurnOverlay({ threadId, turnId });
+  const messages = new Map();
+
+  function applyMessage(event) {
+    const payload = event.payload || {};
+    const key = String(payload.messageId || "");
+    // Deltas without an item ID can precede the first authoritative completed item.
+    if (key && !messages.has(key) && messages.size === 1 && messages.has("") && !messages.get("").completed) {
+      messages.set(key, messages.get(""));
+      messages.delete("");
+    }
+    const previous = messages.get(key);
+    const completed = event.kind === CANONICAL_EVENT_KINDS.MESSAGE_COMPLETED;
+    if (!completed && previous?.completed) return;
+    messages.set(key, {
+      text: completed ? String(payload.text ?? "") : `${previous?.text || ""}${String(payload.text ?? "")}`,
+      completed
+    });
+    overlay.message = {
+      text: [...messages.values()].map((message) => message.text).join("\n\n"),
+      seq: event.seq
+    };
+  }
 
   return {
     getOverlay() {
@@ -53,6 +75,7 @@ export function createLiveTurnAggregator({ threadId, turnId }) {
     },
 
     reset(next = {}) {
+      messages.clear();
       overlay = createLiveTurnOverlay({
         threadId: next.threadId ?? threadId,
         turnId: next.turnId ?? turnId
@@ -72,10 +95,7 @@ export function createLiveTurnAggregator({ threadId, turnId }) {
       switch (event.kind) {
         case CANONICAL_EVENT_KINDS.MESSAGE_DELTA:
         case CANONICAL_EVENT_KINDS.MESSAGE_COMPLETED:
-          overlay.message = {
-            text: mergeLiveText(overlay.message?.text, payload.text),
-            seq: event.seq
-          };
+          applyMessage(event);
           break;
         case CANONICAL_EVENT_KINDS.REASONING_DELTA:
         case CANONICAL_EVENT_KINDS.REASONING_COMPLETED:

@@ -11,6 +11,12 @@ import { CONVERSATION_PROTOCOL_VERSION } from "../conversation/protocol.js";
 import { nowIso } from "../shared/text.js";
 import { buildThreadSnapshotFromFile, deriveConversationStateFromThreadSnapshot } from "../../threads/index.js";
 import { parseHistoricalThreadComposerContext } from "../shared/historicalComposerState.js";
+import {
+  buildHistoryCatalogSourceSignature,
+  historyFileSignature,
+  optionalHistoryFileSignature,
+  readHistoryCatalogFile
+} from "./historyCatalogCache.js";
 
 const CODEX_PROJECT_LIST_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -62,7 +68,7 @@ export class HistoricalSessionService {
     this.customNameMetaPath = path.join(this.config.dataDir, "session-name-meta.json");
     this.archivedSessionsPath = path.join(this.config.dataDir, "archived-sessions.json");
     this.codexSessionIndexPath = this.config.codexSessionIndexPath || path.join(this.config.home, ".codex", "session_index.jsonl");
-    this.codexSessionIndexCache = { mtimeMs: -1, size: -1, byId: new Map() };
+    this.codexSessionIndexCache = { signature: null, byId: new Map() };
     this.providerEntriesCache = new Map();
     this.historicalMessagesCache = new Map();
     this.customNames = new Map(
@@ -112,8 +118,8 @@ export class HistoricalSessionService {
 
   ensureCodexSessionIndexCache() {
     try {
-      const stat = fs.statSync(this.codexSessionIndexPath);
-      const shouldReload = stat.mtimeMs !== this.codexSessionIndexCache.mtimeMs || stat.size !== this.codexSessionIndexCache.size;
+      const signature = historyFileSignature(this.codexSessionIndexPath);
+      const shouldReload = signature !== this.codexSessionIndexCache.signature;
       if (shouldReload) {
         const byId = new Map();
         const content = fs.readFileSync(this.codexSessionIndexPath, "utf8");
@@ -133,10 +139,13 @@ export class HistoricalSessionService {
             // Ignore malformed rows.
           }
         }
-        this.codexSessionIndexCache = { mtimeMs: stat.mtimeMs, size: stat.size, byId };
+        this.codexSessionIndexCache = {
+          signature: historyFileSignature(this.codexSessionIndexPath) === signature ? signature : null,
+          byId
+        };
       }
     } catch {
-      this.codexSessionIndexCache = { mtimeMs: -1, size: -1, byId: new Map() };
+      this.codexSessionIndexCache = { signature: null, byId: new Map() };
     }
   }
 
@@ -169,10 +178,14 @@ export class HistoricalSessionService {
 
   scanHistoricalSessionsForProvider(provider) {
     const providerCacheKey = String(provider?.id || "").trim();
+    const sourceDirs = this.getProviderHistorySourceDirs(provider, { includeArchived: true });
+    const cached = this.providerEntriesCache.get(providerCacheKey);
+    let sourceSignature = null;
     try {
-      const sourceDirs = this.getProviderHistorySourceDirs(provider, { includeArchived: true });
-      const sourceSignature = this.buildHistorySourceSignature(sourceDirs);
-      const cached = this.providerEntriesCache.get(providerCacheKey);
+      sourceSignature = this.buildHistorySourceSignature(sourceDirs);
+      if (provider.id === "codex") {
+        sourceSignature += `|index:${optionalHistoryFileSignature(this.codexSessionIndexPath)}`;
+      }
       if (cached && cached.sourceSignature === sourceSignature) {
         return cached.entries;
       }
@@ -180,13 +193,19 @@ export class HistoricalSessionService {
       // Ignore cache lookup failures and rescan below.
     }
 
-    const files = this.getProviderHistorySourceDirs(provider, { includeArchived: true }).flatMap((dirPath) => walkJsonlFiles(dirPath));
+    const files = sourceDirs.flatMap((dirPath) => walkJsonlFiles(dirPath));
     const entries = [];
+    const fileEntries = new Map();
+    let stableScan = sourceSignature !== null;
 
     for (const filePath of files) {
       try {
-        const stat = fs.statSync(filePath);
-        const parsed = parseHistoricalFile(filePath);
+        const { stat, parsed, cached: fileCache } = readHistoryCatalogFile(filePath, cached?.fileEntries?.get(filePath));
+        if (fileCache) {
+          fileEntries.set(filePath, fileCache);
+        } else {
+          stableScan = false;
+        }
         const id = parsed.resumeSessionId || path.basename(filePath, path.extname(filePath));
         if (!id) {
           continue;
@@ -218,18 +237,15 @@ export class HistoricalSessionService {
           sourceRoot: filePath.startsWith(String(provider.sessionsDir || "")) ? "sessions" : "archived"
         });
       } catch {
+        stableScan = false;
         // Ignore malformed or unreadable session files.
       }
     }
-    try {
-      const sourceSignature = this.buildHistorySourceSignature(this.getProviderHistorySourceDirs(provider, { includeArchived: true }));
-      this.providerEntriesCache.set(providerCacheKey, {
-        sourceSignature,
-        entries
-      });
-    } catch {
-      // Ignore cache population failures.
-    }
+    this.providerEntriesCache.set(providerCacheKey, {
+      sourceSignature: stableScan ? sourceSignature : null,
+      entries,
+      fileEntries
+    });
     return entries;
   }
 
@@ -243,42 +259,7 @@ export class HistoricalSessionService {
   }
 
   buildHistorySourceSignature(sourceDirs) {
-    return sourceDirs
-      .map((dirPath) => {
-        const parts = [];
-        const queue = [dirPath];
-        while (queue.length) {
-          const current = queue.pop();
-          let stat;
-          try {
-            stat = fs.statSync(current);
-          } catch {
-            parts.push(`${current}:missing`);
-            continue;
-          }
-
-          parts.push(`${current}:${stat.mtimeMs}:${stat.size}`);
-          if (!stat.isDirectory()) {
-            continue;
-          }
-
-          let entries = [];
-          try {
-            entries = fs.readdirSync(current, { withFileTypes: true });
-          } catch {
-            continue;
-          }
-
-          for (const entry of entries) {
-            const fullPath = path.join(current, entry.name);
-            if (entry.isDirectory() || (entry.isFile() && fullPath.endsWith(".jsonl"))) {
-              queue.push(fullPath);
-            }
-          }
-        }
-        return parts.sort().join(",");
-      })
-      .join("|");
+    return buildHistoryCatalogSourceSignature(sourceDirs);
   }
 
   isRecentCodexProjectListEntry(entry) {

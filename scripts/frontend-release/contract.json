@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "releasePattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$",
+  "segmentPattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$",
+  "immutablePattern": "^assets/.+-[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9]+$",
+  "fileFields": ["path", "size", "sha256", "contentType", "encoding", "immutable"],
+  "privateRoots": ["api", "ws", "image", "images", "preview", "previews", "files", "attachments"],
+  "publicDirectories": ["assets", "licenses"],
+  "contentTypes": {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".avif": "image/avif",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".webmanifest": "application/manifest+json"
+  }
+}

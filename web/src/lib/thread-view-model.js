@@ -1,4 +1,5 @@
 import { normalizeThreadItem, summarizeProcessItems } from "./thread-item-renderers.js";
+import { activityDuration } from "./activity-time.js";
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];
@@ -67,6 +68,8 @@ function buildHistoricalFileChanges(items = []) {
     for (const [filePath, change] of Object.entries(changes)) {
       const diff = String(change?.unified_diff || "").trim();
       const stats = summarizeDiff(diff);
+      if (Number.isFinite(change?.additions)) stats.additions = Math.max(0, change.additions);
+      if (Number.isFinite(change?.deletions)) stats.deletions = Math.max(0, change.deletions);
       const path = normalizeChangePath(filePath);
       const existing = fileMap.get(path);
       if (existing) {
@@ -91,7 +94,7 @@ function buildHistoricalFileChanges(items = []) {
 
 function createSegment(kind, items = [], turn = {}, index = 0) {
   return {
-    id: `${turn?.id || "turn"}-segment-${index}-${kind}`,
+    id: `${turn?.id || "turn"}-segment-${encodeURIComponent(items[0]?.id || index)}-${kind}`,
     kind,
     items,
     visibleItems: items,
@@ -100,34 +103,19 @@ function createSegment(kind, items = [], turn = {}, index = 0) {
   };
 }
 
-function isTerminalTurn(turn = {}) {
-  const status = String(turn?.status || "").trim().toLowerCase();
-  return Boolean(turn?.completedAt) || ["completed", "failed", "aborted"].includes(status);
-}
-
-function applySegmentCollapseDefaults(segments = [], turn = {}) {
-  const hasPrimary = segments.some((segment) => segment.kind === "primary");
-  return segments.map((segment, index) => {
+function applySegmentCollapseDefaults(segments = []) {
+  return segments.map((segment) => {
     if (segment.kind !== "process") {
       return segment;
     }
-    const hasPrimaryAfter = segments.slice(index + 1).some((candidate) => candidate.kind === "primary");
     const processSummary = summarizeProcessItems(segment.items);
     const hasDiagnosticDump = segment.items.some((item) => item.isDiagnosticDump);
     const visibleItems = segment.items.filter((item) => !item.isNoisyProcess);
-    const defaultCollapsed =
-      hasDiagnosticDump
-        ? true
-        : isTerminalTurn(turn)
-        ? true
-        : hasPrimary
-          ? hasPrimaryAfter || segments.slice(0, index).some((candidate) => candidate.kind === "primary")
-          : false;
     return {
       ...segment,
       visibleItems,
       processSummary,
-      defaultCollapsed,
+      defaultCollapsed: true,
       hasDiagnosticDump
     };
   });
@@ -137,10 +125,23 @@ export function segmentTurnItems(items = [], turn = {}, options = {}) {
   const normalizedItems = asArray(items)
     .map((item) => normalizeThreadItem(item, options))
     .filter(Boolean);
+  const activityStarts = new Map(normalizedItems.filter((item) => item.activity?.event === "started").map((item) => [item.id, item]));
+  const mergedCompletions = new Set();
+  for (const item of normalizedItems) {
+    const started = activityStarts.get(item.activity?.startedItemId);
+    if (!started || item === started || !["completed", "failed", "interrupted"].includes(item.activity?.state)) continue;
+    if (started.activity.agentThreadId && item.activity.agentThreadId && started.activity.agentThreadId !== item.activity.agentThreadId) continue;
+    started.activity = { ...started.activity, ...item.activity, event: "started", label: started.activity.label || item.activity.label,
+      startedAt: started.activity.startedAt || item.activity.startedAt,
+      completedAt: item.activity.completedAt || started.activity.completedAt,
+      durationMs: item.activity.durationMs ?? started.activity.durationMs, startedItemId: started.id };
+    mergedCompletions.add(item.id);
+  }
   const segments = [];
 
   for (const item of normalizedItems) {
-    const segmentKind = item.category === "user" ? "user" : item.category === "primary" ? "primary" : "process";
+    if (mergedCompletions.has(item.id)) continue;
+    const segmentKind = ["user", "primary", "activity"].includes(item.category) ? item.category : "process";
     const previous = segments[segments.length - 1];
     const canMerge =
       previous &&
@@ -169,7 +170,7 @@ export function buildTurnViewModel(turn = {}, options = {}) {
     status: String(turn?.status || "inProgress"),
     startedAt: firstDefined(turn?.startedAt, ""),
     completedAt: firstDefined(turn?.completedAt, ""),
-    durationMs: Number(turn?.durationMs || 0),
+    durationMs: Number(turn?.durationMs || 0) || activityDuration({ state: "completed", startedAt: turn.startedAt, completedAt: turn.completedAt }) || 0,
     error: turn?.error || null,
     segments,
     hasPrimary: segments.some((segment) => segment.kind === "primary"),
@@ -179,8 +180,8 @@ export function buildTurnViewModel(turn = {}, options = {}) {
   };
 }
 
-export function buildThreadViewModel(snapshot = {}, options = {}) {
-  const turns = asArray(snapshot?.turns).map((turn) => buildTurnViewModel(turn, options));
+function buildThread(snapshot, options, buildTurn) {
+  const turns = asArray(snapshot?.turns).map((turn) => buildTurn(turn, options));
   const latestFileChangeTurn = [...turns]
     .reverse()
     .find((turn) => turn.hasFileChange);
@@ -191,5 +192,45 @@ export function buildThreadViewModel(snapshot = {}, options = {}) {
     turns,
     latestFileChangeTurnId: String(latestFileChangeTurn?.id || ""),
     isEmpty: turns.length === 0
+  };
+}
+
+export function buildThreadViewModel(snapshot = {}, options = {}) {
+  return buildThread(snapshot, options, buildTurnViewModel);
+}
+
+export function createThreadViewModelBuilder() {
+  // Presented turns retain their identity only while all display inputs are unchanged.
+  let cache = new WeakMap();
+  let previousOptions = {};
+  let previousTurns = new Map(), previousThreadId;
+  let expansionAnchors = new WeakMap();
+  return (snapshot = {}, options = {}) => {
+    const keys = Object.keys(options);
+    if (keys.length !== Object.keys(previousOptions).length || keys.some((key) => !Object.is(options[key], previousOptions[key]))) {
+      cache = new WeakMap();
+      previousTurns.clear();
+      expansionAnchors = new WeakMap();
+      previousOptions = { ...options };
+    }
+    if (previousThreadId !== snapshot.threadId) { previousTurns.clear(); previousThreadId = snapshot.threadId; }
+    const model = buildThread(snapshot, options, (turn) => {
+      if (!cache.has(turn)) {
+        const view = buildTurnViewModel(turn, options);
+        const previous = previousTurns.get(view.id);
+        const retained = new Set();
+        for (const segment of view.segments.filter((segment) => segment.kind === "process")) {
+          const ids = new Set(segment.items.map((item) => item.id));
+          const anchor = previous?.segments.find((candidate) => candidate.kind === "process" && !retained.has(candidate.id)
+            && ids.has(expansionAnchors.get(candidate) || candidate.items[0]?.id));
+          expansionAnchors.set(segment, anchor && (expansionAnchors.get(anchor) || anchor.items[0]?.id) || segment.items[0]?.id);
+          if (anchor) { segment.id = anchor.id; retained.add(anchor.id); }
+        }
+        cache.set(turn, view);
+      }
+      return cache.get(turn);
+    });
+    previousTurns = new Map(model.turns.map((turn) => [turn.id, turn]));
+    return model;
   };
 }

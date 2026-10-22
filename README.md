@@ -4,7 +4,7 @@ English | [简体中文](./README.zh-CN.md)
 
 One thing only: use local `codex` sessions in your browser (including mobile).
 
-Currently supports **Codex** only.
+The main chat interface is for **Codex**. Legacy Claude Code (CC) terminal compatibility is retained.
 
 ## Screenshots
 
@@ -15,7 +15,7 @@ Currently supports **Codex** only.
 
 ## Prerequisites
 
-- Node.js 22+
+- Node.js 22.15+
 - `codex` CLI installed and available in `PATH`
 - For remote/external access: Tailscale installed on both desktop and phone, logged into the same account
 
@@ -35,7 +35,7 @@ Or run manually (macOS / Linux):
 ```bash
 cd codex-cc-web-terminal
 cp .env.example .env
-# Set your own ACCESS_TOKEN in .env
+# Set your own ACCESS_TOKEN in .env; the default change-me is rejected
 npm install
 npm run dev:up
 ```
@@ -88,6 +88,67 @@ npm run service:start
 npm run service:status
 npm run service:logs
 ```
+
+使用公网静态托管时，应用重启不会自动更新远端前端。请将管理入口构建出的同一份产物按[静态发布与回退流程](docs/operations/frontend-release.md)发布；不要仅重启本机后就认为公网页面已更新。
+
+Codex app-server receives the thread's model, reasoning effort, and permission
+settings explicitly. The browser currently declines command/file approval and
+permission-escalation requests; it does not approve them automatically.
+The composer supports read-only, automatic review, and full-access modes. Automatic
+review uses Codex's reviewer; unsupported human approval requests remain declined.
+Settings belong to the current thread and do not change desktop-wide permissions.
+Reasoning choices follow the selected model's capabilities, and sending waits for
+settings to finish saving. Codex V2 chat sends through the official app-server.
+
+The sidebar follows local Codex project identities, membership, pins and ordering.
+Groups initially show five chats, with an option to expand all. A Recent activity
+view sorts chats across projects by actual activity time. Confirmed running chats
+are marked in both views; desktop-owned threads without reliable runtime evidence
+remain unknown.
+It reads desktop metadata directly instead of scanning every transcript for each
+list request. Model choices come from the active app-server's model catalog.
+Custom permission policies that cannot be represented safely require an explicit
+permission selection before continuation.
+
+## Codex Chat (V2)
+
+Chat uses official Thread / Turn / Item identities, bounded history pages, and a
+WebSocket subscription tied to the stable thread ID. Visible history pages load
+intermediate messages and file changes automatically, with at most two turns being
+read concurrently. Complete older turns are reused; the latest turn reads only new
+items after its last loaded item. Execution details remain collapsed by default. Reconnection restores history and subscriptions without
+replaying prompts. Legacy transcripts are adapted at the history boundary, and the
+existing CC terminal transport remains separate.
+
+Submissions have durable request receipts. Queued messages wait for the current
+web-owned turn to finish; **steer** sends a follow-up to that specific active turn,
+and **interrupt** stops it explicitly. Waiting messages appear above the composer and
+can be promoted to steer without submitting a duplicate. Expanding execution details
+loads them automatically; reasoning items without visible content are omitted.
+Failed messages retain their text and images.
+An uncertain submission is checked automatically and is never blindly resent.
+
+Messages preserve multiline text and support up to six PNG, JPEG, WebP or GIF
+attachments (20 MiB each). Local and inline reply images use authenticated media
+URLs; tool output and file diffs have on-demand details with explicit size limits.
+The web app does not take over a desktop-owned thread. On a writer conflict,
+it saves the message in Codex's durable desktop queue under the original thread
+ID, then checks official history for execution. An unloaded or interrupted
+desktop thread may leave the message pending. Read-only viewing does not claim
+execution ownership, and the web app cannot steer or interrupt desktop-owned turns.
+
+See the [V2 contract](./docs/refactoring/codex-chat-v2.md) and
+[desktop compatibility boundaries](./docs/architecture/codex-desktop-compatibility.md).
+
+## Local File and Web Previews
+
+Open local file links and running loopback web apps in a side panel on desktop or
+a full-screen preview on mobile, while keeping the chat and draft. File previews
+use kkFileView 5.0.3; Office documents, images, PDF and Markdown are the core cases.
+The computer and required services must stay online. Previews use isolated ports
+and temporary, scoped access links; keep private directories outside published
+content. See the [local preview runbook](./docs/operations/local-preview.md) for
+frp/Caddy setup, runtime management and compatibility limits.
 
 ## Common Commands
 

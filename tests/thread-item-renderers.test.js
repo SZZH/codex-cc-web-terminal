@@ -3,7 +3,23 @@ import assert from "node:assert/strict";
 
 import { normalizeImageUrl } from "../web/src/lib/image-url.js";
 import { normalizeThreadItem, summarizeProcessItems } from "../web/src/lib/thread-item-renderers.js";
-import { buildThreadViewModel } from "../web/src/lib/thread-view-model.js";
+import { buildThreadViewModel, createThreadViewModelBuilder } from "../web/src/lib/thread-view-model.js";
+
+test("process expansion identity survives older prefix pages without crossing newly revealed messages or threads", () => {
+  const build = createThreadViewModelBuilder();
+  const command = (id) => ({ id, kind: "CommandExecution", status: "completed", text: id });
+  const snapshot = (items, threadId = "thread") => ({ threadId, turns: [{ id: "turn", status: "completed", items }] });
+  const tail = build(snapshot([command("later"), command("last")]));
+  const tailId = tail.turns[0].segments[0].id;
+  const full = build(snapshot([command("early"), command("later"), command("last")]));
+  assert.equal(full.turns[0].segments[0].id, tailId);
+  assert.deepEqual(full.turns[0].segments[0].items.map((item) => item.id), ["early", "later", "last"]);
+  const split = build(snapshot([command("early"), { id: "commentary", kind: "AgentMessage", text: "reply" }, command("later"), command("last")]));
+  assert.equal(split.turns[0].segments[2].id, tailId, "the group containing the originally opened item keeps its identity");
+  assert.notEqual(split.turns[0].segments[0].id, tailId, "a process split must not duplicate an expansion identity");
+  const other = build(snapshot([command("earlier"), command("early"), command("last")], "other-thread"));
+  assert.equal(other.turns[0].segments[0].id, buildThreadViewModel(snapshot([command("earlier"), command("early"), command("last")], "other-thread")).turns[0].segments[0].id);
+});
 
 test("thread item renderer normalizes process items with explicit type title and status label", () => {
   const item = normalizeThreadItem({
@@ -255,7 +271,7 @@ test("thread view model collapses process segments for terminal turns", () => {
   const completedProcess = viewModel.turns[2].segments.find((segment) => segment.kind === "process");
 
   assert.equal(historyProcess.defaultCollapsed, true);
-  assert.equal(runningProcess.defaultCollapsed, false);
+  assert.equal(runningProcess.defaultCollapsed, true);
   assert.equal(completedProcess.defaultCollapsed, true);
 });
 
@@ -341,7 +357,7 @@ test("thread view model keeps a process segment renderable even before primary t
   assert.equal(viewModel.turns[0].segments.length, 1);
   assert.equal(viewModel.turns[0].segments[0].kind, "process");
   assert.equal(viewModel.turns[0].segments[0].items[0].label, "命令执行");
-  assert.equal(viewModel.turns[0].segments[0].defaultCollapsed, false);
+  assert.equal(viewModel.turns[0].segments[0].defaultCollapsed, true);
 });
 
 test("thread view model keeps workspace changes anchored to the file-change turn", () => {

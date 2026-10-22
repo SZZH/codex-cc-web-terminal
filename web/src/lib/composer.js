@@ -11,19 +11,25 @@ export const REASONING_EFFORT_OPTIONS = [
 export const PERMISSION_MODE_OPTIONS = [
   {
     value: "default",
-    label: "默认权限",
-    description: "沿用当前项目配置"
+    label: "只读",
+    description: "仅可读取文件"
   },
   {
     value: "auto-review",
-    label: "自动审查",
-    description: "写入工作区，必要时请求确认"
+    label: "自动审核",
+    description: "工作区读写，额外权限由 Codex 审核"
   },
   {
     value: "full-access",
     label: "完全访问权限",
     description: "跳过审批和沙箱，仅 Codex 生效"
   }
+];
+
+export const CODEX_PERMISSION_MODE_OPTIONS = [
+  PERMISSION_MODE_OPTIONS[0],
+  { value: "manual-review", label: "人工审批", description: "默认只读，额外权限由你审批" },
+  ...PERMISSION_MODE_OPTIONS.slice(1)
 ];
 
 export function createComposerOptions(overrides = {}) {
@@ -51,7 +57,36 @@ export function createWorkspaceGitState(overrides = {}) {
 }
 
 export function getReasoningEffortLabel(value) {
-  return REASONING_EFFORT_OPTIONS.find((option) => option.value === value)?.label || "中等";
+  const labels = { none: "关闭", minimal: "最低", max: "最高", ultra: "极致" };
+  return REASONING_EFFORT_OPTIONS.find((option) => option.value === value)?.label || labels[value] || String(value || "未启用");
+}
+
+export function getModelReasoningEffortOptions(models = [], model = "") {
+  const selectedModel = models.find((option) => option.value === model);
+  if (!Array.isArray(selectedModel?.supportedReasoningEfforts)) {
+    return REASONING_EFFORT_OPTIONS;
+  }
+  return selectedModel.supportedReasoningEfforts.map((value) => ({
+    value,
+    label: getReasoningEffortLabel(value)
+  }));
+}
+
+export function normalizeComposerSettingsPatch(patch = {}, options = {}, models = []) {
+  const normalized = { ...patch };
+  if (!Object.hasOwn(patch, "model") && !Object.hasOwn(patch, "reasoningEffort")) {
+    return normalized;
+  }
+  const model = Object.hasOwn(patch, "model") ? patch.model : options.model;
+  const selectedModel = models.find((option) => option.value === model);
+  const efforts = getModelReasoningEffortOptions(models, model).map((option) => option.value);
+  const effort = Object.hasOwn(patch, "reasoningEffort") ? patch.reasoningEffort : options.reasoningEffort;
+  if (!efforts.includes(effort)) {
+    normalized.reasoningEffort = efforts.includes(selectedModel?.defaultReasoningEffort)
+      ? selectedModel.defaultReasoningEffort
+      : Array.isArray(selectedModel?.supportedReasoningEfforts) ? efforts[0] || "" : "medium";
+  }
+  return normalized;
 }
 
 export function getProviderModelOptions(providers = [], providerId = "codex", currentModel = "") {
@@ -74,7 +109,15 @@ export function getProviderModelOptions(providers = [], providerId = "codex", cu
       }
       return {
         value,
-        label: String(item?.label || value).trim() || value
+        label: String(item?.label || value).trim() || value,
+        ...(typeof item?.capabilitiesKnown === "boolean" ? { capabilitiesKnown: item.capabilitiesKnown } : {}),
+        ...(Array.isArray(item?.inputModalities) ? { inputModalities: [...item.inputModalities] } : {}),
+        ...(Array.isArray(item?.supportedReasoningEfforts)
+          ? { supportedReasoningEfforts: [...new Set(item.supportedReasoningEfforts.map((effort) => String(effort || "").trim()).filter(Boolean))] }
+          : {}),
+        ...(String(item?.defaultReasoningEffort || "").trim()
+          ? { defaultReasoningEffort: String(item.defaultReasoningEffort).trim() }
+          : {})
       };
     })
     .filter(Boolean);
@@ -96,8 +139,7 @@ export function formatComposerContextSummary(options, modelOptions = []) {
 export function hasImageAttachment(attachments = []) {
   return (attachments || []).some(
     (attachment) =>
-      attachment?.kind === "image" &&
-      attachment?.status !== "failed"
+      attachment?.kind === "image"
   );
 }
 
@@ -155,20 +197,16 @@ export function collectAttachmentLimitError(records = [], nextRecord) {
 
 export function serializeImageAttachmentsForRequest(attachments = []) {
   return (attachments || [])
-    .filter((attachment) => attachment?.kind === "image" && attachment?.status !== "failed")
+    .filter((attachment) => attachment?.kind === "image" && attachment?.status === "uploaded" && attachment?.uploadedId)
     .map((attachment) => ({
-      id: String(attachment.id || ""),
-      kind: "image",
-      name: String(attachment.name || ""),
-      mimeType: String(attachment.file?.type || ""),
-      size: Number(attachment.file?.size || 0),
-      status: String(attachment.status || "pending")
+      id: String(attachment.uploadedId)
     }));
 }
 
 export function buildSessionCreateRequest({
   provider = "codex",
   cwd = "",
+  projectId = "",
   name = "",
   resumeSessionId = "",
   composerOptions = {}
@@ -176,10 +214,11 @@ export function buildSessionCreateRequest({
   return {
     provider,
     cwd,
+    ...(projectId ? { projectId } : {}),
     ...(name ? { name } : {}),
     ...(resumeSessionId ? { resumeSessionId } : {}),
     model: String(composerOptions.model || "").trim(),
-    reasoningEffort: String(composerOptions.reasoningEffort || "medium").trim() || "medium",
+    reasoningEffort: String(composerOptions.reasoningEffort ?? "medium").trim(),
     permissionMode: String(composerOptions.permissionMode || "default").trim() || "default"
   };
 }
@@ -188,12 +227,12 @@ export function buildInputRequest({
   text = "",
   composerOptions = {}
 } = {}) {
-  const trimmed = String(text || "").trim();
+  const source = String(text || "");
   return {
     type: "input",
-    data: trimmed ? `${trimmed}\n` : "",
+    data: source.trim() ? `${source}\n` : "",
     model: String(composerOptions.model || "").trim(),
-    reasoningEffort: String(composerOptions.reasoningEffort || "medium").trim() || "medium",
+    reasoningEffort: String(composerOptions.reasoningEffort ?? "medium").trim(),
     permissionMode: String(composerOptions.permissionMode || "default").trim() || "default",
     attachments: serializeImageAttachmentsForRequest(composerOptions.attachments || [])
   };

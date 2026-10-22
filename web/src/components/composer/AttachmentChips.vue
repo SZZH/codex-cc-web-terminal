@@ -17,7 +17,7 @@ function iconForAttachment(attachment = {}) {
       <span class="chip-icon" aria-hidden="true">{{ iconForAttachment(attachment) }}</span>
       <span class="chip-name">{{ attachment.name }}</span>
       <button
-        v-if="attachment.status === 'failed'"
+        v-if="attachment.kind === 'image' && attachment.status === 'failed' && attachment.file"
         type="button"
         class="chip-remove"
         :disabled="disabled"
@@ -25,7 +25,6 @@ function iconForAttachment(attachment = {}) {
         @click="emit('retry', attachment.id)"
       >↻</button>
       <button
-        v-else
         type="button"
         class="chip-remove"
         :disabled="disabled"

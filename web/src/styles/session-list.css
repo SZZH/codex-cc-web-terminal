@@ -1,0 +1,260 @@
+.session-screen {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 12px 18px;
+}
+.session-screen > * { flex-shrink: 0; }
+
+.session-list-loading { min-height: 112px; display: grid; place-items: center; color: #846b54; font-size: 14px; }
+.session-list-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #984237; font-size: 13px; overflow-wrap: anywhere; }
+.session-list-error button { flex: 0 0 44px; width: 44px; height: 44px; border: 1px solid #d9cec3; border-radius: 6px; background: #fffcf8; color: inherit; font: inherit; font-size: 22px; cursor: pointer; }
+.session-list-error button:disabled { opacity: 0.5; cursor: default; }
+.session-list-error button:focus-visible, .session-show-more:focus-visible { outline: 2px solid #b6a08b; outline-offset: 2px; }
+.session-running-count { flex: 0 0 auto; color: #846b54; font-size: 11px; white-space: nowrap; }
+.session-show-more { display: flex; align-items: center; gap: 8px; align-self: flex-start; padding: 8px 12px; border: 0; border-radius: 8px; background: transparent; color: #88715e; font: inherit; font-size: 12px; cursor: pointer; }
+.session-show-more:hover { background: #f0e8df; }
+.session-activity { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid #dfd4ca; border-radius: 18px; background: #faf6f1; }
+
+.session-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.session-group {
+  position: relative;
+  overflow: visible;
+  border: 1px solid rgba(201, 189, 177, 0.55);
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(255, 251, 247, 0.98), rgba(247, 242, 237, 0.94));
+  box-shadow: 0 12px 30px rgba(120, 101, 84, 0.05);
+}
+
+.session-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 14px 14px 13px;
+}
+
+.session-group-toggle-area {
+  display: flex;
+  align-items: flex-start;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  appearance: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.session-group-toggle-area:active {
+  transform: translateY(1px);
+}
+
+.session-group-toggle-area:focus-visible {
+  outline: 2px solid rgba(182, 160, 139, 0.34);
+  outline-offset: 2px;
+  border-radius: 14px;
+}
+
+.session-group-head-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
+}
+
+.session-screen .folder-icon {
+  position: relative;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  margin-top: 1px;
+  border: 1px solid rgba(205, 193, 181, 0.66);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(240, 232, 224, 0.98), rgba(248, 242, 236, 0.9));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+.session-screen .folder-icon::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 6px;
+  width: 12px;
+  height: 5px;
+  border-radius: 4px 4px 0 0;
+  background: rgba(146, 126, 108, 0.16);
+}
+
+.session-screen .folder-icon::after {
+  content: "";
+  position: absolute;
+  inset: 9px 4px 4px;
+  border-radius: 5px;
+  background: rgba(146, 126, 108, 0.1);
+}
+
+.session-group-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.session-group-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-group-title-row h2 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: rgba(58, 50, 42, 0.94);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-group-count {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid rgba(208, 197, 187, 0.6);
+  border-radius: 999px;
+  background: rgba(245, 239, 233, 0.92);
+  color: rgba(127, 112, 98, 0.92);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.session-group-subtitle {
+  margin: 5px 0 0;
+  color: rgba(140, 124, 110, 0.95);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.session-group-add {
+  position: relative;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(205, 193, 181, 0.72);
+  border-radius: 999px;
+  background: rgba(255, 252, 248, 0.86);
+  color: rgba(118, 100, 84, 0.92);
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 26px;
+  text-align: center;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.74);
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.session-group-add:hover {
+  border-color: rgba(178, 158, 138, 0.8);
+  background: rgba(255, 249, 243, 0.98);
+}
+
+.session-group-add:active {
+  transform: translateY(1px);
+}
+
+.session-group-add:focus-visible {
+  outline: 2px solid rgba(182, 160, 139, 0.34);
+  outline-offset: 2px;
+}
+
+.session-group-add:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.session-group-add.loading .session-group-add-label {
+  opacity: 0;
+}
+
+.session-group-add.loading::after {
+  content: "";
+  position: absolute;
+  inset: 7px;
+  border: 2px solid rgba(180, 163, 145, 0.32);
+  border-top-color: rgba(118, 100, 84, 0.92);
+  border-radius: 999px;
+  animation: group-add-spin 0.8s linear infinite;
+}
+
+@keyframes group-add-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.session-group-body {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 10px 10px 42px;
+}
+
+.session-group-body::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 10px;
+  left: 26px;
+  width: 1px;
+  background: linear-gradient(
+    180deg,
+    rgba(201, 189, 177, 0.42),
+    rgba(201, 189, 177, 0.1)
+  );
+}
+
+.session-row-placeholder { margin: 0; padding: 2px 12px 6px; color: #a2958a; font-size: 14px; line-height: 1.4; }
+
+.session-screen .empty-state {
+  padding: 24px 18px;
+  border: 1px dashed rgba(205, 193, 181, 0.7);
+  border-radius: 18px;
+  background: rgba(250, 246, 242, 0.78);
+  color: rgba(142, 126, 113, 0.92);
+  font-size: 13px;
+  text-align: center;
+}
+
+@media (min-width: 700px) {
+  .session-screen {
+    padding: 14px 16px 20px;
+  }
+}

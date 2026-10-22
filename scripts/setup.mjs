@@ -246,7 +246,7 @@ async function main() {
   base.set('DEFAULT_CWD', defaultCwd);
 
   logStep('写入 .env');
-  writeFileSync(envPath, toEnvContent(base), 'utf8');
+  writeFileSync(envPath, toEnvContent(base), { encoding: 'utf8', mode: 0o600 });
   output.write(`已写入: ${envPath}\n`);
 
   if (tailscaleOnly) {

@@ -1,5 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { EventEmitter } from "node:events";
+
+import { CodexThreadService } from "../src/sessions/codex/threadService.js";
+import { createBaseConfig, createTempDir, waitForCondition } from "./helpers/backendTestUtils.js";
 
 import {
   applyConversationDeltaPayload,
@@ -10,6 +15,55 @@ import {
 function applyPayload(state, payload) {
   return applyConversationDeltaPayload(state, payload).conversation;
 }
+
+test("Codex V2 reads official history and completes streamed requests without legacy manager projection methods", async (t) => {
+  const rootDir = createTempDir();
+  const config = createBaseConfig(rootDir);
+  const calls = [];
+  const bridge = new EventEmitter();
+  bridge.ensureReady = async () => {};
+  bridge.request = async (method, params) => {
+    calls.push({ method, params });
+    if (method === "thread/read") return { thread: { id: params.threadId, cwd: rootDir, status: { type: "idle" } } };
+    if (method === "thread/turns/list") return { data: [], nextCursor: null };
+    if (method === "thread/resume") return {};
+    if (method === "turn/start") return { turn: { id: "official-turn", status: "inProgress", items: [] } };
+    assert.fail(`Unexpected official method: ${method}`);
+  };
+  const sessionManager = new Proxy({ codexModelCatalog: () => [] }, {
+    get(target, property, receiver) {
+      assert.equal(property, "codexModelCatalog", `V2 accessed manager.${String(property)}`);
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  const service = new CodexThreadService({ config, bridge, sessionManager, pollMs: 60_000 });
+  t.after(() => {
+    service.shutdown();
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+  const page = await service.reader.listTurns("official-thread");
+  assert.deepEqual(page.turns, []);
+  assert.deepEqual(calls.map(({ method }) => method), ["thread/read", "thread/turns/list"]);
+  assert.equal(calls[0].params.includeTurns, false);
+
+  const events = [];
+  service.subscribe("official-thread", (event) => events.push(event));
+  service.submit("official-thread", { clientRequestId: "v2-boundary-request", input: { text: "continue", attachments: [] }, options: {} });
+  await waitForCondition(() => service.requests.get("official-thread", "v2-boundary-request")?.state === "accepted");
+  const turnParams = { threadId: "official-thread", turnId: "official-turn" };
+  bridge.emit("notification", { method: "item/agentMessage/delta", params: { ...turnParams, itemId: "official-item", delta: "reply" } });
+  bridge.emit("notification", { method: "item/completed", params: { ...turnParams, item: { id: "official-item", type: "agentMessage", text: "reply" } } });
+  bridge.emit("notification", { method: "turn/completed", params: { threadId: "official-thread", turn: { id: "official-turn", status: "completed", items: [] } } });
+
+  assert.equal(service.requests.get("official-thread", "v2-boundary-request").state, "completed");
+  assert.equal(calls.filter(({ method }) => method === "turn/start").length, 1);
+  assert.equal(calls.find(({ method }) => method === "turn/start").params.clientUserMessageId, "v2-boundary-request");
+  assert.deepEqual(events.filter(({ type }) => type === "item.delta").map(({ payload }) => payload), [
+    { turnId: "official-turn", itemId: "official-item", field: "text", text: "reply" }
+  ]);
+  assert.equal(events.find(({ type }) => type === "item.upsert").payload.item.text, "reply");
+  assert.ok(events.every(({ schemaVersion }) => schemaVersion === 2));
+});
 
 test("realtime assistant body stays visible while streaming updates converge into a single committed block", () => {
   let state = createConversationState({

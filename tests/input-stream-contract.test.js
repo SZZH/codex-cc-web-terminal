@@ -1026,26 +1026,27 @@ test("typed SSE contract: input-stream transport filters snapshots and keeps tra
   assert.doesNotMatch(sessionStreamSource, /type === "conversation_snapshot"/);
 });
 
-test("input main-path guard: App submits through json input and leaves rendering to history polling", () => {
+test("input main-path guard: JSON submission preserves realtime transport and history reconciliation", () => {
   const appSource = fs.readFileSync(new URL("../web/src/App.vue", import.meta.url), "utf8");
+  const composerSource = fs.readFileSync(new URL("../web/src/lib/composer-runtime.js", import.meta.url), "utf8");
   const threadRuntimeSource = fs.readFileSync(new URL("../web/src/lib/thread-runtime.js", import.meta.url), "utf8");
   const liveRuntimeSource = fs.readFileSync(new URL("../web/src/lib/live-session-runtime.js", import.meta.url), "utf8");
   const sessionManagerSource = fs.readFileSync(new URL("../src/sessionManager.js", import.meta.url), "utf8");
-  const submitStart = appSource.indexOf("async function submitInput()");
-  const submitEnd = appSource.indexOf("async function interruptActiveSession()");
-  const submitSource = submitStart >= 0 && submitEnd > submitStart ? appSource.slice(submitStart, submitEnd) : "";
+  const submitStart = composerSource.indexOf("async function submitInput()");
+  const submitEnd = composerSource.indexOf("async function interruptActiveSession()");
+  const submitSource = submitStart >= 0 && submitEnd > submitStart ? composerSource.slice(submitStart, submitEnd) : "";
 
+  assert.match(appSource, /createComposerSubmissionController\(/);
+  assert.doesNotMatch(submitSource, /closeSocket\(/);
+  assert.match(submitSource, /await attachLiveSocket\(liveSessionId\)/);
+  assert.match(submitSource, /applyInputResponse\(payload\)/);
   assert.match(
     submitSource,
-    /try \{\s*state\.loading = true;\s*setStatus\("正在发送…"\);\s*closeSocket\(\{ silent: true \}\);/
-  );
-  assert.match(
-    submitSource,
-    /if \(targetThreadId\) \{[\s\S]*requestThreadInput\([\s\S]*\} else \{[\s\S]*requestSessionInput\(/
+    /targetThreadId\s*\? await requestThreadInput\([\s\S]*: await requestSessionInput\(/
   );
   assert.doesNotMatch(submitSource, /requestThreadInputStream\(/);
   assert.doesNotMatch(submitSource, /requestSessionInputStream\(/);
-  assert.doesNotMatch(submitSource, /activeInputStream\s*=/);
+  assert.match(submitSource, /activeInputStream = true/);
   assert.doesNotMatch(submitSource, /stopHistorySyncLoop\(\)/);
   assert.doesNotMatch(appSource, /requestThreadInputStream/);
   assert.doesNotMatch(appSource, /requestSessionInputStream/);
@@ -1053,7 +1054,7 @@ test("input main-path guard: App submits through json input and leaves rendering
   assert.doesNotMatch(appSource, /Promise\.race\(\[streamPromise,\s*historyFallbackPromise\]\)/);
   assert.match(
     submitSource,
-    /finally \{[\s\S]*state\.loading = false;[\s\S]*await syncActiveThreadSession\(\{ silent: true \}\)\.catch\(\(\) => \{\}\);[\s\S]*startHistorySyncLoop\(\);[\s\S]*\}/
+    /finally \{[\s\S]*isCurrent\(\)[\s\S]*state\.loading = false;[\s\S]*await syncActiveThreadSession\(\{ silent: true \}\)\.catch\(\(\) => \{\}\);[\s\S]*startHistorySyncLoop\(\);/
   );
   assert.match(
     appSource,
@@ -1065,11 +1066,11 @@ test("input main-path guard: App submits through json input and leaves rendering
   );
   assert.match(
     fs.readFileSync(new URL("../web/src/lib/session-runtime.js", import.meta.url), "utf8"),
-    /forceSync: isAwaitingInputStatus\(state\.statusText\)/
+    /forceSync:[\s\S]*isAwaitingInputStatus\(state\.statusText\)/
   );
   assert.match(
-    appSource,
-    /async function interruptActiveSession\(\) \{[\s\S]*?closeSocket\(\{ silent: true \}\);[\s\S]*?type:\s*"interrupt"/
+    composerSource,
+    /async function interruptActiveSession\(\) \{[\s\S]*?type:\s*"interrupt"/
   );
   assert.match(
     threadRuntimeSource,
@@ -1093,18 +1094,23 @@ test("input main-path guard: App submits through json input and leaves rendering
   );
   assert.match(
     sessionManagerSource,
-    /const preferAppServer = Boolean\([\s\S]*this\.config\.codexAppServerEnabled[\s\S]*this\.appServerBridge[\s\S]*!sessionRequiresJsonExec/
+    /preferredCodexRunnerMode\([\s\S]*this\.config\.codexAppServerEnabled[\s\S]*this\.appServerBridge/
   );
+  assert.doesNotMatch(sessionManagerSource, /sessionRequiresJsonExec/);
 });
 
-test("input-stream control contract: interrupt events stay explicit and map to ESC only inside the transport adapter", () => {
+test("input-stream control contract: interrupt events call the session control API without writing a prompt", () => {
   const events = normalizeSessionInputEvents({ type: "interrupt", reason: "user_interrupt" });
   assert.deepEqual(events, [{ type: "interrupt", reason: "user_interrupt" }]);
 
   const writes = [];
+  const interrupts = [];
   applySessionInputEvents(
     {
       resize() {},
+      interrupt(sessionId) {
+        interrupts.push(sessionId);
+      },
       write(_sessionId, data) {
         writes.push(data);
         return "";
@@ -1114,5 +1120,6 @@ test("input-stream control contract: interrupt events stay explicit and map to E
     events
   );
 
-  assert.deepEqual(writes, ["\u001b"]);
+  assert.deepEqual(writes, []);
+  assert.deepEqual(interrupts, ["session-ctrl-1"]);
 });

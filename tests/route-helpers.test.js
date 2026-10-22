@@ -11,8 +11,9 @@ import {
 } from "../src/sessions/history/sessionSidebarSnapshot.js";
 import { buildSessionCreatePayloadFromThreadState } from "../src/routes/threadComposerState.js";
 
-test("buildSessionSidebarPayload falls back to grouped + live session merge", () => {
-  const payload = buildSessionSidebarPayload({
+test("buildSessionSidebarPayload falls back to grouped + live session merge", async (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-04-29T12:00:00.000Z"));
+  const payload = await buildSessionSidebarPayload({
     listAll() {
       return [
         { id: "live-1", name: "live", updatedAt: "2026-04-28T10:00:00.000Z" },
@@ -34,7 +35,16 @@ test("buildSessionSidebarPayload falls back to grouped + live session merge", ()
   assert.deepEqual(payload.sessions.map((session) => session.id), ["live-1", "history-1"]);
 });
 
-test("mergeProjectGroupsWithLiveSessions injects matching live sessions and preserves empty groups", () => {
+test("buildSessionSidebarPayload awaits the async manager without invoking its legacy snapshot", async () => {
+  const payload = await buildSessionSidebarPayload({
+    async listSidebarSnapshotAsync() { return { sessions: [], projectGroups: [] }; },
+    listSidebarSnapshot() { assert.fail("HTTP payload must prefer the async manager"); }
+  });
+  assert.deepEqual(payload, { sessions: [], projectGroups: [] });
+});
+
+test("mergeProjectGroupsWithLiveSessions injects matching live sessions and preserves project order and old history", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-04-29T12:00:00.000Z"));
   const groups = mergeProjectGroupsWithLiveSessions(
     [
       {
@@ -63,10 +73,11 @@ test("mergeProjectGroupsWithLiveSessions injects matching live sessions and pres
     groups[0].sessions.map((session) => session.id),
     ["live-1", "live-2"]
   );
-  assert.deepEqual(groups[1].sessions, []);
+  assert.deepEqual(groups[1].sessions.map((session) => session.id), ["history-old"]);
 });
 
-test("buildSidebarSnapshotFromGroups appends sessions missing from project groups", () => {
+test("buildSidebarSnapshotFromGroups appends sessions missing from project groups", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-04-29T12:00:00.000Z"));
   const payload = buildSidebarSnapshotFromGroups(
     [
       { id: "live-2", updatedAt: "2026-04-28T10:00:00.000Z" },
@@ -83,7 +94,7 @@ test("buildSidebarSnapshotFromGroups appends sessions missing from project group
   assert.deepEqual(payload.sessions.map((session) => session.id), ["live-2", "history-1"]);
 });
 
-test("filterSidebarSessionsByRecency keeps only unarchived sessions used within seven days", () => {
+test("filterSidebarSessionsByRecency retains old unarchived sessions like the desktop sidebar", () => {
   const nowMs = Date.parse("2026-04-29T12:00:00.000Z");
   const payload = filterSidebarSessionsByRecency(
     [
@@ -98,7 +109,7 @@ test("filterSidebarSessionsByRecency keeps only unarchived sessions used within 
     { nowMs }
   );
 
-  assert.deepEqual(payload.map((session) => session.id), ["recent-history"]);
+  assert.deepEqual(payload.map((session) => session.id), ["recent-history", "eight-days-old-history", "old-history", "running-live-old", "exited-live-old"]);
 });
 
 test("history route helpers parse query and scoped routes", () => {

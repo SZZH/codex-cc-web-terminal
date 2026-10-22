@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { applySessionInputEvents, normalizeSessionInputEvents, openSessionSseStream } from "../transport/index.js";
-import { applyComposerOptionOverrides } from "../sessions/shared/composerOptions.js";
+import { applyComposerOptionOverrides, normalizeCodexComposerPatch } from "../sessions/shared/composerOptions.js";
 import { buildSessionSidebarPayload } from "./sessionSidebar.js";
-import { buildSessionCreatePayloadFromThreadState, buildThreadComposerState } from "./threadComposerState.js";
+import { sendSidebarResponse } from "./sidebarResponse.js";
+import { buildSessionCreatePayloadFromThreadState, buildThreadComposerState, getCodexThreadStateStore } from "./threadComposerState.js";
 import { workspaceChangesInternals } from "./workspaceChanges.js";
 
 function extractSessionOptionOverrides(body = {}) {
@@ -26,7 +27,7 @@ function hasStreamTurnInput(events = []) {
     if (event?.type === "interrupt") {
       return true;
     }
-    return event?.type === "input" && String(event?.data || "") !== "";
+    return event?.type === "input" && (String(event?.data || "") !== "" || Boolean(event?.attachments?.length));
   });
 }
 
@@ -133,6 +134,7 @@ export async function handleSessionRoute(ctx, runtime) {
         return true;
       }
 
+      ctx.set("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'");
       runtime.serveFile(ctx, filePath, contentType);
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
@@ -145,7 +147,10 @@ export async function handleSessionRoute(ctx, runtime) {
       return true;
     }
 
-    runtime.json(ctx, 200, buildSessionSidebarPayload(runtime.sessionManager));
+    await sendSidebarResponse(ctx, runtime, await buildSessionSidebarPayload(runtime.sessionManager, runtime.codexThreads), {
+      compact: ctx.query?.compact === "1",
+      progressive: ctx.query?.progressive === "1"
+    });
     return true;
   }
 
@@ -211,7 +216,9 @@ export async function handleSessionRoute(ctx, runtime) {
     try {
       const providerId = decodeURIComponent(parts[3] || "").trim();
       const threadId = decodeURIComponent(parts[4] || "").trim();
-      runtime.json(ctx, 200, buildThreadComposerState(runtime, workspaceChangesInternals, providerId, threadId));
+      runtime.json(ctx, 200, await buildThreadComposerState(runtime, workspaceChangesInternals, providerId, threadId, {
+        includeGit: new URL(ctx.url, "http://localhost").searchParams.get("git") !== "0"
+      }));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -241,37 +248,34 @@ export async function handleSessionRoute(ctx, runtime) {
       }
       const body = runtime.parseJson(await runtime.readBody(ctx.req));
       const store = getCodexThreadStateStore(runtime);
-      const nextState = store.patchThreadComposerState(threadId, body || {});
-      if (!nextState) {
+      const models = runtime.sessionManager.providerCatalog?.().find((provider) => provider.id === "codex")?.models || [];
+      const liveSession = runtime.sessionManager.findLiveSessionByThreadId?.(threadId, { providerId }) || null;
+      const storedState = store.getThreadComposerState(threadId);
+      if (!storedState && !liveSession) {
         runtime.json(ctx, 404, { error: `Thread composer state not found: ${providerId}/${threadId}` });
         return true;
       }
-      const nextComposerState = buildThreadComposerState(runtime, workspaceChangesInternals, providerId, threadId);
-
-      const liveSession =
-        typeof runtime.sessionManager.findLiveSessionByThreadId === "function"
-          ? runtime.sessionManager.findLiveSessionByThreadId(threadId, { providerId })
-          : null;
+      const patch = normalizeCodexComposerPatch(body || {}, storedState || liveSession, models);
+      const nextState = storedState ? store.patchThreadComposerState(threadId, { ...body, ...patch }, { models }) : liveSession;
+      const options = storedState ? {
+        model: nextState.model,
+        reasoningEffort: nextState.reasoningEffort,
+        permissionMode: nextState.permissionMode
+      } : patch;
       if (liveSession) {
         if (typeof runtime.sessionManager.updateSessionOptions === "function") {
-          runtime.sessionManager.updateSessionOptions(liveSession, {
-            model: nextComposerState.model,
-            reasoningEffort: nextComposerState.reasoningEffort,
-            permissionMode: nextComposerState.permissionMode
-          });
+          runtime.sessionManager.updateSessionOptions(liveSession, options);
         } else {
-          applyComposerOptionOverrides(liveSession, {
-            model: nextComposerState.model,
-            reasoningEffort: nextComposerState.reasoningEffort,
-            permissionMode: nextComposerState.permissionMode
-          });
+          applyComposerOptionOverrides(liveSession, options);
         }
         if (nextState.cwd) {
           liveSession.cwd = nextState.cwd;
         }
       }
 
-      runtime.json(ctx, 200, nextComposerState);
+      runtime.json(ctx, 200, await buildThreadComposerState(runtime, workspaceChangesInternals, providerId, threadId, {
+        includeGit: new URL(ctx.url, "http://localhost").searchParams.get("git") !== "0"
+      }));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -322,11 +326,12 @@ export async function handleSessionRoute(ctx, runtime) {
       }
       let createPayload = body;
       if (resumeSessionId) {
-        const threadComposerState = buildThreadComposerState(
+        const threadComposerState = await buildThreadComposerState(
           runtime,
           workspaceChangesInternals,
           providerId,
-          resumeSessionId
+          resumeSessionId,
+          { includeGit: false }
         );
         createPayload = buildSessionCreatePayloadFromThreadState(body, threadComposerState);
       }
@@ -473,10 +478,8 @@ export async function handleSessionRoute(ctx, runtime) {
       const session = runtime.sessionManager.ensureLiveSessionForThread(threadId, {
         providerId: String(body.provider || providerId || "").trim(),
         cwd: body.cwd,
-        model: body.model,
         name: body.name,
-        reasoningEffort: body.reasoningEffort,
-        permissionMode: body.permissionMode
+        ...optionOverrides
       });
       if (!session) {
         runtime.json(ctx, 404, { error: "Session not found" });
@@ -526,10 +529,8 @@ export async function handleSessionRoute(ctx, runtime) {
       const session = runtime.sessionManager.ensureLiveSessionForThread(threadId, {
         providerId: String(body.provider || providerId || "").trim(),
         cwd: body.cwd,
-        model: body.model,
         name: body.name,
-        reasoningEffort: body.reasoningEffort,
-        permissionMode: body.permissionMode
+        ...optionOverrides
       });
       if (!session) {
         runtime.json(ctx, 404, { error: "Session not found" });
@@ -557,6 +558,14 @@ export async function handleSessionRoute(ctx, runtime) {
     const id = ctx.path.split("/").at(-1);
     try {
       const body = runtime.parseJson(await runtime.readBody(ctx.req));
+      const liveSession = runtime.sessionManager.get(id);
+      if (liveSession?.provider === "codex" && liveSession.resumeSessionId && runtime.sessionManager.appServerBridge) {
+        await runtime.sessionManager.appServerBridge.ensureReady();
+        await runtime.sessionManager.appServerBridge.request("thread/name/set", {
+          threadId: liveSession.resumeSessionId,
+          name: String(body.name || "").trim()
+        });
+      }
       const session = runtime.sessionManager.rename(id, body.name);
       runtime.json(ctx, 200, { session });
     } catch (err) {

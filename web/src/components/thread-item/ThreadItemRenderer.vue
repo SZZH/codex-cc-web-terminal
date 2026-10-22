@@ -1,119 +1,33 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import MarkdownIt from "markdown-it";
+import { computed, nextTick, onBeforeUnmount, shallowRef, watch } from "vue";
 import DOMPurify from "dompurify";
-import hljs from "highlight.js";
+import { createThreadItemMarkdown } from "../../lib/thread-item-markdown.js";
+import { preserveCodeScroll } from "../../lib/code-highlighting.js";
+import { handleLocalPreviewLink } from "../../lib/markdown-links.js";
+import { openLocalPreview } from "../../lib/preview.js";
+import ImageLightbox from "./ImageLightbox.vue";
+import ThreadQuestionCard from "./ThreadQuestionCard.vue";
+import ThreadQuestionReply from "./ThreadQuestionReply.vue";
 
 const props = defineProps({
+  workspaceCwd: { type: String, default: "" },
+  compactProcess: { type: Boolean, default: false },
+  canAnswerQuestions: { type: Boolean, default: false },
   item: { type: Object, required: true },
   assistantName: { type: String, default: "Codex" }
 });
+const emit = defineEmits(["question-answer"]);
 
-const lightboxImage = ref(null);
-const lightboxScale = ref(1);
-const lightboxTranslateX = ref(0);
-const lightboxTranslateY = ref(0);
-const lightboxGesture = {
-  startScale: 1,
-  startDistance: 0,
-  startTranslateX: 0,
-  startTranslateY: 0,
-  startTouchX: 0,
-  startTouchY: 0,
-  startMidpointX: 0,
-  startMidpointY: 0
-};
+const lightboxImage = shallowRef(null);
+const itemElement = shallowRef(null);
 
-function normalizeLanguageTag(lang) {
-  const key = String(lang || "")
-    .trim()
-    .toLowerCase();
-  if (!key) {
-    return "";
-  }
-  if (["sh", "shell", "zsh", "console", "env"].includes(key)) {
-    return "bash";
-  }
-  if (["plain", "text"].includes(key)) {
-    return "plaintext";
-  }
-  return key;
-}
-
-function classifyLanguageFamily(language) {
-  const key = String(language || "").toLowerCase();
-  if (!key) {
-    return "plain";
-  }
-  if (["sql", "postgresql", "mysql", "plsql"].includes(key)) {
-    return "sql";
-  }
-  if (["bash", "shell", "zsh", "powershell", "pwsh", "fish", "sh"].includes(key)) {
-    return "shell";
-  }
-  if (
-    [
-      "javascript",
-      "typescript",
-      "tsx",
-      "jsx",
-      "json",
-      "yaml",
-      "toml",
-      "ini",
-      "xml",
-      "html",
-      "css",
-      "scss",
-      "less",
-      "dockerfile",
-      "nginx",
-      "markdown"
-    ].includes(key)
-  ) {
-    return "config";
-  }
-  return "code";
-}
-
-function renderCodeFence(sourceText, languageTag = "") {
-  const normalizedLanguage = normalizeLanguageTag(languageTag);
-  let highlighted = "";
-  let resolvedLanguage = "";
-
-  if (normalizedLanguage && hljs.getLanguage(normalizedLanguage)) {
-    highlighted = hljs.highlight(sourceText, {
-      language: normalizedLanguage,
-      ignoreIllegals: true
-    }).value;
-    resolvedLanguage = normalizedLanguage;
-  } else {
-    const auto = hljs.highlightAuto(sourceText);
-    highlighted = auto.value;
-    resolvedLanguage = String(auto.language || "plaintext").toLowerCase();
-  }
-
-  const family = classifyLanguageFamily(resolvedLanguage);
-  const languageLabel = resolvedLanguage === "plaintext" ? "text" : resolvedLanguage;
-  return [
-    `<pre class="code-block language-${resolvedLanguage} family-${family}">`,
-    `<span class="code-lang">${languageLabel}</span>`,
-    `<span class="code-scroll"><code class="hljs language-${resolvedLanguage}">${highlighted}</code></span>`,
-    "</pre>"
-  ].join("");
-}
-
-const md = new MarkdownIt({
-  html: false,
-  breaks: true,
-  linkify: true,
-  typographer: true,
-  highlight(code, language) {
-    return renderCodeFence(String(code || ""), language);
-  }
+const { renderMarkdown, renderCodeFence, clearFenceCache } = createThreadItemMarkdown({
+  getCwd: () => props.workspaceCwd,
+  onHighlightReady: () => preserveCodeScroll(itemElement.value, nextTick)
 });
+watch(() => props.item?.id, clearFenceCache, { flush: "sync" });
 
-const shouldRenderMarkdown = computed(() => props.item?.category === "primary");
+const shouldRenderMarkdown = computed(() => props.item?.category === "primary" && !props.item?.question);
 const isProcessItem = computed(() => props.item?.category === "process");
 const processKindClass = computed(() => {
   if (!isProcessItem.value) {
@@ -192,34 +106,38 @@ const shouldRenderProcessCode = computed(() => {
     /(^|\n)(npm |pnpm |yarn |node |python |python3 |bash |zsh |git |curl |cd |ls |cat |sed |rg )/.test(body)
   );
 });
-const renderedProcessBody = computed(() => {
-  if (!shouldRenderProcessCode.value) {
-    return "";
-  }
+const processLanguage = computed(() => {
   const kind = String(props.item?.kind || "").trim().toLowerCase();
-  const language =
+  return (
     kind === "commandexecution"
       ? "bash"
       : kind === "filechange"
         ? "diff"
         : processBody.value.trim().startsWith("{") || processBody.value.trim().startsWith("[")
           ? "json"
-          : "";
-  return DOMPurify.sanitize(renderCodeFence(processBody.value, language), {
+          : ""
+  );
+});
+const renderedProcessBody = computed(() => {
+  if (!shouldRenderProcessCode.value) {
+    return "";
+  }
+  return DOMPurify.sanitize(renderCodeFence(processBody.value, processLanguage.value), {
     ALLOWED_TAGS: ["pre", "code", "span"],
     ALLOWED_ATTR: ["class"]
   }).trim();
 });
 
+const markdownSource = computed(() => String(props.item?.body || "").trim());
 const renderedBody = computed(() => {
-  const body = String(props.item?.body || "").trim();
+  const body = markdownSource.value;
   if (!body) {
     return "";
   }
   if (!shouldRenderMarkdown.value) {
     return "";
   }
-  return DOMPurify.sanitize(md.render(body), {
+  return DOMPurify.sanitize(renderMarkdown(body), {
     ALLOWED_TAGS: [
       "p",
       "br",
@@ -241,9 +159,16 @@ const renderedBody = computed(() => {
       "h6",
       "hr",
       "img",
-      "span"
+      "span",
+      "div",
+      "table",
+      "thead",
+      "tbody",
+      "tr",
+      "th",
+      "td"
     ],
-    ALLOWED_ATTR: ["href", "target", "rel", "class", "src", "alt", "title"]
+    ALLOWED_ATTR: ["href", "target", "rel", "class", "src", "alt", "title", "role", "tabindex", "loading", "decoding", "aria-label"]
   }).trim();
 });
 const imageUrl = computed(() => String(props.item?.imageUrl || "").trim());
@@ -255,142 +180,56 @@ const imageItems = computed(() => {
   }
   return imageUrl.value ? [{ url: imageUrl.value, alt: imageAlt.value }] : [];
 });
-const lightboxImageStyle = computed(() => ({
-  transform: `translate3d(${lightboxTranslateX.value}px, ${lightboxTranslateY.value}px, 0) scale(${lightboxScale.value})`
-}));
-
 const itemClasses = computed(() => [
   "thread-item-card",
   `thread-item-${props.item?.category || "process"}`,
   `thread-item-kind-${props.item?.kind || "unknown"}`,
   processKindClass.value,
   {
+    "is-question-reply": Boolean(props.item?.questionReplies?.length),
+    "is-question-transcript": props.item?.question?.status === "answered",
     "is-live-overlay": Boolean(props.item?.isLiveOverlay),
+    "is-process-detail": props.compactProcess,
     "is-unknown-item": Boolean(props.item?.isUnknown)
   }
 ]);
 
-function openLightboxImage(image) {
+function openLightboxImage(image, origin = globalThis.document?.activeElement) {
   const url = String(image?.url || "").trim();
   if (!url) {
     return;
   }
   lightboxImage.value = {
     url,
-    alt: String(image?.alt || "image").trim() || "image"
-  };
-  lightboxScale.value = 1;
-  lightboxTranslateX.value = 0;
-  lightboxTranslateY.value = 0;
-}
-
-function closeLightboxImage() {
-  lightboxImage.value = null;
-  lightboxScale.value = 1;
-  lightboxTranslateX.value = 0;
-  lightboxTranslateY.value = 0;
-}
-
-function getTouchDistance(touches) {
-  if (!touches || touches.length < 2) {
-    return 0;
-  }
-  const [a, b] = touches;
-  return Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
-}
-
-function getTouchMidpoint(touches) {
-  if (!touches || touches.length < 2) {
-    return { x: 0, y: 0 };
-  }
-  const [a, b] = touches;
-  return {
-    x: (a.clientX + b.clientX) / 2,
-    y: (a.clientY + b.clientY) / 2
+    alt: String(image?.alt || "image").trim() || "image",
+    origin
   };
 }
 
-function clampLightboxScale(value) {
-  return Math.min(4, Math.max(1, value));
-}
-
-function handleLightboxTouchStart(event) {
-  if (!lightboxImage.value) {
+function handleMarkdownImage(event) {
+  if (handleLocalPreviewLink(event, openLocalPreview)) return;
+  const image = event.target?.closest?.("img.markdown-image");
+  if (!image || !event.currentTarget?.contains(image)) {
     return;
   }
-  if (event.touches.length >= 2) {
-    const midpoint = getTouchMidpoint(event.touches);
-    lightboxGesture.startScale = lightboxScale.value;
-    lightboxGesture.startDistance = getTouchDistance(event.touches);
-    lightboxGesture.startTranslateX = lightboxTranslateX.value;
-    lightboxGesture.startTranslateY = lightboxTranslateY.value;
-    lightboxGesture.startMidpointX = midpoint.x;
-    lightboxGesture.startMidpointY = midpoint.y;
-    event.preventDefault();
+  if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") {
     return;
   }
-  if (event.touches.length === 1 && lightboxScale.value > 1) {
-    const touch = event.touches[0];
-    lightboxGesture.startTouchX = touch.clientX;
-    lightboxGesture.startTouchY = touch.clientY;
-    lightboxGesture.startTranslateX = lightboxTranslateX.value;
-    lightboxGesture.startTranslateY = lightboxTranslateY.value;
-    event.preventDefault();
-  }
+  event.preventDefault();
+  event.stopPropagation();
+  openLightboxImage({ url: image.getAttribute("src"), alt: image.getAttribute("alt") }, image);
 }
 
-function handleLightboxTouchMove(event) {
-  if (!lightboxImage.value) {
-    return;
-  }
-  if (event.touches.length >= 2) {
-    const midpoint = getTouchMidpoint(event.touches);
-    const distance = getTouchDistance(event.touches);
-    const ratio = lightboxGesture.startDistance > 0 ? distance / lightboxGesture.startDistance : 1;
-    lightboxScale.value = clampLightboxScale(lightboxGesture.startScale * ratio);
-    lightboxTranslateX.value = lightboxGesture.startTranslateX + (midpoint.x - lightboxGesture.startMidpointX);
-    lightboxTranslateY.value = lightboxGesture.startTranslateY + (midpoint.y - lightboxGesture.startMidpointY);
-    event.preventDefault();
-    return;
-  }
-  if (event.touches.length === 1 && lightboxScale.value > 1) {
-    const touch = event.touches[0];
-    lightboxTranslateX.value = lightboxGesture.startTranslateX + (touch.clientX - lightboxGesture.startTouchX);
-    lightboxTranslateY.value = lightboxGesture.startTranslateY + (touch.clientY - lightboxGesture.startTouchY);
-    event.preventDefault();
-  }
-}
-
-function handleLightboxTouchEnd() {
-  if (lightboxScale.value <= 1) {
-    lightboxScale.value = 1;
-    lightboxTranslateX.value = 0;
-    lightboxTranslateY.value = 0;
-  }
-}
-
-function handleWindowKeydown(event) {
-  if (event.key === "Escape" && lightboxImage.value) {
-    closeLightboxImage();
-  }
-}
-
-onMounted(() => {
-  if (typeof window !== "undefined") {
-    window.addEventListener("keydown", handleWindowKeydown);
-  }
-});
-
-onBeforeUnmount(() => {
-  if (typeof window !== "undefined") {
-    window.removeEventListener("keydown", handleWindowKeydown);
-  }
-});
+onBeforeUnmount(clearFenceCache);
 
 </script>
 
 <template>
-  <article :class="itemClasses">
+  <article ref="itemElement" :class="itemClasses" :data-thread-item-id="item.id">
+    <ThreadQuestionCard v-if="item.question" :question="item.question"
+      :can-respond="canAnswerQuestions && item.question.canRespond !== false && !item.question.pendingResponse"
+      @answer="emit('question-answer', $event)" />
+    <ThreadQuestionReply v-else-if="item.questionReplies?.length" :replies="item.questionReplies" />
     <header v-if="isProcessItem" class="thread-item-header">
       <span class="thread-item-kind-pill">{{ processHeader }}</span>
       <span v-if="processStatus" class="thread-item-status" :data-status="processStatusTone">{{ processStatus }}</span>
@@ -402,56 +241,52 @@ onBeforeUnmount(() => {
         type="button"
         class="thread-item-thumb"
         :aria-label="`查看图片 ${index + 1}`"
-        @click="openLightboxImage(image)"
+        @click="openLightboxImage(image, $event.currentTarget)"
       >
         <img class="thread-item-image" :src="image.url" :alt="image.alt" loading="lazy" decoding="async">
       </button>
     </div>
     <p v-if="processSummary" class="thread-item-summary">{{ processSummary }}</p>
     <div
-      v-if="isProcessItem && renderedProcessBody"
+      v-if="!item.question && isProcessItem && renderedProcessBody"
       class="thread-item-body process-code"
       v-html="renderedProcessBody"
     ></div>
     <div
-      v-else-if="isProcessItem && processBody"
+      v-else-if="!item.question && isProcessItem && processBody"
       class="thread-item-body process-body"
       :title="processBody"
     >{{ processBody }}</div>
     <div
       v-else-if="renderedBody"
       class="thread-item-body markdown-body"
+      @click="handleMarkdownImage"
+      @keydown="handleMarkdownImage"
       v-html="renderedBody"
     ></div>
     <pre
-      v-else-if="item.body"
+      v-else-if="!item.question && !item.questionReplies?.length && item.body"
       class="thread-item-body plain-body"
     >{{ item.body }}</pre>
 
-    <div
-      v-if="lightboxImage"
-      class="image-lightbox"
-      @click="closeLightboxImage"
-      @touchstart="handleLightboxTouchStart"
-      @touchmove="handleLightboxTouchMove"
-      @touchend="handleLightboxTouchEnd"
-      @touchcancel="handleLightboxTouchEnd"
-    >
-      <button class="image-lightbox-close" type="button" aria-label="关闭预览" @click.stop="closeLightboxImage">×</button>
-      <img
-        class="image-lightbox-media"
-        :src="lightboxImage.url"
-        :alt="lightboxImage.alt"
-        :style="lightboxImageStyle"
-        loading="eager"
-        decoding="async"
-        @click.stop
-      >
-    </div>
+    <ImageLightbox v-if="lightboxImage" :image="lightboxImage" :origin="lightboxImage.origin" @close="lightboxImage = null" />
   </article>
 </template>
 
 <style scoped>
+.markdown-body :deep(.markdown-image) {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+.markdown-body :deep(.markdown-image:focus-visible) {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+
 .thread-item-header {
   display: flex;
   align-items: flex-start;
@@ -739,6 +574,19 @@ onBeforeUnmount(() => {
   background: rgba(191, 175, 161, 0.92);
 }
 
+.thread-item-process.is-process-detail {
+  width: 100%;
+  max-width: 100%;
+  padding: 6px 0 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.thread-item-process.is-process-detail::before { display: none; }
+.thread-item-process.is-process-detail .thread-item-header { margin-bottom: 5px; }
+.thread-item-process.is-process-detail .thread-item-kind-pill { min-height: 20px; padding: 0; border: 0; border-radius: 0; background: transparent; }
+
 .thread-item-process.is-reasoning::before {
   background: rgba(181, 141, 99, 0.9);
 }
@@ -783,45 +631,4 @@ onBeforeUnmount(() => {
   border-color: rgba(230, 201, 195, 0.96);
 }
 
-.image-lightbox {
-  position: fixed;
-  inset: 0;
-  z-index: 80;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  background: rgba(24, 19, 15, 0.76);
-  backdrop-filter: blur(8px);
-  touch-action: none;
-  overscroll-behavior: contain;
-}
-
-.image-lightbox-media {
-  max-width: min(100vw - 32px, 960px);
-  max-height: min(100vh - 48px, 88vh);
-  border-radius: 16px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
-  background: rgba(255, 255, 255, 0.96);
-  transform-origin: center center;
-  user-select: none;
-  -webkit-user-drag: none;
-  touch-action: none;
-  will-change: transform;
-}
-
-.image-lightbox-close {
-  position: absolute;
-  top: calc(env(safe-area-inset-top) + 12px);
-  right: 14px;
-  width: 36px;
-  height: 36px;
-  border: 0;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.9);
-  color: #3b3028;
-  font-size: 24px;
-  line-height: 1;
-  cursor: pointer;
-}
 </style>

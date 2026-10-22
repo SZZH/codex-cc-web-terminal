@@ -2,14 +2,10 @@ import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 
 import {
-  readCodexDesktopAgentMode,
-  readCodexDesktopDefaults,
-  writeCodexDesktopPermissionMode
-} from "../shared/codexDesktopConfig.js";
-import {
-  extractComposerOptionOverrides,
+  normalizeCodexComposerPatch,
   normalizePermissionMode
 } from "../shared/composerOptions.js";
+import { permissionModeFromStoredPolicy, permissionPolicyIsUnsupported } from "../shared/permissionPolicy.js";
 
 function readSqliteJson(dbPath, sql) {
   const output = execFileSync("sqlite3", ["-json", dbPath, sql], {
@@ -30,18 +26,6 @@ function execSqlite(dbPath, sql) {
 
 function sqlString(value = "") {
   return `'${String(value || "").replace(/'/g, "''")}'`;
-}
-
-function mapPermissionModeFromRow(row = {}, desktopPermissionMode = "") {
-  const sandboxType = String(row?.sandbox_policy_type || row?.sandbox_policy?.type || "").trim().toLowerCase();
-  const approvalMode = String(row?.approval_mode || "").trim().toLowerCase();
-  if (sandboxType === "danger-full-access" || approvalMode === "never") {
-    return "full-access";
-  }
-  if (approvalMode === "on-request" || approvalMode === "untrusted") {
-    return desktopPermissionMode === "default" ? "default" : "auto-review";
-  }
-  return "default";
 }
 
 function toEffectivePermissionMode(requestedMode) {
@@ -67,23 +51,22 @@ function mapPermissionColumns(permissionMode) {
     };
   }
   return {
-    sandboxPolicy: JSON.stringify({ type: "read-only" }),
-    approvalMode: "default"
+    sandboxPolicy: JSON.stringify({ type: "read-only", network_access: true }),
+    approvalMode: effectiveMode === "manual-review" ? "on-request" : "never"
   };
 }
 
-function normalizeThreadRow(row = {}, config = {}) {
+function normalizeThreadRow(row = {}) {
   if (!row || !String(row.id || "").trim()) {
     return null;
   }
-  const desktopAgentMode = readCodexDesktopAgentMode(config);
-  const desktopPermissionMode = desktopAgentMode ? readCodexDesktopDefaults(config).permissionMode : "";
   return {
     threadId: String(row.id || "").trim(),
     cwd: String(row.cwd || "").trim(),
     model: String(row.model || "").trim(),
     reasoningEffort: String(row.reasoning_effort || "").trim(),
-    permissionMode: mapPermissionModeFromRow(row, desktopPermissionMode),
+    permissionMode: permissionModeFromStoredPolicy(row.sandbox_policy, { cwd: row.cwd, approvalPolicy: row.approval_mode }),
+    ...(permissionPolicyIsUnsupported(row.sandbox_policy, { cwd: row.cwd }) ? { permissionPolicyUnsupported: true } : {}),
     gitBranch: String(row.git_branch || "").trim(),
     updatedAtMs: Number(row.updated_at_ms || 0) || 0
   };
@@ -109,20 +92,19 @@ export class CodexThreadStateStore {
         this.dbPath,
         [
           "select",
-          "id, cwd, model, reasoning_effort, sandbox_policy, approval_mode, git_branch, updated_at_ms,",
-          "json_extract(sandbox_policy, '$.type') as sandbox_policy_type",
+          "id, cwd, model, reasoning_effort, sandbox_policy, approval_mode, git_branch, updated_at_ms",
           "from threads",
           `where id = ${sqlString(targetThreadId)}`,
           "limit 1"
         ].join(" ")
       );
-      return normalizeThreadRow(rows[0], this.config);
+      return normalizeThreadRow(rows[0]);
     } catch {
       return null;
     }
   }
 
-  patchThreadComposerState(threadId, patch = {}) {
+  patchThreadComposerState(threadId, patch = {}, { models = [] } = {}) {
     const targetThreadId = String(threadId || "").trim();
     if (!targetThreadId || !this.isAvailable()) {
       return null;
@@ -133,7 +115,7 @@ export class CodexThreadStateStore {
       return null;
     }
 
-    const composerPatch = extractComposerOptionOverrides(patch);
+    const composerPatch = normalizeCodexComposerPatch(patch, current, models);
     const updates = [];
 
     if (Object.prototype.hasOwnProperty.call(composerPatch, "model") && composerPatch.model) {
@@ -169,9 +151,6 @@ export class CodexThreadStateStore {
       this.dbPath,
       `update threads set ${updates.join(", ")} where id = ${sqlString(targetThreadId)}`
     );
-    if (Object.prototype.hasOwnProperty.call(composerPatch, "permissionMode")) {
-      writeCodexDesktopPermissionMode(this.config, composerPatch.permissionMode);
-    }
     return this.getThreadComposerState(targetThreadId);
   }
 

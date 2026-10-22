@@ -1,14 +1,40 @@
 import { WebSocketServer } from "ws";
+import { applySessionInputEvents, normalizeSessionInputEvents } from "../transport/sse/sessionStream.js";
+
+const MAX_CODEX_WS_BUFFER_BYTES = 1024 * 1024;
+
+export function sendCodexEvent(ws, event) {
+  if (ws.readyState !== 1) return false;
+  const payload = JSON.stringify(event);
+  if (ws.bufferedAmount + Buffer.byteLength(payload) > MAX_CODEX_WS_BUFFER_BYTES) {
+    ws.terminate();
+    return false;
+  }
+  ws.send(payload);
+  return true;
+}
 
 export function installWebSocketServer(server, runtime) {
   const wss = new WebSocketServer({ noServer: true });
   runtime.wss = wss;
 
-  wss.on("connection", (ws, req, sessionId) => {
+  wss.on("connection", (ws, req, sessionId, codexSubscription = null) => {
     ws.isAlive = true;
     ws.on("pong", () => {
       ws.isAlive = true;
     });
+
+    if (codexSubscription) {
+      try {
+        const unsubscribe = runtime.codexThreads.subscribe(codexSubscription.threadId, (event) => {
+          sendCodexEvent(ws, event);
+        }, codexSubscription);
+        ws.on("close", unsubscribe);
+      } catch (error) {
+        ws.close(1011, "Unable to subscribe to this thread");
+      }
+      return;
+    }
 
     try {
       runtime.sessionManager.attachClient(sessionId, ws);
@@ -21,11 +47,7 @@ export function installWebSocketServer(server, runtime) {
     ws.on("message", (raw) => {
       try {
         const payload = JSON.parse(String(raw || "{}"));
-        if (payload.type === "input") {
-          runtime.sessionManager.write(sessionId, payload.data || "");
-        } else if (payload.type === "resize") {
-          runtime.sessionManager.resize(sessionId, payload.cols, payload.rows);
-        }
+        applySessionInputEvents(runtime.sessionManager, sessionId, normalizeSessionInputEvents(payload));
       } catch (err) {
         ws.send(JSON.stringify({ type: "error", error: err?.message || String(err) }));
       }
@@ -49,7 +71,7 @@ export function installWebSocketServer(server, runtime) {
 
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url || "/", "http://localhost");
-    if (url.pathname !== "/ws") {
+    if (url.pathname !== "/ws" && url.pathname !== "/ws/codex") {
       socket.destroy();
       return;
     }
@@ -81,6 +103,15 @@ export function installWebSocketServer(server, runtime) {
       return;
     }
 
+    if (url.pathname === "/ws/codex") {
+      const threadId = url.searchParams.get("threadId") || "";
+      if (!runtime.codexThreads || !/^[a-zA-Z0-9_-]{8,128}$/.test(threadId)) {
+        socket.write("HTTP/1.1 400 Bad Request\r\n\r\n"); socket.destroy(); return;
+      }
+      const subscription = { threadId, epoch: url.searchParams.get("epoch") || "", after: Number(url.searchParams.get("after")) || 0 };
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, null, subscription));
+      return;
+    }
     const sessionId = url.searchParams.get("sessionId") || "";
     if (!sessionId || !runtime.sessionManager.get(sessionId)) {
       console.warn(

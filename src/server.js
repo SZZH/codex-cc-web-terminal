@@ -5,41 +5,24 @@ import { AppServerBridge } from "./appServerBridge.js";
 import { createKoaApp } from "./koa-app.js";
 import { SessionManager } from "./sessionManager.js";
 import { installWebSocketServer } from "./routes/ws.js";
+import { CodexThreadService } from "./sessions/codex/threadService.js";
+import { getPreviewRegistry } from "./routes/previews.js";
+import { PreviewGateway } from "./preview/gateway.js";
+import { createRuntimeShutdown } from "./runtime/createRuntime.js";
 
 const appServerBridge = config.codexAppServerEnabled ? new AppServerBridge(config) : null;
 const sessionManager = new SessionManager(config, { appServerBridge });
-const { app, runtime } = createKoaApp({ config, sessionManager });
+const codexThreads = appServerBridge ? new CodexThreadService({ config, bridge: appServerBridge, sessionManager }) : null;
+const { app, runtime } = createKoaApp({ config, sessionManager, codexThreads });
 const server = http.createServer(app.callback());
 const wsRuntime = installWebSocketServer(server, runtime);
-
-let shutdownPromise = null;
-
-async function shutdown(signal = "unknown") {
-  if (shutdownPromise) {
-    return shutdownPromise;
-  }
-
-  runtime.shuttingDown = true;
-  shutdownPromise = new Promise((resolve) => {
-    wsRuntime.closeClients(signal);
-
-    server.close(() => {
-      wsRuntime.stop();
-      appServerBridge?.shutdown();
-      sessionManager.shutdown();
-      resolve();
-    });
-
-    setTimeout(() => {
-      wsRuntime.stop();
-      appServerBridge?.shutdown();
-      sessionManager.shutdown();
-      resolve();
-    }, 3000).unref();
-  });
-
-  return shutdownPromise;
+const previewGateway = config.previewEnabled ? new PreviewGateway({ config, registry: getPreviewRegistry(runtime) }) : null;
+if (previewGateway) {
+  try { await previewGateway.start(); runtime.previewGatewayReady = true; }
+  catch (error) { console.error(`Preview gateway could not start: ${error.message}`); await previewGateway.close(); }
 }
+
+const shutdown = createRuntimeShutdown({ runtime, server, wsRuntime, previewGateway, codexThreads, appServerBridge, sessionManager });
 
 server.listen(config.port, config.host, () => {
   const displayHost = config.host === "0.0.0.0" ? "localhost" : config.host;

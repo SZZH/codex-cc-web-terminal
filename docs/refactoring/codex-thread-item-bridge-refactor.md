@@ -1,8 +1,12 @@
 # Codex Thread / Turn / Item Bridge Refactor
 
-Last updated: 2026-04-21
-Status: draft
+Last updated: 2026-10-16
+Status: deprecated
 Owner: backend
+
+Superseded by: [Codex V2 聊天契约](codex-chat-v2.md)
+
+> 本旧规划已被替代（superseded），保留用于历史和兼容层参考。Codex 当前主链路采用官方 typed 历史、独立持久回执与稳定线程 WebSocket；本文的旧 canonical/snapshot/SSE 设计不再作为 V2 实施依据。
 
 ## Background
 

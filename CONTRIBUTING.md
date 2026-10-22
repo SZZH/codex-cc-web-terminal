@@ -25,7 +25,11 @@ Run:
 
 ```bash
 npm run check
+npm test
 ```
+
+`check` validates syntax and builds the frontend. `npm test` runs all regression tests,
+including HTTP, WebSocket, thread state, and frontend runtime contracts. CI runs both.
 
 ## Documentation Rules
 

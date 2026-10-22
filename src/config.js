@@ -77,6 +77,10 @@ function inferShellQuoteStyle(shellBin) {
 const root = process.cwd();
 const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
 const generatedToken = crypto.randomBytes(18).toString("base64url");
+const accessToken = env("ACCESS_TOKEN", generatedToken);
+if (accessToken === "change-me") {
+  throw new Error("ACCESS_TOKEN must not be the example value change-me.");
+}
 const shellBin = env("SHELL_BIN", inferShellBin());
 const shellArgs = hasEnv("SHELL_ARGS") ? listEnv("SHELL_ARGS") : inferShellArgs(shellBin);
 
@@ -86,7 +90,7 @@ export const config = {
   platform: process.platform,
   host: env("HOST", "0.0.0.0"),
   port: intEnv("PORT", 3210),
-  accessToken: env("ACCESS_TOKEN", generatedToken),
+  accessToken,
   defaultCwd: env("DEFAULT_CWD", home),
   shellBin,
   shellArgs,
@@ -118,6 +122,12 @@ export const config = {
   wsHeartbeatMs: intEnv("WS_HEARTBEAT_SECONDS", 30) * 1000,
   sessionBufferLimit: 250000,
   maxQueuedInputs: intEnv("MAX_QUEUED_INPUTS", 200),
+  previewEnabled: boolEnv("PREVIEW_ENABLED", true),
+  previewHost: env("PREVIEW_HOST", "127.0.0.1"),
+  previewPort: intEnv("PREVIEW_PORT", 3211),
+  previewServicePorts: hasEnv("PREVIEW_SERVICE_PORTS") ? listEnv("PREVIEW_SERVICE_PORTS").map(Number).filter((port) => Number.isInteger(port) && port > 1023 && port < 65536) : [3212, 3213, 3214, 3215],
+  previewPublicOrigin: env("PREVIEW_PUBLIC_ORIGIN", ""),
+  kkFileViewUrl: env("KKFILEVIEW_URL", "http://127.0.0.1:8012"),
   dataDir: path.join(root, "data"),
   codexSessionsDir: env("CODEX_SESSIONS_DIR", path.join(home, ".codex", "sessions")),
   codexArchivedSessionsDir: env("CODEX_ARCHIVED_SESSIONS_DIR", path.join(home, ".codex", "archived_sessions")),

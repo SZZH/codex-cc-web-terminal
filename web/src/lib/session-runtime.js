@@ -1,27 +1,9 @@
 import { hydrateHistoricalSession } from "./history-session-cache.js";
-import { decorateSession, mergeSessionTitlesIntoCache, parseHistoryRouteSessionId } from "./session-list.js";
+import { decorateSession, parseHistoryRouteSessionId } from "./session-list.js";
+import { createSessionCatalogController } from "./session-catalog-runtime.js";
 import { createConversationState, buildConversationStateFromPayload } from "./conversation-timeline.js";
 import { buildSessionCreateRequest } from "./composer.js";
 import { shouldSyncPersistedThread } from "./thread-display-state.js";
-
-function toOriginProtocol(proto) {
-  return String(proto || "").toLowerCase() === "https:" ? "https:" : "http:";
-}
-
-function toWsProtocol(proto) {
-  return String(proto || "").toLowerCase() === "https:" ? "wss:" : "ws:";
-}
-
-function normalizeBackendHost(rawHost) {
-  const host = String(rawHost || "").trim();
-  if (!host || host === "0.0.0.0" || host === "::") {
-    return window.location.hostname || "localhost";
-  }
-  if (host === "::1") {
-    return "localhost";
-  }
-  return host;
-}
 
 function isAwaitingInputStatus(statusText = "") {
   return statusText === "等待 Codex 回复…" || statusText === "正在发送…";
@@ -58,6 +40,7 @@ export function createSessionRuntimeController({
   setStatus,
   wait,
   getActiveThreadId,
+  getActiveProviderId,
   getExpectedThreadId,
   getInteractiveThreadId,
   getRouteHistoryTarget,
@@ -74,33 +57,68 @@ export function createSessionRuntimeController({
   setLiveOverlay,
   attachLiveSocket,
   syncComposerStateForThread,
-  applyHistoricalComposerValues
+  applyHistoricalComposerValues,
+  pagedCatalog = false,
+  now = Date.now
 } = {}) {
   let historySyncTimer = null;
-  let syncingRouteOpen = false;
+  let threadSyncInFlight = null;
+  let activation = 0;
+  let routeLookup = 0;
+  let socketRecovery = null;
+  let recoveryTimer = null;
+  const { refreshSessions, startSessionListSyncLoop, stopSessionListSyncLoop, applyBackendConfig,
+    requestWorkspaceConfig, invalidateWorkspaceBootstrap, bootstrapWorkspace,
+    setSessionCatalogView, loadSessionCatalogGroup, loadMoreSessionCatalog } = createSessionCatalogController({
+    state, route, request, composerOptions, sessionCache, getActiveProviderId, now, paged: pagedCatalog
+  });
 
-  async function hydrateSession(session, { includeMessages = false, silent = false, forceRefresh = false } = {}) {
-    return hydrateHistoricalSession(session, {
+  function stopSocketRecovery() {
+    if (recoveryTimer) window.clearTimeout(recoveryTimer);
+    recoveryTimer = null;
+    socketRecovery = null;
+    state.liveView.recoveringSocket = false;
+  }
+
+  function invalidateActivation() {
+    activation += 1;
+    routeLookup += 1;
+    state.loading = false;
+    state.pendingSessionId = "";
+    stopSocketRecovery();
+    stopHistorySyncLoop();
+  }
+
+  function beginActivation(sessionId) {
+    invalidateActivation();
+    stopSessionListSyncLoop();
+    state.pendingSessionId = sessionId;
+    state.routeSessionId = sessionId;
+    return activation;
+  }
+
+  function isActivationCurrent(token) {
+    return token === activation;
+  }
+
+  async function hydrateSession(session, { includeMessages = false, silent = false, forceRefresh = false, strict = false } = {}) {
+    const token = activation;
+    let failure = null;
+    const hydrated = await hydrateHistoricalSession(session, {
       includeMessages,
-      silent,
+      silent: silent && !strict,
       forceRefresh,
       sessionCache,
       pendingHydrations,
       historyApiAvailable,
       requestHistoryMessages,
       onError: (error) => {
-        setStatus(error?.message || String(error));
+        failure = error;
+        if (!silent && isActivationCurrent(token)) setStatus(error?.message || String(error));
       }
     });
-  }
-
-  async function refreshSessions() {
-    const payload = await request("/api/sessions");
-    const sessions = payload.sessions || [];
-    const projectGroups = payload.projectGroups || [];
-    mergeSessionTitlesIntoCache(sessions, sessionCache);
-    state.sessions = sessions;
-    state.projectGroups = projectGroups;
+    if (strict && failure) throw failure;
+    return hydrated;
   }
 
   function stopHistorySyncLoop() {
@@ -110,7 +128,7 @@ export function createSessionRuntimeController({
     }
   }
 
-  function currentThreadSyncTarget() {
+  function currentThreadSyncTarget({ force = false } = {}) {
     if (
       !shouldSyncPersistedThread({
         routeThreadId: String(getRouteHistoryTarget()?.resumeSessionId || "").trim(),
@@ -118,7 +136,7 @@ export function createSessionRuntimeController({
         liveSessionId: state.liveView.liveSessionId,
         liveSessionMeta: state.liveView.sessionMeta,
         hasAuthoritativeLiveData: Boolean(state.liveView.hasConversationSnapshot || state.liveView.hasConversationDelta),
-        forceSync: isAwaitingInputStatus(state.statusText)
+        forceSync: force || state.liveView.recoveringSocket || (!state.liveView.socket && state.liveView.activeInputStream) || isAwaitingInputStatus(state.statusText)
       })
     ) {
       return null;
@@ -141,19 +159,37 @@ export function createSessionRuntimeController({
     return null;
   }
 
-  async function syncActiveThreadSession({ silent = true } = {}) {
-    const target = currentThreadSyncTarget();
+  async function syncActiveThreadSession({ silent = true, force = false, recover = false } = {}) {
+    const target = currentThreadSyncTarget({ force });
     if (!target?.resumeSessionId) {
       return false;
     }
-
-    const hydrated = await hydrateSession(target, {
+    const token = activation;
+    const key = `${target.provider}:${target.resumeSessionId}`;
+    if (threadSyncInFlight?.key === key && threadSyncInFlight.token === token) {
+      await threadSyncInFlight.promise;
+      return false;
+    }
+    const task = hydrateSession(target, {
       includeMessages: true,
       forceRefresh: true,
-      silent
+      silent,
+      strict: recover
     });
+    threadSyncInFlight = { key, token, promise: task };
+    let hydrated;
+    try {
+      hydrated = await task;
+    } finally {
+      if (threadSyncInFlight?.promise === task) threadSyncInFlight = null;
+    }
+    const current = currentThreadSyncTarget({ force });
+    if (!isActivationCurrent(token) || `${current?.provider}:${current?.resumeSessionId}` !== key) return false;
     if (!hydrated) {
       return false;
+    }
+    if (socketRecovery?.token === token && socketRecovery.threadId === target.resumeSessionId && socketRecovery.provider === target.provider) {
+      socketRecovery.hydratedSession = hydrated.session || null;
     }
 
     const nextThreadSnapshot = hydrated.threadSnapshot || null;
@@ -162,6 +198,19 @@ export function createSessionRuntimeController({
       setThreadSnapshot(nextThreadSnapshot);
       if (isAwaitingInputStatus(state.statusText) && !isThreadSnapshotRunning(nextThreadSnapshot)) {
         setStatus("");
+      }
+    }
+    if ((recover || state.liveView.recoveringSocket || !state.liveView.socket) && nextThreadSnapshot) {
+      clearAuthoritativeThreadSnapshot();
+      if (hydrated.conversation) setConversation(hydrated.conversation, { force: true });
+      setLiveOverlay(null);
+      const trackedTurnId = String(state.liveView.inputTurnId || "").trim();
+      const trackedTurn = (nextThreadSnapshot.turns || []).find((turn) => !trackedTurnId || turn.id === trackedTurnId);
+      if (trackedTurn && !isThreadSnapshotRunning(nextThreadSnapshot)) {
+        state.liveView.activeInputStream = false;
+        state.liveView.interruptInFlight = false;
+        state.loading = false;
+        if (isAwaitingInputStatus(state.statusText) || String(state.statusText || "").startsWith("连接已断开")) setStatus("");
       }
     }
     if (state.threadView.meta && target.resumeSessionId === state.threadView.meta.resumeSessionId) {
@@ -173,6 +222,85 @@ export function createSessionRuntimeController({
       };
     }
     return applied;
+  }
+
+  function recoverLiveSession(sessionId) {
+    if (state.liveView.liveSessionId !== sessionId || route.name !== "chat") return;
+    if (socketRecovery?.token === activation && socketRecovery.sessionId === sessionId) return;
+    stopSocketRecovery();
+    const target = getRouteHistoryTarget() || state.threadView.meta || state.liveView.sessionMeta || {};
+    const recovery = { token: activation, sessionId, attempts: 0,
+      threadId: String(target.resumeSessionId || state.threadView.threadId || "").trim(),
+      provider: String(target.provider || state.liveView.sessionMeta?.provider || "codex").trim().toLowerCase(), hydratedSession: null };
+    socketRecovery = recovery;
+    const isCurrent = () => {
+      const current = getRouteHistoryTarget() || state.threadView.meta || state.liveView.sessionMeta || {};
+      return socketRecovery === recovery && isActivationCurrent(recovery.token) && state.liveView.liveSessionId === recovery.sessionId && route.name === "chat" &&
+        String(current.resumeSessionId || state.threadView.threadId || "").trim() === recovery.threadId &&
+        String(current.provider || state.liveView.sessionMeta?.provider || "codex").trim().toLowerCase() === recovery.provider;
+    };
+    const matchesThread = (session) => session?.kind === "live" && session.id &&
+      String(session.resumeSessionId || "").trim() === recovery.threadId &&
+      String(session.provider || "").trim().toLowerCase() === recovery.provider;
+    function rebindSession(session) {
+      if (!isCurrent() || !matchesThread(session)) return false;
+      closeSocket({ silent: true });
+      recovery.sessionId = session.id;
+      state.liveView.sessionId = session.id;
+      state.liveView.liveSessionId = session.id;
+      state.liveView.sessionMeta = decorateSession(session);
+      return true;
+    }
+    async function resolveRecoverySession() {
+      if (matchesThread(recovery.hydratedSession) && recovery.hydratedSession.id !== recovery.sessionId) {
+        rebindSession(recovery.hydratedSession);
+        return;
+      }
+      if (!requestSessionById) return;
+      try {
+        await requestSessionById(recovery.sessionId);
+      } catch (error) {
+        if (!isCurrent() || error?.status !== 404 || !recovery.threadId) throw error;
+        if (matchesThread(recovery.hydratedSession) && recovery.hydratedSession.id !== recovery.sessionId) {
+          rebindSession(recovery.hydratedSession);
+          return;
+        }
+        const payload = await request("/api/sessions", {
+          method: "POST",
+          body: JSON.stringify({ provider: recovery.provider, resumeSessionId: recovery.threadId,
+            cwd: String(state.threadView.meta?.cwd || state.liveView.sessionMeta?.cwd || "").trim() })
+        });
+        if (!isCurrent()) return;
+        if (!rebindSession(payload?.session)) throw new Error("恢复会话返回了不匹配的线程。");
+      }
+    }
+    state.liveView.recoveringSocket = true;
+    state.liveView.hasConversationSnapshot = false;
+    state.liveView.hasConversationDelta = false;
+    state.liveView.hasReducerConversationDelta = false;
+    setStatus("连接已断开，正在恢复…");
+    startHistorySyncLoop();
+    syncActiveThreadSession({ silent: true, force: true, recover: true }).catch(() => {});
+    async function reconnect() {
+      recoveryTimer = null;
+      if (!isCurrent()) return;
+      recovery.attempts += 1;
+      try {
+        await resolveRecoverySession();
+        if (!isCurrent()) return;
+        await attachLiveSocket(recovery.sessionId);
+        if (!isCurrent()) return;
+        await syncActiveThreadSession({ silent: true, force: true, recover: true });
+        if (!isCurrent()) return;
+        stopSocketRecovery();
+        if (String(state.statusText || "").startsWith("连接已断开")) setStatus("");
+      } catch {
+        if (!isCurrent()) return;
+        closeSocket({ silent: true });
+        recoveryTimer = window.setTimeout(reconnect, Math.min(1000 * recovery.attempts, 10_000));
+      }
+    }
+    recoveryTimer = window.setTimeout(reconnect, 500);
   }
 
   function startHistorySyncLoop() {
@@ -191,42 +319,11 @@ export function createSessionRuntimeController({
     }, 4000);
   }
 
-  function applyBackendConfig(payload) {
-    const host = normalizeBackendHost(payload?.host);
-    const port = Number(payload?.port || 0);
-    if (!host || !port) {
-      return;
-    }
-    const httpProtocol = toOriginProtocol(window.location.protocol);
-    const wsProtocol = toWsProtocol(window.location.protocol);
-    state.backendHttpOrigin = `${httpProtocol}//${host}:${port}`;
-    state.backendWsOrigin = `${wsProtocol}//${host}:${port}`;
-  }
-
-  async function bootstrapWorkspace({ includeSessions = true } = {}) {
-    const configPayload = await request("/api/config");
-    applyBackendConfig(configPayload);
-    state.providerCatalog = Array.isArray(configPayload?.providers) ? configPayload.providers : [];
-    state.codexDefaults = {
-      model: String(configPayload?.codexDefaults?.model || "").trim(),
-      reasoningEffort: String(configPayload?.codexDefaults?.reasoningEffort || "medium").trim() || "medium",
-      permissionMode: String(configPayload?.codexDefaults?.permissionMode || "default").trim() || "default"
-    };
-    state.defaultProvider = String(configPayload?.defaultProvider || "codex").trim().toLowerCase() || "codex";
-    if (!composerOptions.value.model && !composerOptions.value.attachments.length) {
-      composerOptions.value = {
-        ...composerOptions.value,
-        ...state.codexDefaults
-      };
-    }
-    if (includeSessions) {
-      await refreshSessions();
-    }
-  }
-
   async function openLiveSession(session, { skipRoute = false } = {}) {
-    stopHistorySyncLoop();
-    state.pendingSessionId = session.id;
+    const token = beginActivation(session.id);
+    closeSocket?.({ silent: true });
+    finalizeAssistantStream?.();
+    resetLiveView?.();
     setStatus("正在连接会话…");
     state.routeSessionId = session.id;
     const decorated = decorateSession(session);
@@ -249,11 +346,16 @@ export function createSessionRuntimeController({
     if (!skipRoute && (route.name !== "chat" || String(route.params.sessionId || "").trim() !== session.id)) {
       await router.push({ name: "chat", params: { sessionId: session.id } });
     }
+    if (!isActivationCurrent(token)) return;
     resetComposerDraftState({ keepOptions: false });
     state.liveView.replayGuardActive = false;
     state.liveView.replayGuardPrompt = "";
     state.liveView.replayGuardUntil = 0;
     await bootstrapWorkspace({ includeSessions: false });
+    if (!isActivationCurrent(token)) return;
+    if (!session.resumeSessionId) {
+      applyHistoricalComposerValues(session);
+    }
 
     let historyTurns = [];
     let historyAgents = [];
@@ -265,6 +367,7 @@ export function createSessionRuntimeController({
     });
     if (session.resumeSessionId) {
       const composerStateSynced = await syncComposerStateForThread(session.provider, session.resumeSessionId, { silent: true });
+      if (!isActivationCurrent(token)) return;
       const hydrated = await hydrateSession(
         {
           ...session,
@@ -274,6 +377,7 @@ export function createSessionRuntimeController({
         },
         { includeMessages: true, silent: true, forceRefresh: true }
       );
+      if (!isActivationCurrent(token)) return;
       historyTurns = hydrated?.turns || [];
       historyAgents = hydrated?.backgroundAgents || [];
       historyConversation = buildConversationStateFromPayload(hydrated?.conversation || {}, {
@@ -300,17 +404,15 @@ export function createSessionRuntimeController({
     setThreadSnapshot(historyThreadSnapshot);
     setLiveOverlay(historyLiveOverlay);
     await attachLiveSocket(session.id);
+    if (!isActivationCurrent(token)) return;
     setStatus("");
     state.pendingSessionId = "";
   }
 
   async function openThreadSession(session, { skipRoute = false } = {}) {
-    stopHistorySyncLoop();
-    state.pendingSessionId = session.id;
+    const token = beginActivation(session.id);
     setStatus("正在加载会话…");
     const decorated = decorateSession(session);
-    const hydrated = await hydrateSession(session, { includeMessages: true, forceRefresh: true });
-    const historyThreadSnapshot = hydrated?.threadSnapshot || null;
     const targetThreadId = String(session.resumeSessionId || "").trim();
     const keepInteractiveState = targetThreadId && getInteractiveThreadId() === targetThreadId;
 
@@ -319,6 +421,7 @@ export function createSessionRuntimeController({
       finalizeAssistantStream();
       resetLiveView();
       clearAuthoritativeThreadSnapshot();
+      setThreadSnapshot(null);
     }
 
     state.routeSessionId = session.id;
@@ -327,16 +430,25 @@ export function createSessionRuntimeController({
     state.threadView.meta = {
       ...decorated,
       kind: "thread",
-      cwd: hydrated?.session?.cwd || decorated.cwd || "",
-      displayTitle: hydrated?.title || decorated.displayTitle,
-      displayPreview: hydrated?.preview || decorated.displayPreview
+      cwd: decorated.cwd || ""
     };
     state.threadView.openToken += 1;
     if (!skipRoute && (route.name !== "chat" || String(route.params.sessionId || "").trim() !== session.id)) {
       await router.push({ name: "chat", params: { sessionId: session.id } });
     }
+    if (!isActivationCurrent(token)) return;
     resetComposerDraftState({ keepOptions: false });
+    const hydrated = await hydrateSession(session, { includeMessages: true, forceRefresh: true });
+    if (!isActivationCurrent(token)) return;
+    const historyThreadSnapshot = hydrated?.threadSnapshot || null;
+    state.threadView.meta = {
+      ...state.threadView.meta,
+      cwd: hydrated?.session?.cwd || decorated.cwd || "",
+      displayTitle: hydrated?.title || decorated.displayTitle,
+      displayPreview: hydrated?.preview || decorated.displayPreview
+    };
     const composerStateSynced = await syncComposerStateForThread(session.provider, targetThreadId, { silent: true });
+    if (!isActivationCurrent(token)) return;
     if (!composerStateSynced) {
       applyHistoricalComposerValues(hydrated?.session || null, historyThreadSnapshot);
     }
@@ -350,6 +462,7 @@ export function createSessionRuntimeController({
   }
 
   async function openSessionItem(session, { skipRoute = false } = {}) {
+    const nextActivation = activation + 1;
     try {
       if (session?.resumeSessionId) {
         await openThreadSession(
@@ -365,6 +478,7 @@ export function createSessionRuntimeController({
       }
       await openLiveSession(session, { skipRoute });
     } catch (error) {
+      if (!isActivationCurrent(nextActivation)) return;
       if (session.kind === "live" && session.resumeSessionId) {
         try {
           await openThreadSession(
@@ -395,6 +509,7 @@ export function createSessionRuntimeController({
     }
 
     const pendingCreateId = `__creating__:${cwd}`;
+    const token = activation;
     try {
       state.pendingSessionId = pendingCreateId;
       setStatus("正在创建会话…");
@@ -404,18 +519,21 @@ export function createSessionRuntimeController({
           buildSessionCreateRequest({
             provider: "codex",
             cwd,
+            projectId: group.projectId || "",
             composerOptions: composerOptions.value
           })
         )
       });
+      if (!isActivationCurrent(token)) return;
       await refreshSessions();
+      if (!isActivationCurrent(token)) return;
       if (payload?.session) {
         await openSessionItem(payload.session);
         return;
       }
       setStatus("会话已创建，请手动打开。");
     } catch (error) {
-      setStatus(error?.message || String(error));
+      if (isActivationCurrent(token)) setStatus(error?.message || String(error));
     } finally {
       if (state.pendingSessionId === pendingCreateId) {
         state.pendingSessionId = "";
@@ -424,6 +542,7 @@ export function createSessionRuntimeController({
   }
 
   async function ensureLiveSession() {
+    const token = activation;
     if (state.liveView.liveSessionId) {
       return state.liveView.liveSessionId;
     }
@@ -493,6 +612,7 @@ export function createSessionRuntimeController({
         })
       )
     });
+    if (!isActivationCurrent(token)) throw new Error("会话已切换，已取消发送。");
 
     state.liveView.sessionMeta = {
       ...state.liveView.sessionMeta,
@@ -509,12 +629,14 @@ export function createSessionRuntimeController({
     state.liveView.replayGuardActive = true;
     state.liveView.replayGuardUntil = Date.now() + 20_000;
     await wait(1800);
+    if (!isActivationCurrent(token)) throw new Error("会话已切换，已取消发送。");
     discardPendingAssistantStream();
     state.liveView.streamBuffer = "";
     return resumed.session.id;
   }
 
   async function backToList() {
+    invalidateActivation();
     closeSocket();
     stopHistorySyncLoop();
     finalizeAssistantStream();
@@ -525,7 +647,27 @@ export function createSessionRuntimeController({
     if (route.name !== "sessions") {
       await router.push({ name: "sessions" });
     }
-    await refreshSessions();
+    await refreshSessions().catch(() => {});
+    if (route.name === "sessions" && state.ready && state.isAuthenticated) startSessionListSyncLoop();
+  }
+
+  function applyInputResponse(payload = {}) {
+    const session = payload.session;
+    if (session) {
+      const decorated = decorateSession(session);
+      state.liveView.sessionMeta = decorated;
+      state.liveView.sessionId = session.id;
+      state.liveView.liveSessionId = session.id;
+      const threadId = String(session.resumeSessionId || payload.threadId || "").trim();
+      if (threadId) {
+        state.threadView.threadId = threadId;
+        state.threadView.sessionId = `history:${session.provider}:${threadId}`;
+        state.threadView.meta = { ...decorated, kind: "thread", id: state.threadView.sessionId };
+        state.liveView.conversation.threadId = threadId;
+      }
+    }
+    if (payload.turnId) state.liveView.inputTurnId = payload.turnId;
+    refreshSessions().catch(() => {});
   }
 
   async function syncRouteSession() {
@@ -565,7 +707,6 @@ export function createSessionRuntimeController({
 
     const historyTarget = parseHistoryRouteSessionId(targetSessionId);
     if (
-      syncingRouteOpen ||
       (state.routeSessionId === targetSessionId &&
         (!historyTarget || Boolean(state.threadView.meta) || Boolean(state.liveView.liveSessionId)))
     ) {
@@ -573,9 +714,7 @@ export function createSessionRuntimeController({
     }
 
     if (historyTarget) {
-      syncingRouteOpen = true;
-      try {
-        await openThreadSession(
+      await openThreadSession(
           {
             id: targetSessionId,
             kind: "thread",
@@ -586,14 +725,12 @@ export function createSessionRuntimeController({
             cwd: state.liveView.sessionMeta?.cwd || state.threadView.meta?.cwd || ""
           },
           { skipRoute: true }
-        );
-      } finally {
-        syncingRouteOpen = false;
-      }
+      );
       return;
     }
 
     let session = state.sessions.find((item) => item.id === targetSessionId);
+    const lookup = ++routeLookup;
     if (!session) {
       try {
         const single = await requestSessionById(targetSessionId);
@@ -604,6 +741,8 @@ export function createSessionRuntimeController({
         // Keep existing state when single-session lookup fails.
       }
     }
+
+    if (lookup !== routeLookup || route.name !== "chat" || String(route.params.sessionId || "").trim() !== targetSessionId) return;
 
     if (!session) {
       setStatus("会话 ID 已失效，无法定位历史记录。请使用 history:provider:resumeSessionId 形式的链接。");
@@ -619,19 +758,24 @@ export function createSessionRuntimeController({
       }
     }
 
-    syncingRouteOpen = true;
-    try {
-      await openSessionItem(session, { skipRoute: true });
-    } finally {
-      syncingRouteOpen = false;
-    }
+    await openSessionItem(session, { skipRoute: true });
   }
 
   return {
+    setSessionCatalogView, loadSessionCatalogGroup, loadMoreSessionCatalog,
     applyBackendConfig,
+    requestWorkspaceConfig,
+    invalidateWorkspaceBootstrap,
     bootstrapWorkspace,
     hydrateSession,
     refreshSessions,
+    startSessionListSyncLoop,
+    stopSessionListSyncLoop,
+    invalidateActivation,
+    stopSocketRecovery,
+    recoverLiveSession,
+    getActivationToken: () => activation,
+    isActivationCurrent,
     stopHistorySyncLoop,
     startHistorySyncLoop,
     currentThreadSyncTarget,
@@ -641,6 +785,7 @@ export function createSessionRuntimeController({
     openSessionItem,
     createSessionInGroup,
     ensureLiveSession,
+    applyInputResponse,
     backToList,
     syncRouteSession
   };

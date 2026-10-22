@@ -302,7 +302,7 @@ Owner: maintainers | backend | frontend | infra | community
 
 模板库定义在：
 
-- [document-templates.md](/workspace/codex-cc-web-terminal/docs/contributing/document-templates.md)
+- [document-templates.md](document-templates.md)
 
 ## Lifecycle Rules
 
@@ -364,7 +364,7 @@ Owner: maintainers | backend | frontend | infra | community
 
 新增正式文档时，不要从空白开始自由发挥，优先使用模板库：
 
-- [document-templates.md](/workspace/codex-cc-web-terminal/docs/contributing/document-templates.md)
+- [document-templates.md](document-templates.md)
 
 ## Decision Rule
 

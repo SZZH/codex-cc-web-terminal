@@ -24,8 +24,8 @@ function toToolPayload(payload = {}, defaults = {}) {
   };
 }
 
-function normalizeKind(eventType) {
-  switch (String(eventType || "")) {
+function normalizeKind(legacyEvent) {
+  switch (String(legacyEvent?.eventType || "")) {
     case "thread_metadata_initialized":
       return CANONICAL_EVENT_KINDS.THREAD_METADATA_UPDATED;
     case "turn_started":
@@ -39,7 +39,9 @@ function normalizeKind(eventType) {
     case "user_message_recorded":
       return CANONICAL_EVENT_KINDS.USER_MESSAGE;
     case "agent_message_recorded":
-      return CANONICAL_EVENT_KINDS.MESSAGE_DELTA;
+      return String(legacyEvent?.payload?.phase || "").toLowerCase() === "streaming"
+        ? CANONICAL_EVENT_KINDS.MESSAGE_DELTA
+        : CANONICAL_EVENT_KINDS.MESSAGE_COMPLETED;
     case "reasoning_summary_recorded":
     case "reasoning_raw_recorded":
       return CANONICAL_EVENT_KINDS.REASONING_DELTA;
@@ -71,8 +73,10 @@ function normalizePayload(legacyEvent, canonicalKind) {
         content: Array.isArray(payload.content) ? [...payload.content] : []
       };
     case CANONICAL_EVENT_KINDS.MESSAGE_DELTA:
+    case CANONICAL_EVENT_KINDS.MESSAGE_COMPLETED:
       return {
         text: payload.text ?? "",
+        ...(payload.messageId ? { messageId: payload.messageId } : {}),
         source: payload.source ?? "primary_output_text",
         phase: payload.phase ?? null
       };
@@ -115,7 +119,7 @@ function normalizePayload(legacyEvent, canonicalKind) {
 }
 
 export function createCanonicalEventFromLegacy(legacyEvent, { provider = "", providerThreadId = "" } = {}) {
-  const canonicalKind = normalizeKind(legacyEvent?.eventType);
+  const canonicalKind = normalizeKind(legacyEvent);
   if (!canonicalKind) {
     return null;
   }

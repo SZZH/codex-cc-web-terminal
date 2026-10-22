@@ -97,6 +97,46 @@ function hasTurnMeaningfulAssistantContent(turn = {}) {
   return Boolean(extractTurnAssistantText(turn)) || extractTurnProcessCount(turn) > 0;
 }
 
+function imageIdentity(value) {
+  let source = String(value || "").trim();
+  if (!source) return "";
+  try {
+    const parsed = new URL(source, "http://history.local");
+    if (parsed.pathname === "/api/local-file-image" && parsed.searchParams.has("path")) source = parsed.searchParams.get("path");
+    else if (parsed.protocol === "file:") source = decodeURIComponent(parsed.pathname);
+    else if (/^https?:|^data:/.test(source)) return parsed.href;
+  } catch { /* Keep local paths as opaque image references. */ }
+  const segments = source.replaceAll("\\", "/").split("/");
+  const normalized = [];
+  for (const segment of segments) {
+    if (segment === ".") continue;
+    if (segment === ".." && normalized.length && normalized.at(-1) !== "..") normalized.pop();
+    else normalized.push(segment);
+  }
+  return normalized.join("/");
+}
+
+function itemImageKeys(item = {}) {
+  const payload = item.payload || item;
+  const images = [...(payload.content || []), ...(payload.images || []), ...(payload.local_images || [])];
+  if (/image/i.test(String(item.kind || ""))) images.push(payload);
+  return [...new Set(images.filter((part) => /image/i.test(String(part.type || "")) || part.url || part.image_url || part.path)
+    .map((part) => imageIdentity(part.image_url || part.url || part.path)).filter(Boolean))].sort();
+}
+
+function isSyntheticItem(item = {}) {
+  return /^(?:historymsg[_:]|live(?:message|overlay|image)[_:]|agent-message:|user-message:|message[-:]|overlay[-:])/i.test(String(item.id || ""));
+}
+
+function isTerminalTurn(turn = {}) {
+  return ["completed", "failed", "aborted", "interrupted"].includes(String(turn.status || turn.assistant?.status || "").toLowerCase());
+}
+
+function mergeEquivalentItem(existing, incoming) {
+  if (existing.id && existing.id === incoming.id) return { ...existing, ...incoming };
+  return { ...incoming, ...existing, id: existing.id || incoming.id };
+}
+
 function areEquivalentItems(existingItem = {}, incomingItem = {}) {
   const existingKind = String(existingItem?.kind || "").trim();
   const incomingKind = String(incomingItem?.kind || "").trim();
@@ -105,10 +145,16 @@ function areEquivalentItems(existingItem = {}, incomingItem = {}) {
   }
   const existingText = normalizeComparableText(existingItem?.text || existingItem?.summary || "");
   const incomingText = normalizeComparableText(incomingItem?.text || incomingItem?.summary || "");
-  if (!existingText || !incomingText || existingText !== incomingText) {
-    return false;
+  if (existingKind === "UserMessage") {
+    const existingImages = itemImageKeys(existingItem);
+    const incomingImages = itemImageKeys(incomingItem);
+    return existingText === incomingText && (existingText || existingImages.length) && JSON.stringify(existingImages) === JSON.stringify(incomingImages);
   }
-  return true;
+  if (!existingText || !incomingText || existingText !== incomingText) {
+    const images = itemImageKeys(existingItem);
+    return Boolean((isSyntheticItem(existingItem) || isSyntheticItem(incomingItem)) && images.length && JSON.stringify(images) === JSON.stringify(itemImageKeys(incomingItem)));
+  }
+  return isSyntheticItem(existingItem) || isSyntheticItem(incomingItem);
 }
 
 function areEquivalentTurns(existingTurn = {}, incomingTurn = {}) {
@@ -117,6 +163,8 @@ function areEquivalentTurns(existingTurn = {}, incomingTurn = {}) {
   if (existingId && incomingId && existingId === incomingId) {
     return true;
   }
+  const isGeneratedId = (id) => /^(?:history-turn-\d+|turn[:_-]\d+|runtime-draft:.+|(?:synthetic|legacy|local)-turn:.+|live-shell(?:[:_-].*)?|.+-turn-\d{13}-\d+-[a-f0-9]{8})$/.test(id);
+  if (!isGeneratedId(existingId) && !isGeneratedId(incomingId)) return false;
 
   const existingUserText = extractTurnUserText(existingTurn);
   const incomingUserText = extractTurnUserText(incomingTurn);
@@ -185,24 +233,35 @@ function mergeConversationTurns(existingTurn = {}, incomingTurn = {}) {
     assistant: {
       ...existingAssistant,
       ...incomingAssistant,
-      body: mergeById(existingAssistant.body, incomingAssistant.body),
+      ...(isTerminalTurn(existingTurn) && existingAssistant.body?.length
+        ? { status: existingAssistant.status, finishedAt: existingAssistant.finishedAt || incomingAssistant.finishedAt }
+        : {}),
+      body: isTerminalTurn(existingTurn) && existingAssistant.body?.length
+        ? existingAssistant.body
+        : mergeById(existingAssistant.body, incomingAssistant.body, {
+            areEquivalent: (existing, incoming) => areEquivalentItems({ ...existing, kind: existing.kind || "AgentMessage" }, { ...incoming, kind: incoming.kind || "AgentMessage" }),
+            mergeItems: mergeEquivalentItem
+          }),
       process: mergeById(existingAssistant.process, incomingAssistant.process)
     }
   };
 }
 
 function mergeThreadTurns(existingTurn = {}, incomingTurn = {}) {
+  const completedBody = isTerminalTurn(existingTurn) && (existingTurn.items || []).some((item) => ["AgentMessage", "ImageView", "ImageGeneration", "Plan"].includes(item.kind));
+  const incomingItems = (incomingTurn.items || []).filter((item) => !completedBody || !["AgentMessage", "ImageView", "ImageGeneration", "Plan"].includes(item.kind));
   const merged = {
     ...existingTurn,
     ...incomingTurn,
     id: String(existingTurn?.id || incomingTurn?.id || "").trim(),
-    items: mergeById(existingTurn?.items, incomingTurn?.items, {
-      areEquivalent: areEquivalentItems
+    items: mergeById(existingTurn?.items, incomingItems, {
+      areEquivalent: areEquivalentItems,
+      mergeItems: mergeEquivalentItem
     })
   };
   const existingHasContent = hasTurnMeaningfulAssistantContent(existingTurn);
   const incomingHasContent = hasTurnMeaningfulAssistantContent(incomingTurn);
-  if (existingHasContent && !incomingHasContent) {
+  if (existingHasContent && (!incomingHasContent || completedBody)) {
     merged.status = existingTurn?.status || incomingTurn?.status;
     merged.completedAt = existingTurn?.completedAt || incomingTurn?.completedAt || "";
     merged.startedAt = existingTurn?.startedAt || incomingTurn?.startedAt || "";
@@ -220,6 +279,7 @@ function mergeThreadSnapshot(baseSnapshot, liveSnapshot) {
   return {
     ...baseSnapshot,
     ...liveSnapshot,
+    metadata: { ...(liveSnapshot.metadata || {}), ...(baseSnapshot.metadata || {}) },
     threadId: liveSnapshot.threadId || baseSnapshot.threadId || "",
     turns: mergeById(baseSnapshot.turns, liveSnapshot.turns, {
       areEquivalent: areEquivalentTurns,

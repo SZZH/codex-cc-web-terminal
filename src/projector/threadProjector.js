@@ -97,6 +97,9 @@ function applyTerminalTurn(snapshot, aggregator, event, status) {
   const turn = ensureTurn(snapshot, event);
   materializeOverlay(turn, aggregator.getOverlay(), event.ts);
   turn.status = status;
+  turn.error = status === TURN_STATUSES.FAILED
+    ? JSON.parse(JSON.stringify(event.payload?.error ?? event.payload ?? { message: "Codex execution failed." }))
+    : null;
   turn.completedAt = event.ts;
   snapshot.activeTurnId = null;
   aggregator.reset({ threadId: snapshot.threadId, turnId: "" });
@@ -117,7 +120,7 @@ export function createThreadProjector(input = {}) {
   );
   const aggregator = createLiveTurnAggregator({
     threadId: snapshot.threadId,
-    turnId: ""
+    turnId: snapshot.activeTurnId || ""
   });
 
   function touch(event) {
@@ -148,6 +151,7 @@ export function createThreadProjector(input = {}) {
         case CANONICAL_EVENT_KINDS.THREAD_SNAPSHOT:
           if (event.payload?.snapshot && typeof event.payload.snapshot === "object") {
             Object.assign(snapshot, createThreadSnapshot(event.payload.snapshot));
+            aggregator.reset({ threadId: snapshot.threadId, turnId: snapshot.activeTurnId || "" });
           }
           break;
         case CANONICAL_EVENT_KINDS.TURN_STARTED:

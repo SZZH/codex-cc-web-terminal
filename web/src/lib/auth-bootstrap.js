@@ -2,9 +2,8 @@ export async function resolveInitialAuthBootstrap({
   savedToken = "",
   autoLoginTried = false,
   requestAuthSession,
-  bootstrapWorkspace,
   handleAutoLogin,
-  routeName = ""
+  isCurrent = () => true
 } = {}) {
   const normalizedToken = String(savedToken || "").trim();
   const result = {
@@ -17,15 +16,25 @@ export async function resolveInitialAuthBootstrap({
 
   try {
     const auth = await requestAuthSession();
+    if (!isCurrent()) return null;
     if (auth?.authenticated) {
-      await bootstrapWorkspace({ includeSessions: routeName !== "chat" });
       result.isAuthenticated = true;
+      result.accessToken = "";
     }
     return result;
-  } catch {
+  } catch (error) {
+    if (!isCurrent()) return null;
+    if (error?.code === "READ_TIMEOUT") {
+      result.statusText = error.message;
+      return result;
+    }
     if (normalizedToken && !autoLoginTried) {
       result.autoLoginTried = true;
-      await handleAutoLogin(normalizedToken);
+      const recovered = await handleAutoLogin(normalizedToken);
+      if (!isCurrent()) return null;
+      result.isAuthenticated = recovered?.isAuthenticated === true;
+      result.accessToken = String(recovered?.accessToken || "");
+      result.rememberToken = Boolean(recovered?.rememberToken);
     }
     return result;
   }

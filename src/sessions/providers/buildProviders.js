@@ -79,21 +79,17 @@ export function buildProviders(config) {
     if (config.codexNoAltScreen) {
       args.push("--no-alt-screen");
     }
-    if (!isResume) {
-      args.push(...buildCodexPermissionArgs(permissionMode || "default", config));
-    }
+    args.push(...buildCodexPermissionArgs(permissionMode || "default", config));
     if (config.codexExtraArgs.length > 0) {
       args.push(...config.codexExtraArgs);
     }
     return args;
   };
-  const ccArgs = ({ resumeSessionId, name, model }) => {
+  const ccArgs = ({ resumeSessionId, model }) => {
     const args = [];
     const selectedModel = selectModel(model, config.ccModel);
     if (resumeSessionId) {
       args.push("--resume", resumeSessionId);
-    } else if (String(name || "").trim()) {
-      args.push("--name", String(name).trim());
     }
     if (selectedModel) {
       args.push("--model", selectedModel);
@@ -142,14 +138,14 @@ export function buildProviders(config) {
       bootstrapNames: ccBootstrapNames,
       defaultModel: config.ccModel,
       models: ccModelOptions,
-      buildSpawnSpec({ resumeSessionId, name, model }) {
+      buildSpawnSpec({ resumeSessionId, model }) {
         return {
           file: config.ccBin,
-          args: ccArgs({ resumeSessionId, name, model })
+          args: ccArgs({ resumeSessionId, model })
         };
       },
-      buildCommand({ resumeSessionId, name, model }) {
-        const parts = [config.ccBin, ...ccArgs({ resumeSessionId, name, model })];
+      buildCommand({ resumeSessionId, model }) {
+        const parts = [config.ccBin, ...ccArgs({ resumeSessionId, model })];
         return buildShellCommand(parts, config.shellQuoteStyle);
       }
     }

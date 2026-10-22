@@ -12,6 +12,7 @@ import { createEmptyConversationState, applyDelta } from "../src/sessions/normal
 import { createTurnCreatedDelta, normalizeRecordToDeltas } from "../src/sessions/normalize/turnDeltas.js";
 import { deriveThreadSnapshotFromConversationState } from "../src/threads/index.js";
 import { summarizeRelevantStderr } from "../src/sessions/runners/codexRunner.js";
+import { normalizeCodexComposerPatch } from "../src/sessions/shared/composerOptions.js";
 import { createBaseConfig, createTempDir, waitForMicrotasks } from "./helpers/backendTestUtils.js";
 
 class AppServerBridgeStub extends EventEmitter {
@@ -52,6 +53,105 @@ function writeJsonl(filePath, records) {
   );
 }
 
+test("legacy turn delegates preserve the manager receiver and explicit completion targets", () => {
+  const { manager } = createManager();
+  const session = {
+    id: "legacy-delegate",
+    currentTurnId: "active-turn",
+    activePendingTurnId: "active-turn",
+    conversationState: createConversationState(),
+    pendingLocalTurnIds: new Set(["active-turn"])
+  };
+  const records = [];
+  const broadcasts = [];
+  manager.applyThreadRawRecord = function (target, record, options) {
+    assert.equal(this, manager);
+    assert.equal(target, session);
+    records.push({ record, options });
+  };
+  manager.broadcastDerivedConversationDelta = function (target, previous) {
+    assert.equal(this, manager);
+    assert.equal(target, session);
+    assert.equal(previous.sessionId, "");
+    broadcasts.push("delta");
+  };
+  manager.broadcastConversationSnapshot = function (target) {
+    assert.equal(this, manager);
+    assert.equal(target, session);
+    broadcasts.push("snapshot");
+  };
+  const timestamp = "2026-10-17T10:00:00.000Z";
+  const images = [{ path: "/tmp/legacy-delegate-image.png", name: "image.png" }];
+  const queuedTurnId = manager.createConversationTurn(session, "queued input", timestamp, { activate: false, images });
+
+  assert.equal(session.currentTurnId, "active-turn");
+  assert.equal(session.activePendingTurnId, "active-turn");
+  assert.ok(session.pendingLocalTurnIds.has(queuedTurnId));
+  assert.equal(records[0].options.turnId, queuedTurnId);
+  assert.equal(records[0].record.timestamp, timestamp);
+  assert.deepEqual(records[0].record.payload.local_images, images);
+  assert.deepEqual(broadcasts, ["delta"]);
+
+  manager.hasConversationTurn = function (target, turnId) {
+    assert.equal(this, manager);
+    assert.equal(target, session);
+    return turnId === queuedTurnId;
+  };
+  assert.equal(manager.finalizeConversationTurn(session, "completed", timestamp, { turnId: "" }), false);
+  assert.equal(manager.finalizeConversationTurn(session, "completed", timestamp, { turnId: "missing-turn" }), false);
+  assert.equal(records.length, 1);
+  assert.equal(manager.finalizeConversationTurn(session, "completed", timestamp, { turnId: queuedTurnId }), true);
+  assert.equal(records[1].options.turnId, queuedTurnId);
+  assert.equal(records[1].record.payload.type, "task_complete");
+  assert.equal(session.currentTurnId, "active-turn");
+  assert.equal(session.activePendingTurnId, "active-turn");
+  assert.ok(!session.pendingLocalTurnIds.has(queuedTurnId));
+  assert.ok(session.pendingLocalTurnIds.has("active-turn"));
+  assert.deepEqual(broadcasts, ["delta", "delta", "snapshot"]);
+});
+
+test("legacy history resync resolves manager methods when each scheduled callback runs", (t) => {
+  const { manager } = createManager();
+  const session = { id: "legacy-resync", provider: "codex", resumeSessionId: "official-thread", status: "running" };
+  manager.sessions.set(session.id, session);
+  const scheduled = [];
+  t.mock.method(globalThis, "setTimeout", (callback, delayMs) => {
+    scheduled.push({ callback, delayMs });
+    return { unref() {} };
+  });
+  manager.scheduleConversationHistoryResync(session, { attempts: 2, delayMs: 5 });
+  assert.deepEqual(scheduled.map(({ delayMs }) => delayMs), [5, 10]);
+
+  const observed = [];
+  manager.ensureThreadSnapshot = function (target) {
+    assert.equal(this, manager);
+    assert.equal(target, session);
+    observed.push("ensure");
+    return { threadId: "official-thread", version: 0, lastEventSeq: 0, turns: [] };
+  };
+  manager.historyService.getHistoricalMessages = () => ({
+    threadSnapshot: { threadId: "official-thread", version: 1, lastEventSeq: 1, turns: [] }
+  });
+  manager.syncConversationStateFromThreadSnapshot = function (target) {
+    assert.equal(this, manager);
+    assert.equal(target, session);
+    observed.push("sync");
+  };
+  manager.broadcastConversationSnapshot = function (target) {
+    assert.equal(this, manager);
+    assert.equal(target, session);
+    assert.equal(target.threadSnapshot.threadId, "official-thread");
+    observed.push("broadcast");
+  };
+  scheduled[0].callback();
+  assert.deepEqual(observed, ["ensure", "sync", "broadcast"]);
+  assert.ok(session.updatedAt);
+
+  session.status = "exited";
+  scheduled[1].callback();
+  assert.deepEqual(observed, ["ensure", "sync", "broadcast"]);
+});
+
 test("providerCatalog exposes both provider definitions", () => {
   const { manager } = createManager();
   const providers = manager.providerCatalog();
@@ -91,7 +191,69 @@ test("providerCatalog reads codex model options from models cache when available
   ]);
 });
 
-test("listProjectGroups sorts groups by latest session activity including live sessions", () => {
+test("providerCatalog preserves model reasoning capabilities, filtering and ordering", () => {
+  const { manager, config } = createManager();
+  fs.writeFileSync(config.codexModelsCachePath, JSON.stringify({ models: [
+    { slug: "future", visibility: "list", priority: 2, supportedReasoningEfforts: ["high", "ultra", "ultra"], defaultReasoningEffort: "ultra" },
+    { slug: "limited", display_name: "Limited", priority: 1, supported_reasoning_levels: [{ effort: "low", description: "Low" }], default_reasoning_level: "low" },
+    { slug: "hidden", visibility: "hide", priority: 0 },
+    { slug: "no-api", supported_in_api: false },
+    { slug: "limited", priority: 0 },
+    { slug: "no-reasoning", priority: 3, supportedReasoningEfforts: [] },
+    { slug: "camel", priority: 4, supportedReasoningEfforts: [{ reasoningEffort: "ultra" }], defaultReasoningEffort: "ultra" }
+  ] }));
+
+  assert.deepEqual(manager.providerCatalog()[0].models, [
+    { value: "limited", label: "Limited", supportedReasoningEfforts: ["low"], defaultReasoningEffort: "low" },
+    { value: "future", label: "future", supportedReasoningEfforts: ["high", "ultra"], defaultReasoningEffort: "ultra" },
+    { value: "no-reasoning", label: "no-reasoning", supportedReasoningEfforts: [] },
+    { value: "camel", label: "camel", supportedReasoningEfforts: ["ultra"], defaultReasoningEffort: "ultra" }
+  ]);
+});
+
+test("Codex patches validate advertised efforts and normalize effort when changing models", () => {
+  const models = [
+    { value: "limited", supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "high" },
+    { value: "future", supportedReasoningEfforts: ["ultra"], defaultReasoningEffort: "ultra" },
+    { value: "no-reasoning", supportedReasoningEfforts: [] }
+  ];
+  const current = { model: "original", reasoningEffort: "xhigh", permissionMode: "full-access" };
+
+  assert.deepEqual(normalizeCodexComposerPatch({}, current, models), {});
+  assert.deepEqual(normalizeCodexComposerPatch({ model: "limited" }, current, models), { model: "limited", reasoningEffort: "high" });
+  assert.deepEqual(normalizeCodexComposerPatch({ model: "limited" }, { ...current, model: "limited" }, models), { model: "limited", reasoningEffort: "high" });
+  assert.deepEqual(normalizeCodexComposerPatch({ model: "limited" }, { ...current, reasoningEffort: "low" }, models), { model: "limited" });
+  assert.deepEqual(normalizeCodexComposerPatch({ model: "future", reasoningEffort: "ultra" }, current, models), { model: "future", reasoningEffort: "ultra" });
+  assert.deepEqual(normalizeCodexComposerPatch({ model: "no-reasoning" }, current, models), { model: "no-reasoning", reasoningEffort: "" });
+  assert.throws(() => normalizeCodexComposerPatch({ model: "limited", reasoningEffort: "xhigh" }, current, models), /does not support reasoning effort/);
+  assert.throws(() => normalizeCodexComposerPatch({ model: "no-reasoning", reasoningEffort: "low" }, current, models), /does not support reasoning effort/);
+  assert.deepEqual(normalizeCodexComposerPatch({ reasoningEffort: "xhigh" }, current), { reasoningEffort: "xhigh" });
+  assert.deepEqual(normalizeCodexComposerPatch({ reasoningEffort: "ultra" }, current), { reasoningEffort: "ultra" });
+  assert.throws(() => normalizeCodexComposerPatch({ reasoningEffort: "unsupported-level" }, current), /does not support reasoning effort/);
+});
+
+test("Codex session creation and updates share model capability validation", () => {
+  const { manager, config } = createManager();
+  fs.writeFileSync(config.codexModelsCachePath, JSON.stringify({ models: [
+    { slug: "limited", supported_reasoning_levels: [{ effort: "low" }], default_reasoning_level: "low" },
+    { slug: "future", supportedReasoningEfforts: ["ultra"], defaultReasoningEffort: "ultra" },
+    { slug: "no-reasoning", supportedReasoningEfforts: [] }
+  ] }));
+  const created = manager.create({ model: "limited" });
+  const live = manager.get(created.id);
+  assert.equal(created.reasoningEffort, "low");
+  assert.throws(() => manager.create({ model: "limited", reasoningEffort: "xhigh" }), /does not support reasoning effort/);
+  assert.throws(() => manager.updateSessionOptions(live, { model: "limited", reasoningEffort: "xhigh" }), /does not support reasoning effort/);
+  assert.equal(live.reasoningEffort, "low");
+  manager.updateSessionOptions(live, { model: "future" });
+  assert.equal(live.reasoningEffort, "ultra");
+  manager.updateSessionOptions(live, { model: "no-reasoning" });
+  assert.equal(manager.serialize(live).reasoningEffort, "");
+  assert.equal(manager.create({ model: "no-reasoning" }).reasoningEffort, "");
+});
+
+test("listProjectGroups preserves project order and includes old history alongside live sessions", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-04-29T12:00:00.000Z"));
   const { manager, rootDir } = createManager();
   const alphaRoot = path.join(rootDir, "workspace", "alpha");
   const betaRoot = path.join(rootDir, "workspace", "beta");
@@ -172,11 +334,12 @@ test("listProjectGroups sorts groups by latest session activity including live s
   const groups = manager.listProjectGroups();
 
   assert.deepEqual(groups.map((group) => group.name), ["alpha", "beta"]);
-  assert.deepEqual(groups[0].sessions.map((session) => session.name), ["alpha live"]);
-  assert.deepEqual(groups[1].sessions, []);
+  assert.deepEqual(groups[0].sessions.map((session) => session.name), ["alpha live", "旧 alpha"]);
+  assert.deepEqual(groups[1].sessions.map((session) => session.name), ["旧 beta"]);
 });
 
-test("listSidebarSnapshot reuses project groups and appends unmatched live sessions", () => {
+test("listSidebarSnapshot reuses project groups and appends unmatched live sessions", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-04-29T12:00:00.000Z"));
   const { manager, rootDir } = createManager();
   const alphaRoot = path.join(rootDir, "workspace", "alpha");
   const gammaRoot = path.join(rootDir, "workspace", "gamma");
@@ -231,7 +394,7 @@ test("listSidebarSnapshot reuses project groups and appends unmatched live sessi
   assert.equal(snapshot.sessions[0].name, "gamma live");
 });
 
-test("listSidebarSnapshot excludes archived sessions and sessions not used within seven days", () => {
+test("listSidebarSnapshot excludes archived sessions while keeping old desktop history", () => {
   const realNow = Date.now;
   Date.now = () => Date.parse("2026-04-29T12:00:00.000Z");
   try {
@@ -305,9 +468,9 @@ test("listSidebarSnapshot excludes archived sessions and sessions not used withi
 
     const snapshot = manager.listSidebarSnapshot();
 
-    assert.deepEqual(snapshot.projectGroups[0].sessions.map((session) => session.name), ["recent history"]);
-    assert.equal(snapshot.sessions.some((session) => session.name === "old history"), false);
-    assert.equal(snapshot.sessions.some((session) => session.name === "running live"), false);
+    assert.deepEqual(snapshot.projectGroups[0].sessions.map((session) => session.name), ["recent history", "old history", "running live"]);
+    assert.equal(snapshot.sessions.some((session) => session.name === "old history"), true);
+    assert.equal(snapshot.sessions.some((session) => session.name === "running live"), true);
     assert.equal(snapshot.sessions.some((session) => session.name === "archived live"), false);
   } finally {
     Date.now = realNow;
@@ -319,7 +482,7 @@ test("create rejects unsupported providers", () => {
   assert.throws(() => manager.create({ provider: "unknown-provider" }), /Unsupported session provider/);
 });
 
-test("codex session stores composer runtime options and switches to json_exec for permission overrides", () => {
+test("codex session stores composer runtime options without switching app-server for permission overrides", () => {
   const { manager } = createManager();
   const created = manager.create({
     provider: "codex",
@@ -333,7 +496,7 @@ test("codex session stores composer runtime options and switches to json_exec fo
   assert.equal(created.model, "gpt-5-mini");
   assert.equal(created.reasoningEffort, "high");
   assert.equal(created.permissionMode, "full-access");
-  assert.equal(live.runnerMode, "json_exec");
+  assert.equal(live.runnerMode, "app_server");
 
   manager.updateSessionOptions(live, {
     model: "gpt-5",
@@ -347,7 +510,7 @@ test("codex session stores composer runtime options and switches to json_exec fo
   assert.equal(live.runnerMode, "app_server");
 });
 
-test("buildCodexJsonExecArgs maps permissionMode without guessing reasoning flags", () => {
+test("buildCodexJsonExecArgs maps permissionMode to headless sandbox flags", () => {
   const { manager } = createManager({ codexFullAccess: true });
 
   const defaultSession = manager.get(manager.create({ provider: "codex", cwd: process.cwd() }).id);
@@ -362,18 +525,19 @@ test("buildCodexJsonExecArgs maps permissionMode without guessing reasoning flag
   const autoReviewArgs = manager.buildCodexJsonExecArgs(autoReviewSession, "hello");
   const fullAccessArgs = manager.buildCodexJsonExecArgs(fullAccessSession, "hello");
 
-  assert.ok(defaultArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
-  assert.deepEqual(
-    autoReviewArgs.slice(autoReviewArgs.indexOf("--sandbox"), autoReviewArgs.indexOf("--sandbox") + 4),
-    ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
-  );
+  assert.deepEqual(defaultArgs.slice(0, 2), ["--sandbox", "read-only"]);
+  assert.ok(!defaultArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.ok(defaultArgs.includes('approval_policy="never"'));
+  assert.ok(defaultArgs.includes('approvals_reviewer="user"'));
+  assert.ok(autoReviewArgs.includes("--approve-for-me"));
   assert.ok(!autoReviewArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
   assert.ok(fullAccessArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
-  assert.ok(!autoReviewArgs.some((arg) => String(arg).includes("reason")));
-  assert.ok(!fullAccessArgs.some((arg) => String(arg).includes("reason")));
+  assert.ok(autoReviewArgs.includes('model_reasoning_effort="xhigh"'));
+  assert.ok(fullAccessArgs.includes('approvals_reviewer="user"'));
+  assert.ok(!autoReviewArgs.includes("--ask-for-approval"));
 });
 
-test("buildCodexJsonExecArgs does not inject permission flags for resumed sessions", () => {
+test("buildCodexJsonExecArgs injects selected permission flags for resumed sessions", () => {
   const { manager } = createManager({ codexFullAccess: true });
   const resumedSession = manager.get(
     manager.create({
@@ -387,9 +551,127 @@ test("buildCodexJsonExecArgs does not inject permission flags for resumed sessio
   const resumedArgs = manager.buildCodexJsonExecArgs(resumedSession, "hello");
 
   assert.ok(resumedArgs.includes("resume"));
-  assert.ok(!resumedArgs.includes("--sandbox"));
-  assert.ok(!resumedArgs.includes("--ask-for-approval"));
+  assert.ok(resumedArgs.includes("--approve-for-me"));
   assert.ok(!resumedArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.ok(!resumedArgs.includes("--ask-for-approval"));
+  assert.ok(resumedArgs.indexOf("--approve-for-me") < resumedArgs.indexOf("exec"));
+  assert.ok(resumedArgs.indexOf("--json") < resumedArgs.indexOf("resume"));
+});
+
+test("resumed JSON execution places shared exec options before the resume subcommand", () => {
+  const { manager } = createManager({ codexProfile: "work", codexExtraArgs: ["--color", "never"] });
+  const args = manager.buildCodexJsonExecArgs({
+    resumeSessionId: "thread-1",
+    model: "gpt-5.4",
+    reasoningEffort: "high",
+    permissionMode: "auto-review"
+  }, "hello");
+
+  assert.deepEqual(args.slice(0, 2), ["--approve-for-me", "exec"]);
+  for (const option of ["--model", "--profile", "--color", "--json", "--skip-git-repo-check"]) {
+    assert.ok(args.indexOf(option) > args.indexOf("exec"));
+    assert.ok(args.indexOf(option) < args.indexOf("resume"));
+  }
+  assert.deepEqual(args.slice(-4), ["resume", "--all", "thread-1", "hello"]);
+  assert.ok(args.indexOf('model_reasoning_effort="high"') < args.indexOf("resume"));
+});
+
+test("JSON fallback includes reasoning only when the selected model has an effort", () => {
+  const { manager } = createManager({ codexAppServerEnabled: false });
+  const created = manager.create({ reasoningEffort: "high" });
+  const live = manager.get(created.id);
+  assert.equal(live.runnerMode, "json_exec");
+  const args = manager.buildCodexJsonExecArgs(live, "hello");
+  assert.ok(args.includes('model_reasoning_effort="high"'));
+  const withoutReasoning = manager.buildCodexJsonExecArgs({ ...live, reasoningEffort: "" }, "hello");
+  assert.ok(!withoutReasoning.some((arg) => String(arg).includes("model_reasoning_effort")));
+  for (const extraArgs of [
+    ["-c", 'model_reasoning_effort="high"'],
+    ["--config", 'model_reasoning_effort="high"'],
+    ['--config=model_reasoning_effort="high"'],
+    ['-cmodel_reasoning_effort="high"']
+  ]) {
+    manager.config.codexExtraArgs = [...extraArgs, "--color", "never"];
+    const withoutExtraReasoning = manager.buildCodexJsonExecArgs({ ...live, reasoningEffort: "" }, "hello");
+    assert.ok(!withoutExtraReasoning.some((arg) => String(arg).includes("model_reasoning_effort")));
+    assert.deepEqual(withoutExtraReasoning.slice(withoutExtraReasoning.indexOf("--color"), withoutExtraReasoning.indexOf("--color") + 2), ["--color", "never"]);
+  }
+});
+
+test("JSON fallback leaves queued input untouched while another turn is active", () => {
+  const { manager } = createManager({ codexAppServerEnabled: false });
+  const created = manager.create();
+  const live = manager.get(created.id);
+  live.turnRunning = true;
+  live.currentTurnId = "active-turn";
+  manager.updateSessionOptions(live, { permissionMode: "full-access" });
+  manager.write(live.id, "queued");
+
+  assert.equal(live.runnerMode, "json_exec");
+  assert.equal(live.runningProcess, null);
+  assert.equal(live.currentTurnId, "active-turn");
+  assert.deepEqual(live.queuedInputs, ["queued"]);
+});
+
+test("JSON fallback selected model and effort override extra argument defaults", () => {
+  const { manager } = createManager({ codexExtraArgs: ["--model", "old-model", "-c", 'model_reasoning_effort="low"', "--color", "never"] });
+  const args = manager.buildCodexJsonExecArgs({ model: "selected-model", reasoningEffort: "xhigh", permissionMode: "default", resumeSessionId: "thread-1" }, "hello");
+
+  assert.deepEqual(args.filter((argument) => argument === "--model"), ["--model"]);
+  assert.equal(args[args.indexOf("--model") + 1], "selected-model");
+  assert.ok(!args.includes("old-model"));
+  assert.ok(!args.includes('model_reasoning_effort="low"'));
+  assert.deepEqual(args.filter((arg) => String(arg).includes("model_reasoning_effort")), ['model_reasoning_effort="xhigh"']);
+  assert.ok(args.indexOf('model_reasoning_effort="xhigh"') < args.indexOf("resume"));
+});
+
+test("JSON fallback refuses permission overrides in extra arguments before queueing input", () => {
+  const { manager } = createManager({ codexAppServerEnabled: false });
+  const live = manager.get(manager.create().id);
+  for (const extraArgs of [
+    ["--sandbox", "danger-full-access"], ["--sandbox=danger-full-access"], ["-sdanger-full-access"],
+    ["--ask-for-approval", "never"], ["-a", "never"], ["--approve-for-me"], ["--full-auto"],
+    ["--dangerously-bypass-approvals-and-sandbox"], ["--yolo"], ["-c", 'sandbox_mode="danger-full-access"'],
+    ["--config", 'approval_policy="never"'], ["--config=approvals_reviewer=\"user\""], ["-capprovals_reviewer=\"user\""]
+  ]) {
+    manager.config.codexExtraArgs = extraArgs;
+    assert.throws(() => manager.write(live.id, "hello"), /conflicts with the selected access permissions/);
+    assert.deepEqual(live.queuedInputs, []);
+    assert.equal(live.turnRunning, false);
+    assert.equal(live.currentTurnId, "");
+  }
+});
+
+test("updating permission during an active app-server turn keeps queued input on the same runner", async () => {
+  const { manager, bridge } = createManager();
+  let finishFirstTurn;
+  const configurations = [];
+  bridge.startTurn = (session, text) => {
+    configurations.push({ text, model: session.model, effort: session.reasoningEffort, permission: session.permissionMode });
+    if (configurations.length === 1) {
+      return new Promise((resolve) => { finishFirstTurn = resolve; });
+    }
+    return Promise.resolve({ turn: { items: [{ type: "agent_message", text: "second reply" }] } });
+  };
+  const session = manager.create({ model: "gpt-5", reasoningEffort: "low", permissionMode: "default" });
+  const live = manager.get(session.id);
+  manager.write(session.id, "first");
+  const activeControl = live.runnerTurnControl;
+  manager.updateSessionOptions(live, { model: "gpt-5-mini", reasoningEffort: "xhigh", permissionMode: "full-access" });
+  manager.write(session.id, "second");
+
+  assert.equal(live.runnerMode, "app_server");
+  assert.equal(live.runningProcess, null);
+  assert.equal(live.runnerTurnControl, activeControl);
+  assert.deepEqual(live.queuedInputs, ["second"]);
+  assert.equal(configurations.length, 1);
+  finishFirstTurn({ turn: { items: [{ type: "agent_message", text: "first reply" }] } });
+  await waitForMicrotasks();
+  assert.deepEqual(configurations, [
+    { text: "first", model: "gpt-5", effort: "low", permission: "default" },
+    { text: "second", model: "gpt-5-mini", effort: "xhigh", permission: "full-access" }
+  ]);
+  assert.equal(live.turnRunning, false);
 });
 
 test("summarizeRelevantStderr drops plugin startup warning noise", () => {
@@ -495,7 +777,37 @@ test("codex resumed session inherits model, reasoning effort, permission and cwd
   assert.equal(live.model, "gpt-5.4");
   assert.equal(live.reasoningEffort, "xhigh");
   assert.equal(live.permissionMode, "auto-review");
-  assert.equal(live.runnerMode, "json_exec");
+  assert.equal(live.runnerMode, "app_server");
+});
+
+test("codex resumed sqlite state keeps workspace-write permissions even when approvals are never", () => {
+  const rootDir = createTempDir();
+  const stateDbPath = path.join(rootDir, ".codex", "state.sqlite");
+  fs.mkdirSync(path.dirname(stateDbPath), { recursive: true });
+  execFileSync("sqlite3", [stateDbPath, "create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer);"]);
+  execFileSync(
+    "sqlite3",
+    [
+      stateDbPath,
+      `insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, model, reasoning_effort)
+       values ('thread-workspace-never', '/tmp/rollout.jsonl', 1, 1, 'vscode', 'openai', '${path.join(rootDir, "workspace", "project-a").replace(/'/g, "''")}', 'workspace never', '{"type":"workspace-write"}', 'never', 'gpt-5.4', 'low');`
+    ],
+    { stdio: "ignore" }
+  );
+
+  const config = createBaseConfig(rootDir, {
+    codexStateDbPath: stateDbPath
+  });
+  const manager = new SessionManager(config, { appServerBridge: new AppServerBridgeStub() });
+
+  const created = manager.create({
+    provider: "codex",
+    resumeSessionId: "thread-workspace-never"
+  });
+  const live = manager.get(created.id);
+
+  assert.equal(live.permissionMode, "auto-review");
+  assert.equal(live.runnerMode, "app_server");
 });
 
 test("codex resumed session prefers app_server when permission mode stays default", () => {
@@ -508,7 +820,7 @@ test("codex resumed session prefers app_server when permission mode stays defaul
     [
       stateDbPath,
       `insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, model, reasoning_effort)
-       values ('thread-resume-default', '/tmp/rollout.jsonl', 1, 1, 'vscode', 'openai', '${path.join(rootDir, "workspace", "project-a").replace(/'/g, "''")}', 'resume default', 'workspace-write', 'on-request', 'gpt-5.4', 'low');`
+       values ('thread-resume-default', '/tmp/rollout.jsonl', 1, 1, 'vscode', 'openai', '${path.join(rootDir, "workspace", "project-a").replace(/'/g, "''")}', 'resume default', '{"type":"read-only","network_access":true}', 'never', 'gpt-5.4', 'low');`
     ],
     { stdio: "ignore" }
   );
@@ -1286,6 +1598,51 @@ test("auto-generated first-user-input titles do not persist as custom names", ()
   assert.equal(fs.existsSync(path.join(config.dataDir, "session-names.json")), false);
 });
 
+test("resumed Codex sessions retain their authoritative desktop title after the first continuation input", () => {
+  const { manager, config } = createManager();
+  manager.codexSidebarService.getDesktopSnapshot = () => ({ sessions: [
+    { resumeSessionId: "thread-resume-title", name: "Desktop title" }
+  ] });
+  const session = manager.create({ provider: "codex", resumeSessionId: "thread-resume-title" });
+  const live = manager.get(session.id);
+  assert.equal(session.name, "Desktop title");
+  assert.equal(session.titleSource, "codex_state_db");
+  assert.equal(session.autoNamed, false);
+  manager.maybeAutoRename(live, "a completely different continuation prompt\n");
+  assert.equal(manager.serialize(live).name, "Desktop title");
+  assert.equal(fs.existsSync(path.join(config.dataDir, "session-names.json")), false);
+  manager.shutdown();
+});
+
+test("a resumed Codex session without desktop metadata does not auto-name from a later prompt", () => {
+  const { manager } = createManager();
+  manager.codexSidebarService.getDesktopSnapshot = () => null;
+  const session = manager.create({ provider: "codex", resumeSessionId: "thread-missing-title" });
+  const live = manager.get(session.id);
+  manager.maybeAutoRename(live, "do not replace an existing thread title\n");
+  assert.equal(manager.serialize(live).name, "");
+  assert.equal(live.autoNamed, false);
+  assert.equal(live.titleSource, "codex_state_db");
+  manager.shutdown();
+});
+
+test("an explicit resumed title remains explicit and new Codex sessions still auto-name", () => {
+  const { manager } = createManager();
+  manager.codexSidebarService.getDesktopSnapshot = () => ({ sessions: [
+    { resumeSessionId: "thread-explicit", name: "Desktop title" }
+  ] });
+  const resumed = manager.create({ provider: "codex", resumeSessionId: "thread-explicit", name: "Explicit title" });
+  assert.equal(resumed.name, "Explicit title");
+  assert.equal(resumed.titleSource, "user_provided");
+  assert.equal(resumed.autoNamed, false);
+  const fresh = manager.create({ provider: "codex" });
+  const live = manager.get(fresh.id);
+  assert.equal(live.autoNamed, true);
+  manager.maybeAutoRename(live, "brand new first prompt\n");
+  assert.equal(manager.serialize(live).name, "brand new first prompt");
+  manager.shutdown();
+});
+
 test("findRunningLiveSessionByResume returns the latest running live session", async () => {
   const { manager } = createManager();
   const first = manager.create({
@@ -1835,14 +2192,14 @@ test("codex sidebar keeps all non-archived threads and empty saved projects", ()
     groups[0].sessions.map((session) => session.name),
     ["回复在吗"]
   );
-  assert.deepEqual(groups[1].sessions, []);
+  assert.deepEqual(groups[1].sessions.map((session) => session.name), ["旧 project-b 线程"]);
   assert.equal(groups[1].collapsed, true);
-  assert.deepEqual(groups[2].sessions, []);
+  assert.deepEqual(groups[2].sessions.map((session) => session.name), ["旧 ai 线程"]);
   assert.equal(groups[3].sessions.length, 1);
   assert.equal(groups[3].sessions[0].name, "改为透传");
 });
 
-test("codex sidebar filters project sessions to vscode threads on the active git branch", () => {
+test("codex sidebar includes desktop CLI and exec sources across branches while excluding child threads", () => {
   const rootDir = createTempDir();
   const workspaceRoot = path.join(rootDir, "workspace", "codex-cc-web-terminal");
   const codexDir = path.join(rootDir, ".codex");
@@ -1921,7 +2278,7 @@ test("codex sidebar filters project sessions to vscode threads on the active git
   assert.equal(groups.length, 1);
   assert.deepEqual(
     groups[0].sessions.map((session) => session.name),
-    ["branch session B", "branch session A"]
+    ["exec session", "branch session B", "branch session A", "main old session"]
   );
 });
 
@@ -2602,39 +2959,44 @@ test("history resync does not replace a protected live turn with an empty histor
   assert.equal(liveSession.threadSnapshot.turns[0].items[1].text, "先按接口说明改这一处。");
 });
 
-test("buildProviderCommand reflects provider-specific CLI arguments", () => {
-  const { manager } = createManager();
+test("buildProviderCommand reflects provider-specific CLI arguments", async () => {
+  const { manager, rootDir } = createManager();
+  try {
+    const codexCommand = manager.buildProviderCommand({
+      provider: "codex",
+      resumeSessionId: "thread-42",
+      model: "gpt-5-mini",
+      autoNamed: false,
+      name: "demo"
+    });
+    assert.match(codexCommand, /codex/);
+    assert.match(codexCommand, /resume/);
+    assert.match(codexCommand, /--model/);
 
-  const codexCommand = manager.buildProviderCommand({
-    provider: "codex",
-    resumeSessionId: "thread-42",
-    model: "gpt-5-mini",
-    autoNamed: false,
-    name: "demo"
-  });
-  assert.match(codexCommand, /codex/);
-  assert.match(codexCommand, /resume/);
-  assert.match(codexCommand, /--model/);
+    const ccCommand = manager.buildProviderCommand({
+      provider: "cc",
+      resumeSessionId: "",
+      model: "sonnet",
+      autoNamed: false,
+      name: "Claude Demo"
+    });
+    assert.match(ccCommand, /claude/);
+    assert.doesNotMatch(ccCommand, /--name|Claude Demo/);
+    assert.match(ccCommand, /'--model' 'sonnet'/);
 
-  const ccCommand = manager.buildProviderCommand({
-    provider: "cc",
-    resumeSessionId: "",
-    model: "sonnet",
-    autoNamed: false,
-    name: "Claude Demo"
-  });
-  assert.match(ccCommand, /claude/);
-  assert.match(ccCommand, /--name/);
-  assert.match(ccCommand, /Claude Demo/);
-
-  const autoNamedCc = manager.buildProviderCommand({
-    provider: "cc",
-    resumeSessionId: "",
-    model: "sonnet",
-    autoNamed: true,
-    name: "ignored"
-  });
-  assert.doesNotMatch(autoNamedCc, /--name/);
+    const autoNamedCc = manager.buildProviderCommand({
+      provider: "cc",
+      resumeSessionId: "",
+      model: "sonnet",
+      autoNamed: true,
+      name: "ignored"
+    });
+    assert.doesNotMatch(autoNamedCc, /--name/);
+  } finally {
+    manager.shutdown();
+    await manager.codexSidebarService.close();
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  }
 });
 
 test("streaming markdown message parts merge into a single body block", () => {

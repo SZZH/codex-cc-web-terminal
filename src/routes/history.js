@@ -1,9 +1,11 @@
-import { createHistoryPayloadResolver } from "./historyPayloads.js";
+import { createAppServerHistoryPayloadResolver } from "../sessions/history/appServerHistory.js";
 import { parseHistoryQuery, parseScopedHistoryRoute, parseThreadRoute } from "./historyRouteParams.js";
 
 export async function handleHistoryRoute(ctx, runtime) {
-  const historyPayloads = createHistoryPayloadResolver(runtime.sessionManager);
-  const { getThreadBundle, getThreadConversationPayload, getThreadMessagesPayload, getContinuationPayload } = historyPayloads;
+  async function historyPayload(method, provider, resumeSessionId) {
+    const resolver = await createAppServerHistoryPayloadResolver(runtime.sessionManager, provider, resumeSessionId);
+    return resolver[method](provider, resumeSessionId);
+  }
 
   if (ctx.path === "/api/history-messages" && ctx.method === "GET") {
     if (!runtime.requireAuthorized(ctx)) {
@@ -12,7 +14,7 @@ export async function handleHistoryRoute(ctx, runtime) {
 
     try {
       const { provider, resumeSessionId } = parseHistoryQuery(ctx.url);
-      runtime.json(ctx, 200, getThreadMessagesPayload(provider, resumeSessionId));
+      runtime.json(ctx, 200, await historyPayload("getThreadMessagesPayload", provider, resumeSessionId));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -32,7 +34,7 @@ export async function handleHistoryRoute(ctx, runtime) {
 
     const { provider, resumeSessionId } = match;
     try {
-      runtime.json(ctx, 200, getThreadMessagesPayload(provider, resumeSessionId));
+      runtime.json(ctx, 200, await historyPayload("getThreadMessagesPayload", provider, resumeSessionId));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -52,7 +54,7 @@ export async function handleHistoryRoute(ctx, runtime) {
 
     const { provider, resumeSessionId } = match;
     try {
-      runtime.json(ctx, 200, getThreadConversationPayload(provider, resumeSessionId));
+      runtime.json(ctx, 200, await historyPayload("getThreadConversationPayload", provider, resumeSessionId));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -72,7 +74,7 @@ export async function handleHistoryRoute(ctx, runtime) {
 
     const { provider, resumeSessionId } = match;
     try {
-      runtime.json(ctx, 200, getThreadBundle(provider, resumeSessionId));
+      runtime.json(ctx, 200, await historyPayload("getThreadBundle", provider, resumeSessionId));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -92,7 +94,7 @@ export async function handleHistoryRoute(ctx, runtime) {
 
     const { provider, resumeSessionId } = match;
     try {
-      runtime.json(ctx, 200, getContinuationPayload(provider, resumeSessionId));
+      runtime.json(ctx, 200, await historyPayload("getContinuationPayload", provider, resumeSessionId));
     } catch (err) {
       runtime.json(ctx, 400, { error: err?.message || String(err) });
     }
@@ -114,18 +116,18 @@ export async function handleHistoryRoute(ctx, runtime) {
 
     try {
       if (!suffix) {
-        runtime.json(ctx, 200, getThreadBundle(provider, resumeSessionId));
+        runtime.json(ctx, 200, await historyPayload("getThreadBundle", provider, resumeSessionId));
         return true;
       }
       if (suffix === "composer-state") {
         return false;
       }
       if (suffix === "conversation") {
-        runtime.json(ctx, 200, getThreadConversationPayload(provider, resumeSessionId));
+        runtime.json(ctx, 200, await historyPayload("getThreadConversationPayload", provider, resumeSessionId));
         return true;
       }
       if (suffix === "continuation") {
-        runtime.json(ctx, 200, getContinuationPayload(provider, resumeSessionId));
+        runtime.json(ctx, 200, await historyPayload("getContinuationPayload", provider, resumeSessionId));
         return true;
       }
       runtime.json(ctx, 404, { error: "Not Found" });

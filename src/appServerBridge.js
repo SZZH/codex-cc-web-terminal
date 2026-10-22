@@ -3,6 +3,14 @@ import { EventEmitter } from "node:events";
 
 import { WebSocket } from "ws";
 
+import {
+  buildAppServerThreadOptions,
+  buildAppServerTurnOptions
+} from "./sessions/shared/appServerOptions.js";
+import { requestAppServer } from "./sessions/shared/appServerRequest.js";
+import { AppServerInbound } from "./sessions/shared/appServerInbound.js";
+import { normalizeRunnerInput } from "./sessions/shared/imageAttachments.js";
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -18,6 +26,8 @@ export class AppServerBridge extends EventEmitter {
     this.initialized = false;
     this.nextId = 1;
     this.pending = new Map();
+    this.connectionGeneration = 0;
+    this.inbound = new AppServerInbound(this);
     this.connecting = null;
     this.shuttingDown = false;
   }
@@ -26,10 +36,28 @@ export class AppServerBridge extends EventEmitter {
     return Boolean(this.proc && this.proc.exitCode == null && !this.proc.killed);
   }
 
-  resetConnectionState() {
+  resetConnectionState(socket = this.ws, generation = this.connectionGeneration) {
+    if (socket !== this.ws || generation !== this.connectionGeneration) return;
+    const wasConnected = this.connected || this.initialized;
+    this.inbound.invalidate();
     this.connected = false;
     this.initialized = false;
     this.ws = null;
+    if (wasConnected) {
+      for (const request of this.pending.values()) request.reject(Object.assign(new Error("app-server connection closed"), { uncertain: true }));
+      this.pending.clear();
+      this.emit("disconnected");
+    }
+  }
+
+  bindSocket(socket) {
+    if (this.ws === socket) return;
+    if (this.ws && this.ws !== socket) this.resetConnectionState();
+    this.ws = socket;
+    this.connected = true;
+    const generation = ++this.connectionGeneration;
+    socket.on("message", (raw) => this.handleMessage(raw, socket, generation));
+    socket.on("close", () => this.resetConnectionState(socket, generation));
   }
 
   async ensureReady() {
@@ -67,6 +95,7 @@ export class AppServerBridge extends EventEmitter {
             experimentalApi: true
           }
         });
+        this.sendNotification("initialized");
         this.initialized = true;
         return;
       } catch (error) {
@@ -85,20 +114,48 @@ export class AppServerBridge extends EventEmitter {
     }
     this.proc = null;
     const args = ["app-server", "--listen", this.listenUrl];
-    this.proc = spawn(this.config.codexBin, args, {
+    const proc = spawn(this.config.codexBin, args, {
       cwd: this.config.root,
       env: process.env,
       stdio: ["ignore", "ignore", "pipe"]
     });
-    this.proc.stderr?.on("data", (chunk) => {
+    this.proc = proc;
+    proc.stderr?.on("data", (chunk) => {
       const line = String(chunk || "").trim();
       if (line) {
         this.emit("log", line);
       }
     });
-    this.proc.on("exit", () => {
+    proc.on("error", (error) => {
+      this.emit("log", `app-server process error: ${error.message}`);
+    });
+    proc.on("exit", () => {
+      if (this.proc !== proc) {
+        return;
+      }
+      this.proc = null;
       this.resetConnectionState();
     });
+    try {
+      await new Promise((resolve, reject) => {
+        const onSpawn = () => {
+          proc.off("error", onError);
+          resolve();
+        };
+        const onError = (error) => {
+          proc.off("spawn", onSpawn);
+          reject(error);
+        };
+        proc.once("spawn", onSpawn);
+        proc.once("error", onError);
+      });
+    } catch (error) {
+      if (this.proc === proc) {
+        this.proc = null;
+      }
+      this.resetConnectionState();
+      throw error;
+    }
     await wait(1_200);
   }
 
@@ -121,12 +178,7 @@ export class AppServerBridge extends EventEmitter {
             reject(err);
           });
         });
-        this.ws = socket;
-        this.connected = true;
-        this.ws.on("message", (raw) => this.handleMessage(raw));
-        this.ws.on("close", () => {
-          this.resetConnectionState();
-        });
+        this.bindSocket(socket);
         return;
       } catch (error) {
         lastError = error;
@@ -158,7 +210,8 @@ export class AppServerBridge extends EventEmitter {
     this.resetConnectionState();
   }
 
-  handleMessage(raw) {
+  handleMessage(raw, socket = this.ws, generation = this.connectionGeneration) {
+    if (socket !== this.ws || generation !== this.connectionGeneration) return;
     let msg;
     try {
       msg = JSON.parse(String(raw || "{}"));
@@ -172,7 +225,7 @@ export class AppServerBridge extends EventEmitter {
       }
       this.pending.delete(msg.id);
       if (msg.error) {
-        pending.reject(new Error(msg.error?.message || "app-server request failed"));
+        pending.reject(Object.assign(new Error(msg.error?.message || "app-server request failed"), { rpcError: true, code: msg.error.code, data: msg.error.data }));
       } else {
         pending.resolve(msg.result);
       }
@@ -183,6 +236,7 @@ export class AppServerBridge extends EventEmitter {
       return;
     }
     if (msg.method) {
+      if (msg.method === "serverRequest/resolved") this.inbound.resolve(msg.params);
       this.emit("notification", msg);
     }
   }
@@ -200,6 +254,13 @@ export class AppServerBridge extends EventEmitter {
     );
   }
 
+  sendNotification(method, params) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("app-server websocket not connected");
+    }
+    this.ws.send(JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) }));
+  }
+
   sendError(id, code, message) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return;
@@ -214,99 +275,61 @@ export class AppServerBridge extends EventEmitter {
   }
 
   handleServerRequest(msg) {
-    const id = msg.id;
-    const method = String(msg.method || "");
-    try {
-      if (method === "item/commandExecution/requestApproval") {
-        this.sendResponse(id, { decision: "acceptForSession" });
-        return;
-      }
-      if (method === "item/fileChange/requestApproval") {
-        this.sendResponse(id, { decision: "acceptForSession" });
-        return;
-      }
-      if (method === "item/permissions/requestApproval") {
-        this.sendResponse(id, {
-          permissions: {
-            fileSystem: {},
-            network: { enabled: true }
-          },
-          scope: "session"
-        });
-        return;
-      }
-      if (method === "item/tool/requestUserInput") {
-        this.sendError(id, -32001, "tool user input is not supported by this bridge");
-        return;
-      }
-      if (method === "item/tool/call") {
-        this.sendError(id, -32001, "dynamic tool call is not supported by this bridge");
-        return;
-      }
-      this.sendError(id, -32601, `method not handled by bridge: ${method}`);
-    } catch (error) {
-      this.sendError(id, -32000, error?.message || String(error));
-    }
+    this.inbound.handle(msg, this.ws, this.connectionGeneration);
   }
 
-  request(method, params) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error("app-server websocket not connected"));
-    }
-    const requestTimeoutMs = Math.max(1_000, Number(this.config.codexAppServerRequestTimeoutMs) || 20_000);
-    const id = this.nextId++;
-    const payload = { jsonrpc: "2.0", id, method, params };
-    this.ws.send(JSON.stringify(payload));
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`app-server request timeout: ${method}`));
-      }, requestTimeoutMs);
-      this.pending.set(id, {
-        resolve: (result) => {
-          clearTimeout(timer);
-          resolve(result);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          reject(err);
-        }
-      });
-    });
+  request(method, params, options) {
+    return requestAppServer(this, method, params, options);
   }
 
-  async ensureThread(session) {
+  async ensureThread(session, options = buildAppServerThreadOptions(session)) {
+    const resumeSessionId = session.resumeSessionId;
     await this.ensureReady();
-    if (session.resumeSessionId) {
+    if (resumeSessionId) {
       await this.request("thread/resume", {
-        threadId: session.resumeSessionId,
-        cwd: session.cwd,
-        model: session.model || null,
-        reasoningEffort: session.reasoningEffort || null
+        threadId: resumeSessionId,
+        ...options
       });
-      return session.resumeSessionId;
+      return resumeSessionId;
     }
     const result = await this.request("thread/start", {
-      cwd: session.cwd,
-      model: session.model || null,
-      reasoningEffort: session.reasoningEffort || null,
-      experimentalRawEvents: true,
-      persistExtendedHistory: true
+      ...options,
+      ...(session.projectId ? { projectId: session.projectId } : {}),
+      experimentalRawEvents: true
     });
     const threadId = String(result?.thread?.id || "").trim();
     if (!threadId) {
       throw new Error("app-server thread/start did not return thread id");
     }
     session.resumeSessionId = threadId;
+    if (["user_provided", "custom_name"].includes(session.titleSource) && String(session.name || "").trim()) {
+      await this.request("thread/name/set", { threadId, name: session.name });
+    }
     return threadId;
   }
 
-  async startTurn(session, text) {
-    const threadId = await this.ensureThread(session);
+  async startTurn(session, text, images = []) {
+    const input = normalizeRunnerInput(text, images);
+    const threadOptions = buildAppServerThreadOptions(session);
+    const turnOptions = buildAppServerTurnOptions(session);
+    const threadId = await this.ensureThread(session, threadOptions);
     return this.request("turn/start", {
       threadId,
-      input: [{ type: "text", text: String(text || ""), text_elements: [] }]
+      ...turnOptions,
+      input: [
+        ...(input.text ? [{ type: "text", text: input.text, text_elements: [] }] : []),
+        ...input.images.map((image) => ({ type: "localImage", path: image.path }))
+      ]
     });
+  }
+
+  async interruptTurn(session, turnId) {
+    const threadId = String(session?.resumeSessionId || "").trim();
+    const targetTurnId = String(turnId || "").trim();
+    if (!threadId || !targetTurnId) {
+      throw new Error("app-server interrupt requires thread and turn ids");
+    }
+    return this.request("turn/interrupt", { threadId, turnId: targetTurnId });
   }
 
   async shutdown() {

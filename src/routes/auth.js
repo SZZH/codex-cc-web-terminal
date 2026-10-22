@@ -14,7 +14,8 @@ export async function handleAuthRoute(ctx, runtime) {
     runtime.attachAuthSessionCookie(ctx, session);
     runtime.json(ctx, 200, {
       authenticated: true,
-      expiresAt: session.expiresAt
+      expiresAt: session.expiresAt,
+      capabilities: { initialHistory: 1 }
     });
     return true;
   }
@@ -41,7 +42,7 @@ export async function handleAuthRoute(ctx, runtime) {
       runtime.json(
         ctx,
         200,
-        { ok: true, expiresAt: authSession.expiresAt },
+        { ok: true, expiresAt: authSession.expiresAt, capabilities: { initialHistory: 1 } },
         {
           "Set-Cookie": runtime.serializeCookie(runtime.config.authSessionCookieName, authSession.id, {
             maxAge: Math.floor(runtime.config.authSessionTtlMs / 1000),

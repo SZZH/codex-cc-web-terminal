@@ -8,8 +8,9 @@ import { EventEmitter } from "node:events";
 import { WebSocket } from "ws";
 
 import { createKoaApp } from "../src/koa-app.js";
-import { installWebSocketServer } from "../src/routes/ws.js";
+import { installWebSocketServer, sendCodexEvent } from "../src/routes/ws.js";
 import { SessionManager } from "../src/sessionManager.js";
+import { applyConversationDeltaPayload } from "../web/src/lib/conversation-timeline.js";
 import { createBaseConfig, createTempDir, login, waitForCondition } from "./helpers/backendTestUtils.js";
 
 function connectWebSocket(url, options = {}) {
@@ -103,6 +104,20 @@ function writeJsonl(filePath, records) {
   );
 }
 
+test("Codex websocket disconnects a slow client before its send queue grows beyond the limit", () => {
+  const sent = [];
+  const socket = { readyState: 1, bufferedAmount: 1024 * 1024 - 4,
+    send: (payload) => sent.push(payload), terminate() { this.readyState = 3; } };
+  assert.equal(sendCodexEvent(socket, { type: "item.delta", text: "hello" }), false);
+  assert.equal(socket.readyState, 3);
+  assert.deepEqual(sent, []);
+
+  socket.readyState = 1;
+  socket.bufferedAmount = 0;
+  assert.equal(sendCodexEvent(socket, { type: "sync.required" }), true);
+  assert.equal(JSON.parse(sent[0]).type, "sync.required");
+});
+
 test("websocket rejects unauthenticated clients", async (t) => {
   const rootDir = createTempDir();
   const config = createBaseConfig(rootDir);
@@ -144,7 +159,7 @@ test("websocket rejects unauthenticated clients", async (t) => {
 test("websocket accepts authenticated clients and forwards input events", async (t) => {
   const rootDir = createTempDir();
   const config = createBaseConfig(rootDir);
-  const recorded = { inputs: [], resizes: [], attached: [] };
+  const recorded = { inputs: [], resizes: [], attached: [], interrupts: [] };
   const sessionManager = {
     attachClient(sessionId, ws) {
       recorded.attached.push(sessionId);
@@ -155,8 +170,11 @@ test("websocket accepts authenticated clients and forwards input events", async 
     get(id) {
       return id === "session-1" ? { id } : null;
     },
-    write(id, data) {
-      recorded.inputs.push({ id, data });
+    write(id, data, options) {
+      recorded.inputs.push({ id, data, ...(options ? { options } : {}) });
+    },
+    interrupt(id) {
+      recorded.interrupts.push(id);
     },
     resize(id, cols, rows) {
       recorded.resizes.push({ id, cols, rows });
@@ -205,6 +223,15 @@ test("websocket accepts authenticated clients and forwards input events", async 
   await waitForCondition(() => recorded.inputs.length === 1 && recorded.resizes.length === 1, { timeoutMs: 400 });
   assert.deepEqual(recorded.inputs, [{ id: "session-1", data: "hello" }]);
   assert.deepEqual(recorded.resizes, [{ id: "session-1", cols: 120, rows: 40 }]);
+
+  const imageId = "08f4102a-d041-4bc1-bffd-542d6281009a";
+  ws.send(JSON.stringify({ type: "input", data: "    first()\n\n    second()\n", attachments: [{ id: imageId }] }));
+  ws.send(JSON.stringify({ type: "interrupt" }));
+  await waitForCondition(() => recorded.inputs.length === 2 && recorded.interrupts.length === 1, { timeoutMs: 400 });
+  assert.deepEqual(recorded.inputs[1], {
+    id: "session-1", data: "    first()\n\n    second()\n", options: { attachments: [{ id: imageId }] }
+  });
+  assert.deepEqual(recorded.interrupts, ["session-1"]);
 });
 
 test("websocket rejects authenticated clients with untrusted origin", async (t) => {
@@ -427,11 +454,10 @@ test("websocket emits conversation snapshot on connect and conversation delta af
   assert.ok(deltaPayload.toVersion >= deltaPayload.fromVersion);
   assert.ok(Array.isArray(deltaPayload.deltas));
   assert.ok(deltaPayload.deltas.length > 0);
-  assert.equal(deltaPayload.threadSnapshot.threadId, "thread-h1");
-  assert.ok(deltaPayload.threadSnapshot.turns.length >= 2);
-  assert.ok(
-    deltaPayload.threadSnapshot.turns.some((turn) =>
-      Array.isArray(turn?.items) && turn.items.some((item) => item?.kind === "UserMessage" && item?.text === "follow up")
-    )
-  );
+  assert.equal(deltaPayload.threadId, "thread-h1");
+  assert.equal(Object.hasOwn(deltaPayload, "threadSnapshot"), false);
+  const { conversation } = applyConversationDeltaPayload(convSnapshot.conversation, deltaPayload);
+  assert.equal(conversation.turns.length, 2);
+  assert.equal(conversation.turns[0].assistant.body[0].text, "历史回答");
+  assert.equal(conversation.turns[1].user.text, "follow up");
 });

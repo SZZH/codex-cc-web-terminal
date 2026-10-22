@@ -257,6 +257,72 @@ test("auth/restart contract: when a stale auth cookie survives a server restart,
   assert.equal(autoLoginTriggered, false);
 });
 
+test("authenticated bootstrap resolves without loading model config and preserves an explicit recovered login", async () => {
+  const authenticated = await resolveInitialAuthBootstrap({
+    savedToken: "saved",
+    requestAuthSession: async () => ({ authenticated: true }),
+    bootstrapWorkspace: () => assert.fail("config must not hold authenticated rendering")
+  });
+  assert.equal(authenticated.isAuthenticated, true);
+  assert.equal(authenticated.accessToken, "");
+  const recovered = await resolveInitialAuthBootstrap({
+    savedToken: "saved",
+    requestAuthSession: async () => { throw new Error("transient auth failure"); },
+    handleAutoLogin: async () => ({ isAuthenticated: true, accessToken: "", rememberToken: true })
+  });
+  assert.equal(recovered.isAuthenticated, true);
+  assert.equal(recovered.accessToken, "");
+  assert.equal(recovered.rememberToken, true);
+});
+
+test("failed auto login never restores its rejected token or treats a swallowed error as success", async () => {
+  for (const returned of [undefined, { isAuthenticated: false, accessToken: "", rememberToken: false }]) {
+    const result = await resolveInitialAuthBootstrap({
+      savedToken: "invalid",
+      requestAuthSession: async () => { throw new Error("unauthorized"); },
+      handleAutoLogin: async () => returned
+    });
+    assert.equal(result.isAuthenticated, false);
+    assert.equal(result.accessToken, "");
+    assert.equal(result.rememberToken, false);
+  }
+});
+
+test("auth read timeout opens login with the saved token and a retry message without automatic login", async () => {
+  for (const autoLoginTried of [false, true]) {
+    const result = await resolveInitialAuthBootstrap({
+      savedToken: " saved-token ",
+      autoLoginTried,
+      requestAuthSession: async () => {
+        throw Object.assign(new Error("读取超时，请重试。"), { code: "READ_TIMEOUT" });
+      },
+      handleAutoLogin: () => assert.fail("a timed out read must not start another unbounded login")
+    });
+    assert.deepEqual(result, {
+      accessToken: "saved-token", rememberToken: true, isAuthenticated: false, ready: true,
+      autoLoginTried, statusText: "读取超时，请重试。"
+    });
+  }
+});
+
+test("invalidated auth checks and auto login continuations cannot revive the old login", async () => {
+  for (const phase of ["auth", "auto-login"]) {
+    let resolve, current = true, autoCalls = 0;
+    const pending = new Promise((yes) => { resolve = yes; });
+    const boot = resolveInitialAuthBootstrap({
+      savedToken: "old",
+      isCurrent: () => current,
+      requestAuthSession: () => phase === "auth" ? pending : Promise.reject(new Error("transient")),
+      handleAutoLogin: async () => { autoCalls += 1; return pending; }
+    });
+    await Promise.resolve();
+    current = false;
+    resolve(phase === "auth" ? { authenticated: true } : { isAuthenticated: true });
+    assert.equal(await boot, null);
+    assert.equal(autoCalls, phase === "auth" ? 0 : 1);
+  }
+});
+
 test("legacy compatibility contract: persisted legacy thread remains the historical base while continuation runtime appends only the new turn", () => {
   const persisted = {
     threadId: "thread-legacy",

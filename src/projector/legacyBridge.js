@@ -62,7 +62,7 @@ function mapItem(item) {
       source: null,
       summary: item.text ?? "",
       text: item.text ?? "",
-      payload: {},
+      payload: clone(item.payload || {}),
       meta: {}
     };
   }
@@ -206,12 +206,18 @@ function overlayItems(turn, overlay) {
 
 export function projectorSnapshotToLegacyThread(snapshot, overlay = null, previous = null) {
   const legacyTurns = (snapshot?.turns || []).map((turn) => {
-    const turnItems = [...(turn.items || []), ...overlayItems(turn, overlay)].map(mapItem);
+    const items = [...(turn.items || [])];
+    for (const item of overlayItems(turn, overlay)) {
+      const index = items.findIndex((existing) => existing.id && existing.id === item.id);
+      if (index >= 0) items[index] = { ...items[index], ...item };
+      else items.push(item);
+    }
+    const turnItems = items.map(mapItem);
     return {
       id: turn.id,
       items: turnItems,
       status: mapTurnStatus(turn.status),
-      error: null,
+      error: clone(turn.error || null),
       startedAt: turn.startedAt ?? null,
       completedAt: turn.completedAt ?? null,
       durationMs: null,
@@ -251,6 +257,7 @@ function legacyTurnToProjectorItems(turn) {
         kind: "UserMessage",
         id: item.id,
         text: item.text ?? item.summary ?? "",
+        payload: clone(item.payload || {}),
         createdAt: item.createdAt ?? null,
         completedAt: item.updatedAt ?? item.createdAt ?? null
       });
@@ -332,6 +339,7 @@ export function legacyThreadToProjectorSnapshot(snapshot) {
               : TURN_STATUSES.RUNNING,
       startedAt: turn.startedAt ?? null,
       completedAt: turn.completedAt ?? null,
+      error: clone(turn.error || turn.assistant?.error || null),
       items: legacyTurnToProjectorItems(turn)
     })),
     backgroundAgents: clone(snapshot?.backgroundAgents || [])

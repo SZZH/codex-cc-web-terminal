@@ -68,6 +68,7 @@ const DISPLAY_LABELS = {
   mcptoolcall: "MCP 工具",
   dynamictoolcall: "动态工具",
   collabagenttoolcall: "子代理协作",
+  subagentactivity: "子智能体",
   websearch: "网页搜索",
   imageview: "图像查看",
   imagegeneration: "图像生成",
@@ -115,6 +116,7 @@ const EMPTY_COMMAND_OUTPUT_PATTERNS = [
 ];
 
 export function inferThreadItemKind(item = {}) {
+  if (item.type === "subAgentActivity") return "subagentactivity";
   const directKind = normalizeKind(firstDefined(item.kind, item.itemKind, item.item_type, item.type));
   if (directKind) {
     return directKind;
@@ -417,6 +419,7 @@ function detectNoisyProcessItem(kind, status, body = "", payload = {}) {
 
 export function getThreadItemCategory(item = {}) {
   const kind = inferThreadItemKind(item);
+  if (kind === "subagentactivity" || kind === "collabagenttoolcall" && (item.activity || item.payload?.activity)) return "activity";
   if (USER_KINDS.has(kind)) {
     return "user";
   }
@@ -441,6 +444,9 @@ export function normalizeThreadItem(item = {}, options = {}) {
   const imageItems = extractImageItems(item, payload);
   const imageUrl = imageItems[0]?.url || "";
   const imageAlt = imageItems[0]?.alt || extractImageAlt(item, payload);
+  const questionSource = item.question || payload.question;
+  const question = kind === "agentmessage" && questionSource?.source === "desktop" &&
+    Array.isArray(questionSource.questions) && questionSource.questions.length ? questionSource : null;
 
   return {
     id: String(firstDefined(item.id, payload?.id, `${kind}-${Math.random().toString(36).slice(2, 10)}`)),
@@ -456,10 +462,13 @@ export function normalizeThreadItem(item = {}, options = {}) {
       : compactText(summary) === compactText(body)
         ? ""
         : summary,
-    body,
+    body: question ? "" : body,
     imageUrl,
     imageAlt,
     imageItems,
+    activity: item.activity || payload.activity || item.presentation?.activity || null,
+    question,
+    questionReplies: category === "user" && Array.isArray(item.questionReplies) ? item.questionReplies : null,
     details: [],
     timestamp: firstDefined(item.timestamp, item.ts, payload?.timestamp, payload?.ts, ""),
     isUnknown: kind === "unknown",
@@ -518,8 +527,31 @@ export function summarizeProcessItems(items = []) {
   if (counts.noisyCommand) parts.push(`已略过空命令 ${counts.noisyCommand}`);
   if (counts.other) parts.push(`其他 ${counts.other}`);
 
+  const reads = new Set();
+  const changedFiles = new Set();
+  let commands = 0;
+  for (const item of items) {
+    if (inferThreadItemKind(item) === "filechange") {
+      const changes = item.raw?.payload?.changes || item.raw?.changes || {};
+      for (const name of Array.isArray(changes) ? changes.map((change) => change.path).filter(Boolean) : Object.keys(changes)) changedFiles.add(name);
+    }
+    if (inferThreadItemKind(item) !== "commandexecution") continue;
+    const actions = asArray(item.raw?.payload?.commandActions || item.raw?.commandActions);
+    const readActions = actions.filter((action) => action.type === "read");
+    for (const action of readActions) reads.add(action.path || action.filename || action.command || item.id);
+    if (!actions.length || actions.some((action) => action.type !== "read")) commands += 1;
+  }
+  const compact = [];
+  if (reads.size) compact.push(`读取了 ${reads.size} 个文件`);
+  if (commands) compact.push(`运行了 ${commands} 条命令`);
+  if (counts.tool) compact.push(`调用了 ${counts.tool} 个工具`);
+  if (counts.fileChange) compact.push(changedFiles.size ? `修改了 ${changedFiles.size} 个文件` : "更新了文件");
+  if (counts.collab) compact.push(`协作了 ${counts.collab} 次`);
+  if (!compact.length) compact.push(counts.reasoning ? "思考过程" : "执行记录");
   return {
     ...counts,
+    compactLabel: compact.join(" · "),
+    running: items.some((item) => ["inprogress", "running", "pending"].includes(item.status)),
     label: parts.length ? `执行过程 ${counts.total} 项 · ${parts.join(" · ")}` : `执行过程 ${counts.total} 项`
   };
 }

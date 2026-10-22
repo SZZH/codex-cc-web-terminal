@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { parse as parseDotEnv } from "dotenv";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,11 +21,24 @@ function fail(message) {
   throw new Error(message);
 }
 
-function parseArgs(argv) {
+function localEnvPort() {
+  try { return parseDotEnv(fs.readFileSync(path.join(root, ".env"))).PORT; }
+  catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+}
+
+export function resolveHealthPort({ cliPort, envPort, filePort } = {}) {
+  const configured = [cliPort, envPort, filePort].find((value) => value !== undefined && String(value).trim() !== "");
+  if (configured === undefined) return 3210;
+  const port = Number(configured);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) fail(`Invalid health port: ${configured}`);
+  return port;
+}
+
+export function parseArgs(argv, { envPort = process.env.PORT, filePort } = {}) {
   const options = {
     action: "status",
     mode: "prod",
-    healthPort: 3210,
+    healthPort: undefined,
     healthTimeoutSeconds: 30,
     logLines: 120,
     forceStart: false,
@@ -44,7 +58,8 @@ function parseArgs(argv) {
       continue;
     }
     if (arg === "--health-port") {
-      options.healthPort = Number.parseInt(args[index + 1] || "", 10) || options.healthPort;
+      if (!args[index + 1]) fail("Missing value for --health-port");
+      options.healthPort = args[index + 1];
       index += 1;
       continue;
     }
@@ -78,6 +93,10 @@ function parseArgs(argv) {
     fail(`Unsupported mode: ${options.mode}`);
   }
 
+  if (["start", "restart", "status"].includes(options.action)) {
+    options.healthPort = resolveHealthPort({ cliPort: options.healthPort, envPort,
+      filePort: filePort === undefined ? localEnvPort() : filePort });
+  }
   return options;
 }
 
@@ -148,7 +167,13 @@ function buildFrontend() {
   }
 }
 
-async function waitForHealth(port, timeoutSeconds) {
+export function matchesManagedHealth(payload, app) {
+  return payload?.ok === true && payload.service === "codex-cc-web-terminal" &&
+    payload.shuttingDown === false && Number.isInteger(app?.pid) && app.pid > 0 &&
+    app.pm2_env?.status === "online" && payload.pid === app.pid;
+}
+
+export async function waitForHealth(port, timeoutSeconds, getManagedApp) {
   const url = `http://127.0.0.1:${port}/api/health`;
   const deadline = Date.now() + timeoutSeconds * 1000;
 
@@ -156,7 +181,8 @@ async function waitForHealth(port, timeoutSeconds) {
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(3000) });
       if (response.ok) {
-        return await response.text();
+        const body = await response.text();
+        if (matchesManagedHealth(JSON.parse(body), getManagedApp())) return body;
       }
     } catch {
       // Keep polling until timeout.
@@ -202,7 +228,8 @@ async function handleStartLike(action, options) {
   buildFrontend();
   const appName = getAppName(options.mode);
   runPm2(["startOrReload", ecosystemFile, "--only", appName, "--update-env"]);
-  const health = await waitForHealth(options.healthPort, options.healthTimeoutSeconds);
+  const health = await waitForHealth(options.healthPort, options.healthTimeoutSeconds,
+    () => readPm2Apps().find((app) => app?.name === appName));
   console.log(`Service ${action === "restart" ? "restarted" : "started"} successfully.`);
   process.stdout.write(health.endsWith("\n") ? health : `${health}\n`);
   runPm2(["status"]);
@@ -211,10 +238,12 @@ async function handleStartLike(action, options) {
 async function handleStatus(options) {
   runPm2(["status"]);
   try {
-    const health = await waitForHealth(options.healthPort, 3);
+    const appName = getAppName(options.mode);
+    const health = await waitForHealth(options.healthPort, 3,
+      () => readPm2Apps().find((app) => app?.name === appName));
     process.stdout.write(health.endsWith("\n") ? health : `${health}\n`);
   } catch {
-    console.log(`Health endpoint is not reachable on port ${options.healthPort}.`);
+    console.log(`Managed service health was not verified on port ${options.healthPort}.`);
   }
 }
 
@@ -296,4 +325,4 @@ async function main() {
   }
 }
 
-await main();
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) await main();

@@ -145,6 +145,7 @@ export function deriveConversationStateFromThreadSnapshot(snapshot, { sessionId 
         body,
         process,
         status: mapTurnStatus(turn?.status),
+        error: clone(turn?.error || null),
         startedAt: toIso(turn?.startedAt),
         finishedAt: toIso(turn?.completedAt)
       }
@@ -250,6 +251,7 @@ export function deriveThreadSnapshotFromConversationState(conversationState, { t
             : turn?.assistant?.status === "completed"
               ? TURN_STATUS.COMPLETED
               : TURN_STATUS.IN_PROGRESS,
+      error: clone(turn?.assistant?.error || null),
       startedAt: createdAt || null,
       completedAt: updatedAt || null
     });

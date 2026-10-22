@@ -2,9 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import http from "node:http";
+import { PassThrough } from "node:stream";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
 
 import { HistoricalSessionService } from "../src/sessions/history/HistoricalSessionService.js";
+import { installRequestBodyRuntime } from "../src/runtime/http/body.js";
 import { buildProviders } from "../src/sessions/providers/buildProviders.js";
 import { createBaseConfig, createTempDir, login, parseCookieValue, startTestServer } from "./helpers/backendTestUtils.js";
 
@@ -265,6 +269,123 @@ test("authorized requests extend auth-session expiration", async (t) => {
   assert.ok(refreshedExpiry > initialExpiry);
 });
 
+test("auth sessions repair legacy file permissions and persist new sessions privately", async (t) => {
+  const dataDir = path.join(createTempDir(), "data");
+  fs.mkdirSync(dataDir);
+  const sessionsPath = path.join(dataDir, "auth-sessions.json");
+  fs.writeFileSync(sessionsPath, JSON.stringify({ legacy: {
+    id: "legacy", createdAt: Date.now(), expiresAt: Date.now() + 60_000, ip: "", userAgent: ""
+  } }), { mode: 0o644 });
+  fs.chmodSync(sessionsPath, 0o644);
+
+  const server = await startTestServer({ sessionManager: createSessionManagerStub(), configOverrides: { dataDir } });
+  t.after(() => server.close());
+  assert.equal(server.runtime.authSessions.has("legacy"), true);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(sessionsPath).mode & 0o777, 0o600);
+  }
+
+  const auth = await login(server.baseUrl, server.config.accessToken);
+  assert.equal(auth.response.status, 200);
+  assert.equal(Object.keys(JSON.parse(fs.readFileSync(sessionsPath, "utf8"))).length, 2);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(sessionsPath).mode & 0o777, 0o600);
+  }
+
+  const freshServer = await startTestServer({ sessionManager: createSessionManagerStub() });
+  t.after(() => freshServer.close());
+  const freshSessionsPath = path.join(freshServer.config.dataDir, "auth-sessions.json");
+  assert.equal(fs.existsSync(freshSessionsPath), false);
+  assert.equal((await login(freshServer.baseUrl, freshServer.config.accessToken)).response.status, 200);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(freshSessionsPath).mode & 0o777, 0o600);
+  }
+});
+
+test("failed auth-session write preserves the last complete file for reload", async (t) => {
+  const server = await startTestServer({ sessionManager: createSessionManagerStub() });
+  t.after(() => server.close());
+  const auth = await login(server.baseUrl, server.config.accessToken);
+  const persistedId = parseCookieValue(auth.cookies, server.config.authSessionCookieName);
+  const sessionsPath = path.join(server.config.dataDir, "auth-sessions.json");
+  const savedPayload = fs.readFileSync(sessionsPath, "utf8");
+  server.runtime.authSessions.set("pending", {
+    id: "pending", createdAt: Date.now(), expiresAt: Date.now() + 60_000, ip: "", userAgent: ""
+  });
+
+  const writeFileSync = fs.writeFileSync;
+  fs.writeFileSync = (target, ...args) => {
+    if (typeof target === "number") {
+      writeFileSync(target, '{"partial":', "utf8");
+      throw new Error("injected auth-session write failure");
+    }
+    return writeFileSync(target, ...args);
+  };
+  try {
+    assert.throws(() => server.runtime.saveAuthSessions(), /injected auth-session write failure/);
+  } finally {
+    fs.writeFileSync = writeFileSync;
+  }
+
+  assert.equal(fs.readFileSync(sessionsPath, "utf8"), savedPayload);
+  assert.equal(fs.readdirSync(server.config.dataDir).some((name) => name.endsWith(".tmp")), false);
+  server.runtime.authSessions.clear();
+  server.runtime.loadAuthSessions();
+  assert.equal(server.runtime.authSessions.has(persistedId), true);
+  assert.equal(server.runtime.authSessions.has("pending"), false);
+});
+
+test("request body readers stop retaining data after exceeding byte limits", async () => {
+  const runtime = {};
+  installRequestBodyRuntime(runtime);
+  const textStream = new PassThrough();
+  const textBody = runtime.readBody(textStream);
+  textStream.write(Buffer.from("é".repeat(1_000_001)));
+  await assert.rejects(textBody, /Request body too large/);
+  assert.equal(textStream.listenerCount("data"), 0);
+  assert.equal(textStream.listenerCount("end"), 0);
+  assert.equal(textStream.listenerCount("error"), 1);
+  assert.doesNotThrow(() => textStream.emit("error", new Error("late stream error")));
+  const textClosed = new Promise((resolve) => textStream.once("close", resolve));
+  textStream.end();
+  await textClosed;
+  assert.equal(textStream.listenerCount("error"), 0);
+
+  const bufferStream = new PassThrough();
+  const bufferBody = runtime.readBodyBuffer(bufferStream, 3);
+  bufferStream.write(Buffer.from("éé"));
+  await assert.rejects(bufferBody, /Request body too large/);
+  assert.equal(bufferStream.listenerCount("data"), 0);
+  bufferStream.end();
+
+  const validStream = new PassThrough();
+  const validBody = runtime.readBody(validStream);
+  validStream.end("正常内容");
+  assert.equal(await validBody, "正常内容");
+});
+
+test("config rejects the example access token while keeping a random default", () => {
+  const configUrl = new URL("../src/config.js", import.meta.url).href;
+  const script = `import { config } from ${JSON.stringify(configUrl)}; process.stdout.write(config.accessToken);`;
+  const cwd = createTempDir();
+  const environment = { ...process.env };
+  delete environment.ACCESS_TOKEN;
+  const run = (env) => spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd, env, encoding: "utf8"
+  });
+
+  const placeholder = run({ ...environment, ACCESS_TOKEN: "change-me" });
+  assert.notEqual(placeholder.status, 0);
+  assert.match(placeholder.stderr, /ACCESS_TOKEN must not be the example value change-me/);
+
+  const first = run(environment);
+  const second = run(environment);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(first.stdout, /^[A-Za-z0-9_-]{24}$/);
+  assert.notEqual(first.stdout, second.stdout);
+});
+
 test("config route exposes codex desktop defaults from local config files", async (t) => {
   const sessionManager = createSessionManagerStub();
   const rootDir = createTempDir();
@@ -278,7 +399,7 @@ test("config route exposes codex desktop defaults from local config files", asyn
   );
   fs.writeFileSync(
     codexGlobalStatePath,
-    JSON.stringify({ "agent-mode": "full-access" }),
+    JSON.stringify({ "electron-persisted-atom-state": { "agent-mode": "full-access" } }),
     "utf8"
   );
   const server = await startTestServer({
@@ -380,6 +501,23 @@ test("authorized local image proxy serves image files for history previews", asy
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "image/png");
   assert.ok((await response.arrayBuffer()).byteLength > 0);
+
+  const gifPath = path.join(server.rootDir, "history-preview.gif");
+  fs.writeFileSync(gifPath, Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64"));
+  const gifUrl = `${server.baseUrl}/api/local-file-image?path=${encodeURIComponent(gifPath)}`;
+  const gifResponse = await fetch(gifUrl, { headers: { cookie: auth.cookies } });
+  assert.equal(gifResponse.status, 200);
+  assert.equal(gifResponse.headers.get("content-type"), "image/gif");
+  assert.deepEqual(Buffer.from(await gifResponse.arrayBuffer()), fs.readFileSync(gifPath));
+  assert.equal((await fetch(gifUrl)).status, 401);
+
+  const svgPath = path.join(server.rootDir, "history-preview.svg");
+  fs.writeFileSync(svgPath, '<svg xmlns="http://www.w3.org/2000/svg"><script>throw new Error("unsafe")</script></svg>');
+  const svgResponse = await fetch(`${server.baseUrl}/api/local-file-image?path=${encodeURIComponent(svgPath)}`,
+    { headers: { cookie: auth.cookies } });
+  assert.equal(svgResponse.status, 200);
+  assert.equal(svgResponse.headers.get("content-security-policy"), "sandbox; default-src 'none'; style-src 'unsafe-inline'");
+  assert.equal(svgResponse.headers.get("x-content-type-options"), "nosniff");
 });
 
 test("login rate limit blocks after max failures and resets after block window", async (t) => {
@@ -630,7 +768,7 @@ test("session input-stream route returns typed sse events and applies input to t
   sessionManager.write = (id, data) => {
     writes.push({ id, data });
     for (const client of liveSession.clients) {
-      client.send(JSON.stringify({ type: "message_part", part: { type: "text", text: "流式回复" }, phase: "streaming" }));
+      client.send(JSON.stringify({ type: "message_part", turnId: "turn-1", part: { type: "text", text: "流式回复" }, phase: "streaming" }));
       client.send(
         JSON.stringify({
           type: "conversation.snapshot",
@@ -662,7 +800,9 @@ test("session input-stream route returns typed sse events and applies input to t
           liveOverlay: null
         })
       );
+      client.send(JSON.stringify({ type: "turn.completed", turnId: "turn-1", status: "completed" }));
     }
+    return "turn-1";
   };
 
   const server = await startTestServer({ sessionManager });
@@ -697,16 +837,7 @@ test("session input-stream route returns typed sse events and applies input to t
   let buffer = "";
   const events = [];
 
-  while (
-    events.length < 6 &&
-    !events.some((event) =>
-      event.event === "thread.snapshot" &&
-      event.payload?.conversation?.turns?.some((turn) =>
-        turn?.user?.text === "你好" &&
-        turn?.assistant?.body?.some((block) => block?.text === "流式回复")
-      )
-    )
-  ) {
+  while (!events.some((event) => event.event === "turn.completed")) {
     const { value, done } = await reader.read();
     if (done) {
       break;
@@ -725,16 +856,7 @@ test("session input-stream route returns typed sse events and applies input to t
         event: eventLine ? eventLine.slice(6).trim() : "",
         payload: JSON.parse(dataLine)
       });
-      if (
-        events.length >= 6 ||
-        events.some((event) =>
-          event.event === "thread.snapshot" &&
-          event.payload?.conversation?.turns?.some((turn) =>
-            turn?.user?.text === "你好" &&
-            turn?.assistant?.body?.some((block) => block?.text === "流式回复")
-          )
-        )
-      ) {
+      if (events.some((event) => event.event === "turn.completed")) {
         break;
       }
     }
@@ -750,21 +872,9 @@ test("session input-stream route returns typed sse events and applies input to t
       permissionMode: "full-access"
     }
   ]);
-  assert.ok(events.some((event) => event.event === "thread.snapshot"));
-  assert.ok(
-    events.some((event) => event.event === "thread.overlay") ||
-    events.some((event) => event.event === "message.delta") ||
-    events.some((event) => event.event === "message.completed")
-  );
-  const completedSnapshot = events.find(
-    (event) =>
-      event.event === "thread.snapshot" &&
-      event.payload?.conversation?.turns?.some((turn) =>
-        turn?.user?.text === "你好" &&
-        turn?.assistant?.body?.some((block) => block?.text === "流式回复")
-      )
-  );
-  assert.ok(completedSnapshot, "input-stream should surface submitted user text and assistant reply");
+  assert.equal(events.some((event) => event.event === "thread.snapshot"), false);
+  assert.equal(events.find((event) => event.event === "message.delta")?.payload.text, "流式回复");
+  assert.equal(events.find((event) => event.event === "turn.completed")?.payload.turnId, "turn-1");
 });
 
 test("thread input-stream route can resume or create a live session from thread id", async (t) => {
@@ -837,7 +947,7 @@ test("thread input-stream route can resume or create a live session from thread 
   sessionManager.write = (id, data) => {
     writes.push({ id, data });
     for (const client of liveSession.clients) {
-      client.send(JSON.stringify({ type: "message_part", part: { type: "text", text: "线程流式回复" }, phase: "streaming" }));
+      client.send(JSON.stringify({ type: "message_part", turnId: "turn-1", part: { type: "text", text: "线程流式回复" }, phase: "streaming" }));
       client.send(
         JSON.stringify({
           type: "conversation.snapshot",
@@ -869,7 +979,9 @@ test("thread input-stream route can resume or create a live session from thread 
           liveOverlay: null
         })
       );
+      client.send(JSON.stringify({ type: "turn.completed", turnId: "turn-1", status: "completed" }));
     }
+    return "turn-1";
   };
 
   const server = await startTestServer({ sessionManager });
@@ -940,12 +1052,9 @@ test("thread input-stream route can resume or create a live session from thread 
       permissionMode: "auto-review"
     }
   ]);
-  assert.ok(events.some((event) => event.event === "thread.snapshot"));
-  assert.ok(
-    events.some((event) => event.event === "thread.overlay") ||
-    events.some((event) => event.event === "message.delta") ||
-    events.some((event) => event.event === "message.completed")
-  );
+  assert.equal(events.some((event) => event.event === "thread.snapshot"), false);
+  assert.equal(events.find((event) => event.event === "message.delta")?.payload.text, "线程流式回复");
+  assert.equal(events.find((event) => event.event === "turn.completed")?.payload.turnId, "turn-1");
 });
 
 test("fs and history routes return manager-backed payloads", async (t) => {
@@ -1142,6 +1251,96 @@ test("thread composer-state route returns thread-specific composer state and git
   assert.equal(typeof payload.git.isGitRepo, "boolean");
 });
 
+test("CC composer-state and resumed creation use canonical provider defaults, live settings and explicit overrides", async (t) => {
+  const rootDir = createTempDir();
+  const config = createBaseConfig(rootDir, {
+    ccModel: "claude-http-default",
+    ccFullAccess: false,
+    codexConfigPath: path.join(rootDir, "codex-config.toml"),
+    codexGlobalStatePath: path.join(rootDir, "codex-global-state.json")
+  });
+  fs.writeFileSync(config.codexConfigPath, 'model = "gpt-http-only"\nmodel_reasoning_effort = "ultra"\n');
+  fs.writeFileSync(config.codexGlobalStatePath, JSON.stringify({
+    "electron-persisted-atom-state": { "agent-mode-by-host-id": { local: "full-access" } }
+  }));
+  const sessionManager = createSessionManagerStub();
+  const providers = buildProviders(config);
+  const spawnSpecs = [];
+  let liveSession = null;
+  sessionManager.getProvider = (id) => providers.find((provider) => provider.id === id || provider.aliases.includes(id));
+  sessionManager.findLiveSessionByThreadId = (threadId, { providerId }) => (
+    liveSession?.resumeSessionId === threadId && liveSession.provider === providerId ? liveSession : null
+  );
+  sessionManager.create = (body) => {
+    sessionManager.calls.create.push(body);
+    const provider = sessionManager.getProvider(body.provider);
+    spawnSpecs.push(provider.buildSpawnSpec(body));
+    return { ...body, id: `cc-http-${spawnSpecs.length}`, provider: provider.id, status: "running" };
+  };
+  const server = await startTestServer({ sessionManager, configOverrides: config });
+  t.after(async () => {
+    await server.runtime.closeWorkspace();
+    await server.close();
+    fs.rmSync(server.rootDir, { recursive: true, force: true });
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+  let gitReads = 0;
+  server.runtime.workspace.listGitBranches = async () => { gitReads += 1; throw new Error("git=0 must not query Git"); };
+  const { cookies } = await login(server.baseUrl, config.accessToken);
+  const headers = { cookie: cookies, "content-type": "application/json" };
+  for (const provider of ["cc", "claude"]) {
+    const response = await fetch(`${server.baseUrl}/api/threads/${provider}/cc-http-thread/composer-state?git=0`, { headers });
+    assert.equal(response.status, 200);
+    const state = await response.json();
+    assert.deepEqual(state, {
+      provider: "cc", threadId: "cc-http-thread", model: config.ccModel, reasoningEffort: "medium",
+      permissionMode: "default", cwd: config.defaultCwd, source: "defaults"
+    });
+    const resumed = await fetch(`${server.baseUrl}/api/sessions`, {
+      method: "POST", headers, body: JSON.stringify({ provider, resumeSessionId: "cc-http-thread" })
+    });
+    assert.equal(resumed.status, 201);
+    assert.equal((await resumed.json()).session.model, config.ccModel);
+    assert.deepEqual(spawnSpecs.at(-1).args, ["--resume", "cc-http-thread", "--model", config.ccModel]);
+    assert.equal(sessionManager.calls.create.at(-1).permissionMode, "default");
+  }
+
+  liveSession = {
+    provider: "cc", resumeSessionId: "cc-http-live", model: "cc-http-live-model", reasoningEffort: "high",
+    permissionMode: "auto-review", cwd: path.join(rootDir, "live")
+  };
+  const liveResponse = await fetch(`${server.baseUrl}/api/threads/claude/cc-http-live/composer-state?git=0`, { headers });
+  assert.equal(liveResponse.status, 200);
+  const liveState = await liveResponse.json();
+  assert.equal(liveState.source, "live_session");
+  assert.equal(liveState.model, liveSession.model);
+  assert.equal(liveState.reasoningEffort, liveSession.reasoningEffort);
+  assert.equal(liveState.permissionMode, liveSession.permissionMode);
+  assert.equal(liveState.cwd, liveSession.cwd);
+  const liveResume = await fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST", headers, body: JSON.stringify({ provider: "claude", resumeSessionId: "cc-http-live" })
+  });
+  assert.equal(liveResume.status, 201);
+  await liveResume.json();
+  assert.equal(sessionManager.calls.create.at(-1).model, liveSession.model);
+  assert.equal(sessionManager.calls.create.at(-1).permissionMode, liveSession.permissionMode);
+
+  const explicit = {
+    provider: "claude", resumeSessionId: "cc-http-live", model: "cc-http-explicit", reasoningEffort: "low",
+    permissionMode: "default", cwd: path.join(rootDir, "explicit")
+  };
+  const overridden = await fetch(`${server.baseUrl}/api/sessions`, {
+    method: "POST", headers, body: JSON.stringify(explicit)
+  });
+  assert.equal(overridden.status, 201);
+  await overridden.json();
+  for (const key of ["model", "reasoningEffort", "permissionMode", "cwd"]) {
+    assert.equal(sessionManager.calls.create.at(-1)[key], explicit[key]);
+  }
+  assert.deepEqual(spawnSpecs.at(-1).args, ["--resume", "cc-http-live", "--model", explicit.model]);
+  assert.equal(gitReads, 0);
+});
+
 test("thread composer-state patch updates sqlite-backed thread state and live session", async (t) => {
   const rootDir = createTempDir();
   const codexDir = path.join(rootDir, ".codex");
@@ -1293,13 +1492,14 @@ test("thread composer-state patch writes default permission to the Codex thread 
     ],
     { encoding: "utf8" }
   ).trim();
-  assert.equal(row, `{"type":"read-only"}|default`);
+  assert.equal(row, `{"type":"read-only","network_access":true}|never`);
 });
 
-test("thread composer-state patch does not call app-server resume for state sync", async (t) => {
+test("thread composer-state patch does not call app-server resume for state sync", { timeout: 10_000 }, async (t) => {
   const rootDir = createTempDir();
   const codexDir = path.join(rootDir, ".codex");
   const stateDbPath = path.join(codexDir, "state_5.sqlite");
+  const workspaceDir = path.join(rootDir, "workspace");
   const sessionManager = createSessionManagerStub();
   let runtimeSyncCalled = false;
   sessionManager.appServerBridge = {
@@ -1309,6 +1509,7 @@ test("thread composer-state patch does not call app-server resume for state sync
     }
   };
   fs.mkdirSync(codexDir, { recursive: true });
+  fs.mkdirSync(workspaceDir, { recursive: true });
   execFileSync(
     "sqlite3",
     [
@@ -1320,7 +1521,7 @@ test("thread composer-state patch does not call app-server resume for state sync
           sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_branch,
           cli_version, first_user_message, memory_mode, model, reasoning_effort, created_at_ms, updated_at_ms
         ) values (
-          'thread-1', '', 1714200000, 1714200000, 'vscode', 'openai', '${process.cwd()}',
+          'thread-1', '', 1714200000, 1714200000, 'vscode', 'openai', '${workspaceDir}',
           'Thread One', '{"type":"read-only"}', 'default', 0, 0, 0, 'feature/old-branch',
           '', '', 'enabled', 'gpt-5.5', 'high', 1714200000000, 1714200000000
         );`
@@ -1352,8 +1553,7 @@ test("thread composer-state patch does not call app-server resume for state sync
         model: "gpt-5.4",
         reasoningEffort: "low",
         permissionMode: "full-access"
-      }),
-      signal: AbortSignal.timeout(1000)
+      })
     }
   );
   const payload = await response.json();
@@ -2181,6 +2381,8 @@ test("workspace git checkout API rejects dirty workspaces with 409", async (t) =
   assert.equal(response.status, 409);
   assert.deepEqual(payload, {
     error: "Workspace has uncommitted changes",
+    code: "DIRTY_WORKTREE",
+    executionState: "not-applied",
     dirty: true
   });
   assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: rootDir, encoding: "utf8" }).trim(), initialBranch);
@@ -2234,4 +2436,175 @@ test("server returns 503 for non-health APIs while shutting down", async (t) => 
 
   const health = await fetch(`${server.baseUrl}/api/health`);
   assert.equal(health.status, 200);
+});
+
+function rawGet(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { headers, agent: false }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) }));
+      response.on("error", reject);
+    });
+    req.on("error", reject);
+  });
+}
+
+test("sidebar transfer negotiates br and gzip and revalidates current JSON with stable weak ETags", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const expected = { sessions: [{ id: "a", name: "侧栏会话", details: "repeatable payload ".repeat(200), activityState: "unknown", lastActivityAt: null }],
+    projectGroups: [{ id: "project", sessions: [{ id: "a", activityState: "unknown", lastActivityAt: null }] }] };
+  let reads = 0;
+  sessionManager.listSidebarSnapshot = () => { reads += 1; return expected; };
+  const server = await startTestServer({ sessionManager });
+  t.after(() => server.close());
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const endpoint = `${server.baseUrl}/api/sessions`;
+  const first = await rawGet(endpoint, { cookie: cookies, "Accept-Encoding": "gzip" });
+  assert.equal(first.status, 200);
+  assert.equal(first.headers["content-encoding"], "gzip");
+  assert.match(first.headers["content-type"], /^application\/json/);
+  assert.equal(first.headers["cache-control"], "private, no-cache");
+  assert.equal(first.headers.vary, "Accept-Encoding");
+  assert.equal(first.headers["x-content-type-options"], "nosniff");
+  assert.equal(first.headers["x-frame-options"], "DENY");
+  assert.equal(first.headers["referrer-policy"], "same-origin");
+  assert.deepEqual(JSON.parse(gunzipSync(first.body).toString()), expected);
+  assert.ok(first.body.length < JSON.stringify(expected).length);
+  assert.match(first.headers.etag, /^W\/".+"$/);
+
+  const repeated = await rawGet(endpoint, { cookie: cookies, "Accept-Encoding": "gzip" });
+  assert.equal(repeated.headers.etag, first.headers.etag);
+  assert.deepEqual(repeated.body, first.body);
+  const cached = await rawGet(endpoint, { cookie: cookies, "Accept-Encoding": "gzip", "If-None-Match": `"unrelated", ${first.headers.etag.replace(/^W\//, "")}` });
+  assert.equal(cached.status, 304);
+  assert.equal(cached.body.length, 0);
+  assert.equal(cached.headers.etag, first.headers.etag);
+  assert.equal(cached.headers.vary, "Accept-Encoding");
+  assert.equal(cached.headers["content-encoding"], undefined);
+
+  const identity = await rawGet(endpoint, { cookie: cookies, "Accept-Encoding": "identity" });
+  assert.equal(identity.status, 200);
+  assert.equal(identity.headers["content-encoding"], undefined);
+  assert.deepEqual(JSON.parse(identity.body.toString()), expected);
+  assert.equal(identity.headers.etag, first.headers.etag);
+  assert.deepEqual(identity.body, gunzipSync(first.body));
+  const brotli = await rawGet(endpoint, { cookie: cookies, "Accept-Encoding": "br" });
+  assert.equal(brotli.status, 200);
+  assert.equal(brotli.headers["content-encoding"], "br");
+  assert.equal(brotli.headers.etag, first.headers.etag);
+  assert.deepEqual(brotliDecompressSync(brotli.body), identity.body);
+  const crossEncoding = await rawGet(endpoint, { cookie: cookies, "Accept-Encoding": "br", "If-None-Match": first.headers.etag });
+  assert.equal(crossEncoding.status, 304);
+  assert.equal(crossEncoding.body.length, 0);
+  assert.equal(crossEncoding.headers["content-encoding"], undefined);
+  assert.equal(crossEncoding.headers.etag, first.headers.etag);
+  expected.sessions[0].name = "桌面已修改标题";
+  const changed = await rawGet(endpoint, { cookie: cookies, "Accept-Encoding": "br", "If-None-Match": first.headers.etag });
+  assert.equal(changed.status, 200);
+  assert.notEqual(changed.headers.etag, first.headers.etag);
+  assert.deepEqual(JSON.parse(brotliDecompressSync(changed.body).toString()), expected);
+  assert.equal(reads, 7);
+});
+
+test("sidebar encoding negotiation honors quality, casing, wildcards, explicit rejection and no header", async (t) => {
+  const server = await startTestServer({ sessionManager: createSessionManagerStub() });
+  t.after(() => server.close());
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const cases = [
+    [undefined, undefined], ["identity", undefined], ["gzip;q=0", undefined],
+    ["br", "br"], ["br, gzip;q=0.5", "br"], ["gzip;q=0.5, br", "br"],
+    ["br;q=0.3, gzip;q=0.8", "gzip"], ["br;q=0.8, gzip;q=0.3", "br"],
+    ["br, gzip", "br"], ["gzip, br", "br"], ["gzip, deflate, br", "br"], ["gzip;q=0.7, br;q=0.7", "br"],
+    ["identity;q=1, br;q=0.8, gzip;q=0.5", undefined],
+    ["gzip;q=0, *;q=1", "br"], ["br;q=0, *;q=1", "gzip"],
+    ["br;q=0, gzip;q=0, identity;q=1, *;q=1", undefined],
+    ["gzip;q=0.0, br", "br"], ["*;q=1", "br"], ["GZip;Q=1", "gzip"], ["BR;q=1", "br"],
+    ["BR;Q=0, GZip;Q=0, identity", undefined], ["BR;Q=0, *;Q=1", "gzip"],
+    ["GZip;Q=0, *;Q=1", "br"]
+  ];
+  const baseline = await rawGet(`${server.baseUrl}/api/sessions`, { cookie: cookies });
+  for (const [accept, encoding] of cases) {
+    const headers = { cookie: cookies, ...(accept === undefined ? {} : { "Accept-Encoding": accept }) };
+    const response = await rawGet(`${server.baseUrl}/api/sessions`, headers);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers["content-encoding"], encoding, `Accept-Encoding: ${accept}`);
+    const decoded = encoding === "br" ? brotliDecompressSync(response.body)
+      : encoding === "gzip" ? gunzipSync(response.body) : response.body;
+    assert.deepEqual(decoded, baseline.body);
+    assert.equal(response.headers.etag, baseline.headers.etag);
+  }
+});
+
+test("sidebar returns a safe 406 JSON error when every supported encoding is rejected", async (t) => {
+  const server = await startTestServer({ sessionManager: createSessionManagerStub() });
+  t.after(() => server.close());
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const valid = await rawGet(`${server.baseUrl}/api/sessions`, { cookie: cookies });
+  for (const accept of ["*;q=0", "br;q=0, gzip;q=0, identity;q=0", "br;q=0, gzip;q=0, identity;q=0, *;q=1"]) {
+    for (const etag of [undefined, valid.headers.etag]) {
+      const response = await rawGet(`${server.baseUrl}/api/sessions`, { cookie: cookies, "Accept-Encoding": accept,
+        ...(etag ? { "If-None-Match": etag } : {}) });
+      assert.equal(response.status, 406, `Accept-Encoding: ${accept}; If-None-Match: ${etag}`);
+      assert.deepEqual(JSON.parse(response.body), { error: "No acceptable content encoding" });
+      assert.equal(response.headers["content-encoding"], undefined);
+      assert.equal(response.headers.etag, undefined);
+      assert.equal(response.headers["cache-control"], "no-store");
+      assert.equal(response.headers.vary, "Accept-Encoding");
+      assert.equal(response.headers["x-content-type-options"], "nosniff");
+      assert.equal(response.headers["x-frame-options"], "DENY");
+      assert.equal(response.headers["referrer-policy"], "same-origin");
+    }
+  }
+});
+
+test("sidebar ETag never bypasses authorization or changes cache policy on other routes", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  let reads = 0;
+  const list = sessionManager.listSidebarSnapshot.bind(sessionManager);
+  sessionManager.listSidebarSnapshot = () => { reads += 1; return list(); };
+  const server = await startTestServer({ sessionManager });
+  t.after(() => server.close());
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const valid = await rawGet(`${server.baseUrl}/api/sessions`, { cookie: cookies });
+  for (const encoding of ["br", "gzip", "*;q=0"]) {
+    const unauthorized = await rawGet(`${server.baseUrl}/api/sessions`, { "If-None-Match": valid.headers.etag, "Accept-Encoding": encoding });
+    assert.equal(unauthorized.status, 401);
+    assert.equal(JSON.parse(unauthorized.body.toString()).error, "Unauthorized");
+    assert.equal(unauthorized.headers.etag, undefined);
+    assert.equal(unauthorized.headers["content-encoding"], undefined);
+    assert.equal(unauthorized.headers["cache-control"], "no-store");
+  }
+  assert.equal(reads, 1);
+  const config = await rawGet(`${server.baseUrl}/api/config`, { cookie: cookies, "Accept-Encoding": "gzip", "If-None-Match": valid.headers.etag });
+  assert.equal(config.status, 200);
+  assert.equal(config.headers["content-encoding"], undefined);
+  assert.equal(config.headers["cache-control"], "no-store");
+});
+
+test("sidebar includes V2 turn activity in all lists and changes ETag without changing recorded recency", async (t) => {
+  const sessionManager = createSessionManagerStub();
+  const entry = { id: "history:codex:activity-thread", threadId: "activity-thread", provider: "codex", status: "saved",
+    updatedAt: "2026-10-16T06:00:00.000Z" };
+  sessionManager.listSidebarSnapshot = () => ({ sessions: [entry], projectGroups: [{ id: "project", sessions: [entry] }] });
+  const server = await startTestServer({ sessionManager });
+  t.after(() => server.close());
+  let state = "running";
+  server.runtime.codexThreads = { getThreadActivity: (id) => {
+    assert.equal(id, "activity-thread"); return { activityState: state, lastActivityAt: "2026-10-16T06:00:01.000Z" };
+  } };
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const first = await rawGet(`${server.baseUrl}/api/sessions`, { cookie: cookies });
+  const running = JSON.parse(first.body.toString());
+  assert.equal(running.sessions[0].activityState, "running");
+  assert.equal(running.projectGroups[0].sessions[0].activityState, "running");
+  const cached = await rawGet(`${server.baseUrl}/api/sessions`, { cookie: cookies, "If-None-Match": first.headers.etag });
+  assert.equal(cached.status, 304);
+  state = "idle";
+  const next = await rawGet(`${server.baseUrl}/api/sessions`, { cookie: cookies, "If-None-Match": first.headers.etag });
+  assert.equal(next.status, 200);
+  const idle = JSON.parse(next.body.toString());
+  assert.equal(idle.sessions[0].activityState, "idle");
+  assert.equal(idle.sessions[0].lastActivityAt, running.sessions[0].lastActivityAt);
+  assert.equal(entry.activityState, undefined);
 });

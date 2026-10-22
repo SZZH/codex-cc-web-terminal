@@ -57,7 +57,6 @@ export function buildLiveHistoryContinuation({
 
   const currentSnapshot = ensureThreadSnapshot(liveSession);
   const currentConversation = ensureConversationState(liveSession);
-  buildThreadProjection(liveSession);
   const mergedSnapshot =
     (currentSnapshot?.turns?.length || 0) >= (currentConversation?.turns?.length || 0)
       ? currentSnapshot
@@ -67,6 +66,9 @@ export function buildLiveHistoryContinuation({
           baseSnapshot: baseSnapshot || currentSnapshot || null
         });
   liveSession.threadSnapshot = mergedSnapshot;
+  if (!liveSession.threadProjection || mergedSnapshot !== currentSnapshot) {
+    buildThreadProjection(liveSession);
+  }
   syncProjectedThreadState(liveSession, { previousSnapshot: mergedSnapshot });
   return {
     session: serialize(liveSession),

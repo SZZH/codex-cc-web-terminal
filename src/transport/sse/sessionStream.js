@@ -2,6 +2,7 @@ import { createSseStreamWriter } from "./streamWriter.js";
 import { createCanonicalEvent } from "../../canonical/createCanonicalEvent.js";
 import { createCanonicalEventFromLegacy } from "../../canonical/fromLegacyEvent.js";
 import { CANONICAL_EVENT_KINDS } from "../../canonical/eventKinds.js";
+import { normalizeImageAttachmentReferences } from "../../sessions/shared/imageAttachments.js";
 import {
   buildThreadTransportOverlay
 } from "../../sessions/conversation/protocol.js";
@@ -59,9 +60,11 @@ function normalizeInputEvent(event) {
 
   const type = String(event.type || "").trim();
   if (type === "input") {
+    const attachments = normalizeImageAttachmentReferences(Object.hasOwn(event, "attachments") ? event.attachments : []);
     return {
       type,
-      data: String(event.data ?? event.input ?? "")
+      data: String(event.data ?? event.input ?? ""),
+      ...(attachments.length ? { attachments } : {})
     };
   }
 
@@ -103,10 +106,12 @@ export function normalizeSessionInputEvents(body = {}) {
   }
 
   const input = body?.input ?? body?.data;
-  if (input != null && String(input) !== "") {
+  const attachments = normalizeImageAttachmentReferences(Object.hasOwn(body || {}, "attachments") ? body.attachments : []);
+  if ((input != null && String(input) !== "") || attachments.length) {
     normalized.push({
       type: "input",
-      data: String(input)
+      data: String(input ?? ""),
+      ...(attachments.length ? { attachments } : {})
     });
   }
 
@@ -124,14 +129,16 @@ export function applySessionInputEvents(sessionManager, sessionId, events = []) 
       continue;
     }
     if (event.type === "input") {
-      const turnId = sessionManager.write(sessionId, event.data || "");
+      const turnId = event.attachments?.length
+        ? sessionManager.write(sessionId, event.data || "", { attachments: event.attachments })
+        : sessionManager.write(sessionId, event.data || "");
       if (turnId) {
         lastInputTurnId = String(turnId);
       }
       continue;
     }
     if (event.type === "interrupt") {
-      sessionManager.write(sessionId, "\u001b");
+      sessionManager.interrupt(sessionId);
     }
   }
   return { lastInputTurnId };

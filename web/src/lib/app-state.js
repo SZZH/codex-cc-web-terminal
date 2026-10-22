@@ -1,5 +1,20 @@
 import { createConversationState } from "./conversation-timeline.js";
 
+export function createSessionListViewState() {
+  return {
+    expandedGroups: new Set(),
+    localExpansion: new Map(),
+    expandedLists: new Set(),
+    activityLimit: 20,
+    searchQuery: "",
+    searchCollapsed: new Set(),
+    searchLimits: new Map(),
+    searchActivityLimit: 20,
+    searchGroupLimit: 20,
+    position: null
+  };
+}
+
 export function createLiveViewState() {
   return {
     sessionId: "",

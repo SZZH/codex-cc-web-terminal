@@ -5,15 +5,19 @@ const props = defineProps({
   busy: Boolean
 });
 
-const emit = defineEmits(["select-branch", "create-branch"]);
+const emit = defineEmits(["select-branch", "create-branch", "refresh"]);
 </script>
 
 <template>
   <div class="branch-sheet">
     <section class="branch-group">
-      <header class="branch-heading">当前分支</header>
+      <header class="branch-heading branch-header">
+        <span>当前分支</span>
+        <button class="branch-refresh" type="button" title="刷新 Git 状态" aria-label="刷新 Git 状态"
+          :disabled="disabled || busy || gitState.loading" @click="emit('refresh')">&#x21bb;</button>
+      </header>
       <div class="branch-current-card">
-        <strong>{{ gitState.currentBranch || "未选择分支" }}</strong>
+        <strong>{{ gitState.available === false ? "Git 状态暂不可用" : gitState.currentBranch || "未选择分支" }}</strong>
         <small>
           {{
             gitState.dirty
@@ -22,6 +26,7 @@ const emit = defineEmits(["select-branch", "create-branch"]);
           }}
         </small>
       </div>
+      <p v-if="gitState.error" class="branch-error" role="status">{{ gitState.error }}</p>
     </section>
 
     <section class="branch-group">
@@ -33,7 +38,7 @@ const emit = defineEmits(["select-branch", "create-branch"]);
           class="branch-chip"
           :class="{ active: branch.current }"
           type="button"
-          :disabled="disabled || busy || gitState.dirty || branch.current"
+          :disabled="disabled || busy || gitState.loading || gitState.available === false || !gitState.isGitRepo || gitState.dirty || branch.current"
           @click="emit('select-branch', branch.name)"
         >
           {{ branch.name }}
@@ -52,7 +57,7 @@ const emit = defineEmits(["select-branch", "create-branch"]);
 
     <section class="branch-group">
       <header class="branch-heading">新建分支</header>
-      <button class="branch-create" type="button" :disabled="disabled || busy" @click="emit('create-branch')">
+      <button class="branch-create" type="button" :disabled="disabled || busy || gitState.loading || gitState.available === false || !gitState.isGitRepo" @click="emit('create-branch')">
         从当前状态新建 Git 分支
       </button>
     </section>
@@ -79,6 +84,34 @@ const emit = defineEmits(["select-branch", "create-branch"]);
   color: #7f7165;
 }
 
+.branch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.branch-refresh {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid rgba(221, 211, 201, 0.95);
+  border-radius: 8px;
+  background: rgba(250, 245, 239, 0.88);
+  color: #60534a;
+  font-size: 24px;
+  cursor: pointer;
+}
+
+.branch-error {
+  margin: 0;
+  max-height: 96px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  color: #9b4537;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .branch-current-card {
   display: flex;
   flex-direction: column;
@@ -87,6 +120,7 @@ const emit = defineEmits(["select-branch", "create-branch"]);
   border: 1px solid rgba(221, 211, 201, 0.95);
   border-radius: 16px;
   background: rgba(248, 243, 238, 0.92);
+  overflow-wrap: anywhere;
 }
 
 .branch-current-card strong,
@@ -141,7 +175,8 @@ const emit = defineEmits(["select-branch", "create-branch"]);
 }
 
 .branch-chip:disabled,
-.branch-create:disabled {
+.branch-create:disabled,
+.branch-refresh:disabled {
   opacity: 0.5;
   cursor: default;
 }

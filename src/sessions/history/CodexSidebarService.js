@@ -1,192 +1,161 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { filterSidebarSessionsByRecency } from "./sessionSidebarSnapshot.js";
+import { buildDesktopSidebarSnapshot, desktopProjectIdMap, hasDesktopProjectMetadata, normalizeSidebarPath } from "./codexDesktopSidebar.js";
+import { createSidebarReadRuntime } from "./sidebar-read-runtime.js";
 
-function readJsonFile(filePath, fallbackValue) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return fallbackValue;
-  }
-}
-
-function normalizePath(value) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return "";
-  }
-  try {
-    return path.resolve(text);
-  } catch {
-    return text;
-  }
-}
-
-function uniquePaths(values = []) {
-  const seen = new Set();
-  const result = [];
-  for (const value of values) {
-    const normalized = normalizePath(value);
-    if (!normalized || seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    result.push(normalized);
-  }
-  return result;
-}
-
-function basenameLabel(projectRoot) {
-  const normalized = normalizePath(projectRoot);
-  return normalized ? path.basename(normalized) || normalized : "";
-}
-
-function isSubpathOf(targetPath, rootPath) {
-  const target = normalizePath(targetPath);
-  const root = normalizePath(rootPath);
-  if (!target || !root) {
-    return false;
-  }
-  if (target === root) {
-    return true;
-  }
-  const relative = path.relative(root, target);
-  return relative && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
-function bestProjectRootForCwd(cwd, projectRoots) {
-  const matches = projectRoots.filter((rootPath) => isSubpathOf(cwd, rootPath));
-  return matches.sort((left, right) => right.length - left.length)[0] || "";
-}
+const THREAD_COLUMNS = ["id", "cwd", "title", "name", "preview", "created_at", "updated_at", "created_at_ms", "updated_at_ms", "recency_at", "recency_at_ms", "archived", "archived_at", "source", "thread_source", "ephemeral", "agent_path", "agent_role", "agent_nickname", "parent_thread_id", "git_branch", "model", "project_id", "is_pinned"];
 
 function sqlite3Json(dbPath, sql) {
-  const output = execFileSync("sqlite3", ["-json", dbPath, sql], {
+  const output = execFileSync("sqlite3", ["-readonly", "-cmd", ".timeout 2000", "-json", dbPath, sql], {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"]
+    timeout: 5000,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"]
   });
   const text = String(output || "").trim();
   return text ? JSON.parse(text) : [];
 }
 
-function readGitBranch(cwd) {
-  const target = normalizePath(cwd);
-  if (!target || !fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
-    return "";
-  }
-  try {
-    return String(
-      execFileSync("git", ["-C", target, "branch", "--show-current"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"]
-      }) || ""
-    ).trim();
-  } catch {
-    return "";
-  }
-}
-
 export class CodexSidebarService {
-  constructor(config) {
+  constructor(config, { readerOptions = {} } = {}) {
     this.config = config;
-    this.globalStatePath =
-      this.config.codexGlobalStatePath || path.join(this.config.home, ".codex", ".codex-global-state.json");
-    this.stateDbPath = this.config.codexStateDbPath || path.join(this.config.home, ".codex", "state_5.sqlite");
+    this.globalStatePath = config.codexGlobalStatePath || path.join(config.home, ".codex", ".codex-global-state.json");
+    this.stateDbPath = config.codexStateDbPath || path.join(config.home, ".codex", "state_5.sqlite");
+    this.lastThreads = [];
+    this.lastReadError = "";
+    this.lastGlobalState = {};
+    this.lastGlobalReadError = "";
+    this.readRuntime = createSidebarReadRuntime({ ...readerOptions, globalStatePath: this.globalStatePath,
+      stateDbPath: this.stateDbPath, columns: THREAD_COLUMNS, publish: (kind, { value, error }) => {
+        if (kind === "global") {
+          if (!error) this.lastGlobalState = value;
+          this.lastGlobalReadError = error ? "Codex project metadata could not be read" : "";
+        } else {
+          if (!error) this.lastThreads = value;
+          this.lastReadError = !error ? "" : error.code === "ENOENT" ? "Codex state database is unavailable"
+            : /TIMEOUT/.test(error.code || "") ? "Codex state database read timed out" : "Codex state database could not be read";
+        }
+      } });
   }
 
   loadGlobalState() {
-    return readJsonFile(this.globalStatePath, {});
+    this.readRuntime.invalidate("global");
+    try {
+      const state = JSON.parse(fs.readFileSync(this.globalStatePath, "utf8"));
+      if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("Invalid global state");
+      this.lastGlobalState = state;
+      this.lastGlobalReadError = "";
+      return state;
+    } catch {
+      this.lastGlobalReadError = "Codex project metadata could not be read";
+      return this.lastGlobalState;
+    }
+  }
+
+  resolveProjectId(projectId) {
+    const id = String(projectId || "").trim();
+    if (!id) return "";
+    const state = this.loadGlobalState();
+    const mapping = desktopProjectIdMap(state, path.dirname(this.globalStatePath));
+    if (hasDesktopProjectMetadata(state)) {
+      const knownIds = new Set([
+        ...Object.keys(state["local-projects"]),
+        ...Object.values(state["local-projects"]).map((project) => String(project?.id || "").trim()),
+        ...Object.values(mapping)
+      ]);
+      if (!knownIds.has(id)) throw new Error("Codex project is no longer available. Refresh the session list.");
+    }
+    return String(mapping[id] || id).trim();
   }
 
   loadThreads() {
+    this.readRuntime.invalidate("threads");
+    this.lastReadError = "";
     if (!fs.existsSync(this.stateDbPath)) {
-      return [];
+      this.lastReadError = "Codex state database is unavailable";
+      return this.lastThreads;
     }
     try {
-      return sqlite3Json(
-        this.stateDbPath,
-        [
-          "select id, cwd, title, updated_at, archived, source, agent_path, agent_role, agent_nickname, git_branch",
-          "from threads",
-          "where archived = 0",
-          "order by updated_at desc"
-        ].join(" ")
-      );
-    } catch {
-      return [];
+      const columns = new Set(sqlite3Json(this.stateDbPath, "pragma table_info(threads)").map((column) => column.name));
+      if (!columns.has("id")) throw new Error("Codex threads table is unavailable");
+      const fields = THREAD_COLUMNS.map((column) => columns.has(column) ? `"${column}"` : `null as "${column}"`);
+      this.lastThreads = sqlite3Json(this.stateDbPath, `select ${fields.join(", ")} from threads`);
+      return this.lastThreads;
+    } catch (error) {
+      this.lastReadError = error.code === "ETIMEDOUT" ? "Codex state database read timed out" : "Codex state database could not be read";
+      return this.lastThreads;
     }
+  }
+
+  getDesktopSnapshot(liveSessions = []) {
+    const globalState = this.loadGlobalState();
+    if (!hasDesktopProjectMetadata(globalState)) return null;
+    this.loadThreads();
+    return this.buildDesktopSnapshot(liveSessions);
+  }
+
+  buildDesktopSnapshot(liveSessions = []) {
+    const globalState = this.lastGlobalState;
+    if (!hasDesktopProjectMetadata(globalState)) return null;
+    const snapshot = buildDesktopSidebarSnapshot({
+      globalState,
+      threads: this.lastThreads,
+      liveSessions,
+      codexHome: path.dirname(this.globalStatePath)
+    });
+    const warnings = [this.lastGlobalReadError, this.lastReadError].filter(Boolean);
+    return {
+      ...snapshot,
+      sidebarStatus: { source: "codex_desktop", degraded: warnings.length > 0, warnings }
+    };
+  }
+
+  async getDesktopSnapshotAsync(liveSessions = []) {
+    await this.readRuntime.readGlobal();
+    if (!hasDesktopProjectMetadata(this.lastGlobalState)) return null;
+    await this.readRuntime.readThreads();
+    return this.buildDesktopSnapshot(typeof liveSessions === "function" ? liveSessions() : liveSessions);
+  }
+
+  async listProjectGroupsAsync() {
+    const desktop = await this.getDesktopSnapshotAsync();
+    if (desktop) return desktop.projectGroups;
+    if (!this.legacyProjectRoots().length) return [];
+    await this.readRuntime.readThreads();
+    return this.buildLegacyProjectGroups(this.lastThreads);
+  }
+
+  legacyProjectRoots() {
+    const globalState = this.lastGlobalState;
+    return [...new Set([
+      ...(Array.isArray(globalState["project-order"]) ? globalState["project-order"] : []),
+      ...(Array.isArray(globalState["electron-saved-workspace-roots"]) ? globalState["electron-saved-workspace-roots"] : [])
+    ].filter((root) => typeof root === "string" && path.isAbsolute(root)).map(normalizeSidebarPath))];
   }
 
   listProjectGroups() {
-    const globalState = this.loadGlobalState();
-    const orderedRoots = uniquePaths(globalState["project-order"] || []);
-    const savedRoots = uniquePaths(globalState["electron-saved-workspace-roots"] || []);
-    const projectRoots = uniquePaths([...orderedRoots, ...savedRoots]);
-    if (!projectRoots.length) {
-      return [];
-    }
-
-    const collapsedGroups = globalState["electron-persisted-atom-state"]?.["sidebar-collapsed-groups"] || {};
-    const threads = this.loadThreads();
-    const branchByRoot = new Map(projectRoots.map((projectRoot) => [projectRoot, readGitBranch(projectRoot)]));
-    const groups = new Map(
-      projectRoots.map((projectRoot) => [
-        projectRoot,
-        {
-          id: `project:${projectRoot}`,
-          name: basenameLabel(projectRoot),
-          projectRoot,
-          cwd: projectRoot,
-          collapsed: Boolean(collapsedGroups[projectRoot]),
-          sessions: []
-        }
-      ])
-    );
-
-    for (const thread of threads) {
-      if (String(thread.source || "").trim() !== "vscode") {
-        continue;
-      }
-      const projectRoot = bestProjectRootForCwd(thread.cwd, projectRoots);
-      if (!projectRoot || !groups.has(projectRoot)) {
-        continue;
-      }
-      const activeBranch = String(branchByRoot.get(projectRoot) || "").trim();
-      const threadBranch = String(thread.git_branch || "").trim();
-      if (activeBranch && threadBranch && activeBranch !== threadBranch) {
-        continue;
-      }
-      groups.get(projectRoot).sessions.push({
-        id: `history:codex:${String(thread.id || "").trim()}`,
-        threadId: String(thread.id || "").trim(),
-        provider: "codex",
-        providerLabel: "Codex",
-        cliLabel: "Codex CLI",
-        name: String(thread.title || "").trim(),
-        cwd: normalizePath(thread.cwd),
-        kind: "history",
-        status: "saved",
-        createdAt: "",
-        updatedAt: new Date(Number(thread.updated_at || 0) * 1000).toISOString(),
-        exitCode: null,
-        autoNamed: false,
-        inputPreview: "",
-        resumeSessionId: String(thread.id || "").trim(),
-        model: "",
-        titleSource: "codex_state_db",
-        sessionType: String(thread.agent_path || "").trim() ? "subagent" : "main",
-        parentThreadId: "",
-        agentRole: String(thread.agent_role || "").trim(),
-        agentNickname: String(thread.agent_nickname || "").trim()
-      });
-    }
-
-    return projectRoots.map((projectRoot) => {
-      const group = groups.get(projectRoot);
-      group.sessions = filterSidebarSessionsByRecency(group.sessions).sort((left, right) =>
-        String(right.updatedAt).localeCompare(String(left.updatedAt))
-      );
-      return group;
-    });
+    const desktop = this.getDesktopSnapshot();
+    if (desktop) return desktop.projectGroups;
+    this.loadGlobalState();
+    return this.buildLegacyProjectGroups(this.legacyProjectRoots().length ? this.loadThreads() : []);
   }
+
+  buildLegacyProjectGroups(threads) {
+    const globalState = this.lastGlobalState;
+    const roots = this.legacyProjectRoots();
+    if (!roots.length) return [];
+    const collapsed = globalState["electron-persisted-atom-state"]?.["sidebar-collapsed-groups"] || {};
+    const snapshot = buildDesktopSidebarSnapshot({
+      globalState: {
+        ...globalState,
+        "local-projects": Object.fromEntries(roots.map((root) => [root, { id: root, name: path.basename(root) || root, rootPaths: [root] }])),
+        "project-order": roots
+      },
+      threads
+    });
+    return snapshot.projectGroups.filter((group) => group.groupKind === "project").map((group) => ({ ...group, collapsed: Boolean(collapsed[group.projectRoot]) }));
+  }
+
+  close() { return this.readRuntime.close(); }
 }

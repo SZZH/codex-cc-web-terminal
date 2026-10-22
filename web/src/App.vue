@@ -1,6 +1,10 @@
 <script setup>
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { defineAppView } from "./lib/async-view.js";
 import { useRoute, useRouter } from "vue-router";
+import PreviewHost from "./components/preview/PreviewHost.vue";
+import { previewState, closeLocalPreview, invalidateLocalPreviewPosition } from "./lib/preview.js";
+import { createAppViewport } from "./lib/app-viewport.js";
 
 import {
   AUTH_EXPIRED_EVENT,
@@ -21,16 +25,15 @@ import {
   createConversationState
 } from "./lib/conversation-timeline.js";
 import { resolveInitialAuthBootstrap } from "./lib/auth-bootstrap.js";
-import { createLiveViewState, createThreadViewState, resetLiveViewState, resetThreadViewState } from "./lib/app-state.js";
-import { createComposerRuntimeController } from "./lib/composer-runtime.js";
-import { cacheKey, createGroupedSessionsComputed, decorateSession } from "./lib/session-list.js";
+import { createLiveViewState, createSessionListViewState, createThreadViewState, resetLiveViewState, resetThreadViewState } from "./lib/app-state.js";
+import { createComposerRuntimeController, createComposerSubmissionController } from "./lib/composer-runtime.js";
+import { cacheKey, createGroupedSessionsComputed, decorateSession, parseHistoryRouteSessionId } from "./lib/session-list.js";
 import { createLiveSessionRuntimeController } from "./lib/live-session-runtime.js";
 import { createSessionSelectors } from "./lib/session-selectors.js";
 import { createSessionRuntimeController } from "./lib/session-runtime.js";
 import { createThreadRuntimeController } from "./lib/thread-runtime.js";
 import { createMessage, formatRelativeTime, normalizeLine, wait } from "./lib/session-helpers.js";
 import {
-  buildInputRequest,
   canSendComposerMessage,
   collectAttachmentLimitError,
   createAttachmentRecord,
@@ -40,15 +43,21 @@ import {
   validateGitBranchName
 } from "./lib/composer.js";
 
-const ChatView = defineAsyncComponent(() => import("./components/ChatView.vue"));
-const LoginView = defineAsyncComponent(() => import("./components/LoginView.vue"));
-const SessionListView = defineAsyncComponent(() => import("./components/SessionListView.vue"));
+const viewLoading = { getGeneration: () => `${authGeneration}:${chatRouteGeneration}:${route.name}:${route.params.sessionId || ""}:${state.isAuthenticated}` };
+const ChatView = defineAppView(() => import("./components/ChatView.vue"), viewLoading);
+const CodexThreadView = defineAppView(() => import("./components/CodexThreadView.vue"), { ...viewLoading, dependsOn: [ChatView] });
+const LoginView = defineAppView(() => import("./components/LoginView.vue"), viewLoading);
+const SessionListView = defineAppView(() => import("./components/SessionListView.vue"), viewLoading);
 
 const composerDraft = ref("");
+const codexThreadId = ref("");
+let chatRouteGeneration = 0;
+let authGeneration = 0;
 const composerOptions = ref(createComposerOptions());
 const workspaceGitState = ref(createWorkspaceGitState());
 const router = useRouter();
 const route = useRoute();
+const appViewport = createAppViewport();
 const historyApiAvailable = ref(null);
 const sessionCache = reactive({});
 const pendingHydrations = new Map();
@@ -79,6 +88,7 @@ const state = reactive({
   ready: false,
   isAuthenticated: false,
   loading: false,
+  composerSaving: false,
   accessToken: "",
   rememberToken: true,
   statusText: "",
@@ -91,6 +101,14 @@ const state = reactive({
   defaultProvider: "codex",
   sessions: [],
   projectGroups: [],
+  sessionListReady: false,
+  sessionListComplete: false,
+  sessionListCounts: null,
+  sessionListLoading: false,
+  sessionListError: null,
+  sessionCatalog: null,
+  sessionSearch: "",
+  sessionListViewState: createSessionListViewState(),
   routeSessionId: "",
   liveView: createLiveViewState(),
   threadView: createThreadViewState(),
@@ -101,6 +119,20 @@ const state = reactive({
   backendWsOrigin: "",
   authExpiredHandler: null
 });
+
+watch(viewLoading.getGeneration, invalidateLocalPreviewPosition, { flush: "sync" });
+
+watch(
+  () => {
+    if (state.ready && !state.isAuthenticated || route.name === "login") return LoginView;
+    if (route.name === "sessions") return SessionListView;
+    if (route.name !== "chat") return null;
+    const history = parseHistoryRouteSessionId(route.params.sessionId);
+    return history?.provider === "codex" ? CodexThreadView : ChatView;
+  },
+  (view) => { if (view) void view.preload(); },
+  { immediate: true }
+);
 
 function resetLiveView() {
   resetLiveViewState(state.liveView);
@@ -154,7 +186,7 @@ function isDisplayedThreadRunning(snapshot = null) {
   });
 }
 const canSend = computed(() => {
-  if (state.loading || !Boolean(activeThreadId.value || displayedSessionMeta.value)) {
+  if (state.loading || state.composerSaving || state.pendingSessionId || state.liveView.activeInputStream || state.liveView.interruptInFlight || !Boolean(activeThreadId.value || displayedSessionMeta.value)) {
     return false;
   }
   if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
@@ -166,16 +198,13 @@ const canSend = computed(() => {
   return canSendComposerMessage(composerDraft.value, composerOptions.value.attachments || []);
 });
 const canInterrupt = computed(() => {
-  if (!state.liveView.liveSessionId) {
+  if (!state.liveView.liveSessionId && !activeThreadId.value) {
     return false;
   }
   if (state.liveView.activeInputStream || state.liveView.interruptInFlight) {
     return true;
   }
-  if (state.loading) {
-    return true;
-  }
-  if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
+  if (state.statusText === "等待 Codex 回复…") {
     return true;
   }
   if (isDisplayedThreadRunning(displayedThreadSnapshot.value)) {
@@ -302,11 +331,17 @@ function saveTokenPreference(token) {
 }
 
 async function forceBackToLogin(statusMessage = "登录状态已失效，请重新登录。") {
+  authGeneration += 1;
+  chatRouteGeneration += 1;
+  invalidateActivation();
+  invalidateWorkspaceBootstrap();
+  closeLocalPreview();
   clearSubmitFallbackTimer();
   closeSocket();
   finalizeAssistantStream();
   state.loading = false;
   state.isAuthenticated = false;
+  state.ready = true;
   state.sessions = [];
   state.routeSessionId = "";
   state.pendingSessionId = "";
@@ -331,15 +366,6 @@ function setMessages(messages) {
   syncThreadViewFromInteraction();
 }
 
-function buildSubmissionText(text) {
-  const fragments = [];
-  const trimmedText = String(text || "").trim();
-  if (trimmedText) {
-    fragments.push(trimmedText);
-  }
-  return fragments.join("\n\n").trim();
-}
-
 const composerRuntime = createComposerRuntimeController({
   state,
   composerDraft,
@@ -350,6 +376,7 @@ const composerRuntime = createComposerRuntimeController({
   requestWorkspaceGit,
   requestWorkspaceGitCheckout,
   requestWorkspaceGitBranchCreate,
+  request,
   wait,
   setStatus,
   createComposerOptions,
@@ -362,6 +389,8 @@ const composerRuntime = createComposerRuntimeController({
   getExpectedThreadId: () => expectedThreadId.value,
   getActiveProviderId: () => activeProviderId.value,
   getActiveWorkspaceCwd: () => activeWorkspaceCwd.value,
+  getActivationToken: () => sessionRuntime.getActivationToken(),
+  getModels: () => availableModels.value,
   getCanInterrupt: () => canInterrupt.value,
   getLoading: () => state.loading,
   getGitDirtyErrorMessage: () => GIT_DIRTY_ERROR_MESSAGE
@@ -371,6 +400,8 @@ const {
   resetComposerDraftState,
   updateComposerOptions,
   handleComposerOptionsChange,
+  syncComposerContext,
+  waitForComposerPersistence,
   applyComposerStatePayload,
   applyHistoricalComposerValues,
   syncComposerStateForThread,
@@ -378,6 +409,7 @@ const {
   addAttachments,
   removeAttachment,
   retryAttachment,
+  uploadImageAttachments,
   switchGitBranch,
   createGitBranch
 } = composerRuntime;
@@ -390,6 +422,8 @@ const liveSessionRuntime = createLiveSessionRuntimeController({
   threadRuntime,
   liveBootstrapLinePatterns: LIVE_BOOTSTRAP_LINE_PATTERNS,
   decorateSession,
+  refreshSessions: () => refreshSessions(),
+  onSocketUnavailable: (sessionId) => sessionRuntime.recoverLiveSession(sessionId),
   stopHistorySyncLoop: () => stopHistorySyncLoop()
 });
 
@@ -420,6 +454,7 @@ function resolveWsUrl(sessionId) {
 }
 
 const sessionRuntime = createSessionRuntimeController({
+  pagedCatalog: true,
   state,
   route,
   router,
@@ -434,6 +469,7 @@ const sessionRuntime = createSessionRuntimeController({
   setStatus,
   wait,
   getActiveThreadId: () => activeThreadId.value,
+  getActiveProviderId: () => activeProviderId.value,
   getExpectedThreadId: () => expectedThreadId.value,
   getInteractiveThreadId: () => interactiveThreadId.value,
   getRouteHistoryTarget: () => routeHistoryTarget.value,
@@ -454,9 +490,18 @@ const sessionRuntime = createSessionRuntimeController({
 });
 
 const {
+  setSessionCatalogView, loadSessionCatalogGroup, loadMoreSessionCatalog,
   bootstrapWorkspace,
+  requestWorkspaceConfig,
+  invalidateWorkspaceBootstrap: invalidateCatalogBootstrap,
   hydrateSession,
   refreshSessions,
+  startSessionListSyncLoop,
+  stopSessionListSyncLoop,
+  invalidateActivation,
+  getActivationToken,
+  isActivationCurrent,
+  applyInputResponse,
   stopHistorySyncLoop,
   startHistorySyncLoop,
   syncActiveThreadSession,
@@ -467,13 +512,97 @@ const {
   syncRouteSession
 } = sessionRuntime;
 
+function invalidateWorkspaceBootstrap() {
+  invalidateCatalogBootstrap();
+  state.sessionListViewState = createSessionListViewState();
+}
+
 async function backToSessionList() {
   clearSubmitFallbackTimer();
   await backToList();
 }
 
+async function openSession(session) {
+  if (session.provider === "codex") {
+    const id = session.resumeSessionId || session.threadId;
+    await router.push({ name: "chat", params: { sessionId: id ? `history:codex:${id}` : session.id } });
+    return;
+  }
+  await openSessionItem(session);
+}
+
+async function createCodexSession(group) {
+  const cwd = String(group?.cwd || "").trim();
+  if (!cwd || state.pendingSessionId) return;
+  state.pendingSessionId = `__creating__:${cwd}`;
+  const generation = chatRouteGeneration;
+  try {
+    const { thread } = await request("/api/v2/codex/threads", { method: "POST", body: JSON.stringify({
+      cwd, projectId: group.projectId || ""
+    }) });
+    if (generation !== chatRouteGeneration) return;
+    setStatus("");
+    await router.push({ name: "chat", params: { sessionId: `history:codex:${thread.id}` } });
+  } catch (error) { if (generation === chatRouteGeneration) setStatus(error.message); }
+  finally { if (state.pendingSessionId === `__creating__:${cwd}`) state.pendingSessionId = ""; }
+}
+
+async function syncCurrentChatRoute() {
+  const generation = ++chatRouteGeneration;
+  codexThreadId.value = "";
+  if (!state.ready || !state.isAuthenticated || route.name !== "chat") {
+    await syncRouteSession();
+    return;
+  }
+  const routeId = String(route.params.sessionId || "");
+  const history = parseHistoryRouteSessionId(routeId);
+  if (history?.provider === "codex") {
+    invalidateActivation();
+    closeSocket({ silent: true });
+    resetLiveView();
+    resetThreadView();
+    state.routeSessionId = routeId;
+    codexThreadId.value = history.resumeSessionId;
+    return;
+  }
+  if (!history && routeId) {
+    try {
+      const session = state.sessions.find((item) => item.id === routeId) || await requestSessionById(routeId);
+      if (generation !== chatRouteGeneration) return;
+      if (session?.provider === "codex") {
+        let threadId = session.resumeSessionId;
+        if (!threadId) {
+          const { thread } = await request("/api/v2/codex/threads", { method: "POST", body: JSON.stringify({
+            cwd: session.cwd, name: session.name, projectId: session.projectId,
+            model: session.model, reasoningEffort: session.reasoningEffort, permissionMode: session.permissionMode
+          }) });
+          threadId = thread.id;
+        }
+        if (generation === chatRouteGeneration) await router.replace({ name: "chat", params: { sessionId: `history:codex:${threadId}` } });
+        return;
+      }
+    } catch (error) { if (generation === chatRouteGeneration) setStatus(error.message); return; }
+  }
+  if (generation === chatRouteGeneration) {
+    try {
+      await requestWorkspaceConfig();
+      if (generation === chatRouteGeneration && state.isAuthenticated) await syncRouteSession();
+    } catch (error) {
+      if (generation === chatRouteGeneration) setStatus(error.message);
+    }
+  }
+}
+
+function startWorkspaceBootstrap(generation) {
+  void bootstrapWorkspace({ includeSessions: route.name !== "chat" }).catch((error) => {
+    if (generation === authGeneration && state.isAuthenticated && error !== state.sessionListError) setStatus(error.message);
+  });
+}
+
 async function handleLogin({ silent = false, auto = false } = {}) {
   const token = state.accessToken.trim();
+  const generation = auto ? authGeneration : ++authGeneration;
+  invalidateWorkspaceBootstrap();
   try {
     state.loading = true;
     if (!token) {
@@ -484,11 +613,13 @@ async function handleLogin({ silent = false, auto = false } = {}) {
       method: "POST",
       body: JSON.stringify({ token })
     });
+    if (generation !== authGeneration) return null;
     saveTokenPreference(token);
     state.isAuthenticated = true;
+    state.ready = true;
     state.accessToken = "";
     setStatus("");
-    await bootstrapWorkspace();
+    startWorkspaceBootstrap(generation);
     if (route.name === "login") {
       const redirectPath = String(route.query.redirect || "").trim();
       if (redirectPath) {
@@ -497,21 +628,24 @@ async function handleLogin({ silent = false, auto = false } = {}) {
         await router.replace({ name: "sessions" });
       }
     }
+    return { isAuthenticated: true, accessToken: "", rememberToken: state.rememberToken };
   } catch (error) {
-    if (auto) {
+    if (generation !== authGeneration) return null;
+    if (auto && [401, 403].includes(error?.status)) {
       if (typeof window !== "undefined") {
         window.localStorage.removeItem(TOKEN_STORAGE_KEY);
       }
       state.rememberToken = false;
       state.accessToken = "";
       setStatus("已保存的 token 已失效，请重新输入一次。");
-      return;
+      return { isAuthenticated: false, accessToken: "", rememberToken: false };
     }
     if (!silent) {
       setStatus(toFriendlyLoginError(error));
     }
+    return { isAuthenticated: false, accessToken: token, rememberToken: state.rememberToken };
   } finally {
-    state.loading = false;
+    if (generation === authGeneration) state.loading = false;
   }
 }
 
@@ -582,177 +716,55 @@ function attachLiveSocket(sessionId) {
   });
 }
 
-async function submitInput() {
-  if (!canSend.value || state.loading) {
-    return;
-  }
-  const draftText = String(composerDraft.value || "");
-  const submissionText = buildSubmissionText(draftText);
-  const requestBody = buildInputRequest({
-    text: submissionText,
-    composerOptions: composerOptions.value
-  });
-  const sendableImages = requestBody.attachments || [];
-  const attachmentsSnapshot = [...composerOptions.value.attachments];
-
-  if (!submissionText && !sendableImages.length) {
-    if (hasOnlyFileAttachments(composerOptions.value.attachments)) {
-      setStatus("当前版本文件附件仅保存选择状态，暂不随消息发送。");
-    }
-    return;
-  }
-  const now = Date.now();
-  const submissionFingerprint = JSON.stringify({
-    text: submissionText,
-    attachments: sendableImages.map((attachment) => attachment.name)
-  });
-  if (submissionFingerprint === state.lastSubmitText && now - Number(state.lastSubmitAt || 0) < 2500) {
-    return;
-  }
-  state.lastSubmitText = submissionFingerprint;
-  state.lastSubmitAt = now;
-  const optimisticUserMessage = submissionText
-    ? createMessage("user", submissionText, new Date().toISOString(), {
-        source: "draft",
-        partType: "text",
-        payload: {}
-      })
-    : null;
-
-  try {
-    state.loading = true;
-    setStatus("正在发送…");
-    closeSocket({ silent: true });
-    if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
-      throw new Error(
-        `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。请返回列表后重新打开该会话。`
-      );
-    }
-    const nextMessages = optimisticUserMessage ? [...state.liveView.messages, optimisticUserMessage] : [...state.liveView.messages];
-    rebuildReplaySuppressionLines(nextMessages);
-    setMessages(nextMessages);
-    resetComposerDraftState();
-    const liveSessionId = await ensureLiveSession();
-    const targetThreadId = String(
-      expectedThreadId.value ||
-        activeThreadId.value ||
-        state.liveView.sessionMeta?.resumeSessionId ||
-        state.threadView.threadId ||
-        ""
-    ).trim();
-    const targetProvider = String(
-      state.liveView.sessionMeta?.provider ||
-        state.threadView.meta?.provider ||
-        routeHistoryTarget.value?.provider ||
-        "codex"
-    ).trim().toLowerCase() || "codex";
-    if (expectedThreadId.value && activeThreadId.value && expectedThreadId.value !== activeThreadId.value) {
-      throw new Error(
-        `会话线程不一致：当前=${activeThreadId.value}，目标=${expectedThreadId.value}。已取消发送，避免写入错误会话。`
-      );
-    }
-    finalizeAssistantStream();
-    clearSubmitFallbackTimer();
-    if (state.liveView.replayGuardActive) {
-      state.liveView.replayGuardPrompt = submissionText;
-    }
-    setStatus("等待 Codex 回复…");
-    if (targetThreadId) {
-      await requestThreadInput(
-        targetProvider,
-        targetThreadId,
-        requestBody
-      );
-    } else {
-      await requestSessionInput(
-        liveSessionId,
-        requestBody
-      );
-    }
-  } catch (error) {
-    updateComposerOptions({ attachments: attachmentsSnapshot });
-    if (submissionText && String(composerDraft.value || "").trim() === "") {
-      composerDraft.value = submissionText;
-    }
-    setMessages(
-      optimisticUserMessage
-        ? state.liveView.messages.filter((message) => String(message.id || "") !== String(optimisticUserMessage.id || ""))
-        : state.liveView.messages
-    );
-    if (!state.liveView.liveSessionId) {
-      startHistorySyncLoop();
-    }
-    setStatus(error.message || String(error));
-  } finally {
-    state.loading = false;
-    await syncActiveThreadSession({ silent: true }).catch(() => {});
-    startHistorySyncLoop();
-  }
-}
-
-async function interruptActiveSession() {
-  clearSubmitFallbackTimer();
-  const liveSessionId = String(state.liveView.liveSessionId || "").trim();
-  const targetThreadId = String(
-    expectedThreadId.value ||
-      activeThreadId.value ||
-      state.liveView.sessionMeta?.resumeSessionId ||
-      state.threadView.threadId ||
-      ""
-  ).trim();
-  const targetProvider = String(
-    state.liveView.sessionMeta?.provider ||
-      state.threadView.meta?.provider ||
-      routeHistoryTarget.value?.provider ||
-      "codex"
-  ).trim().toLowerCase() || "codex";
-  if (!liveSessionId) {
-    setStatus("当前没有可中断的运行流程。");
-    return;
-  }
-  if (state.liveView.interruptInFlight) {
-    return;
-  }
-
-  try {
-    state.liveView.interruptInFlight = true;
-    closeSocket({ silent: true });
-    setStatus("已发送中断指令。");
-    if (targetThreadId) {
-      await requestThreadInput(
-        targetProvider,
-        targetThreadId,
-        { type: "interrupt", reason: "user_interrupt" }
-      );
-    } else {
-      await requestSessionInput(
-        liveSessionId,
-        { type: "interrupt", reason: "user_interrupt" }
-      );
-    }
-  } catch (error) {
-    setStatus(error.message || String(error));
-  } finally {
-    state.liveView.interruptInFlight = false;
-  }
-}
+const { submitInput, interruptActiveSession } = createComposerSubmissionController({
+  state,
+  composerDraft,
+  composerOptions,
+  getContext: () => ({
+    activation: getActivationToken(),
+    provider: activeProviderId.value,
+    threadId: activeThreadId.value,
+    expectedThreadId: expectedThreadId.value,
+    liveSessionId: state.liveView.liveSessionId
+  }),
+  isContextCurrent: (context) => isActivationCurrent(context.activation),
+  getCanSend: () => canSend.value,
+  waitForComposerPersistence,
+  uploadImageAttachments,
+  ensureLiveSession,
+  attachLiveSocket,
+  requestSessionInput,
+  requestThreadInput,
+  applyInputResponse,
+  createUserMessage: (text) => createMessage("user", text, new Date().toISOString(), { source: "draft", partType: "text", payload: {} }),
+  setMessages,
+  finalizeAssistantStream,
+  setStatus,
+  syncActiveThreadSession,
+  startHistorySyncLoop
+});
 
 watch(
   () => route.name,
   async (name) => {
+    if (name !== "chat") invalidateActivation();
+    if (name !== "sessions") stopSessionListSyncLoop({ abortBootstrap: true });
     if (name === "sessions") {
       closeSocket();
       stopHistorySyncLoop();
       finalizeAssistantStream();
       if (state.isAuthenticated) {
-        try {
-          await refreshSessions();
-        } catch (error) {
-          setStatus(error?.message || String(error));
-        }
+        startSessionListSyncLoop();
+        await refreshSessions().catch(() => {});
       }
     }
   }
+);
+
+watch(
+  () => [activeProviderId.value, activeThreadId.value, expectedThreadId.value],
+  () => syncComposerContext(),
+  { immediate: true, flush: "sync" }
 );
 
 watch(
@@ -772,7 +784,7 @@ watch(
 watch(
   () => activeWorkspaceCwd.value,
   () => {
-    refreshWorkspaceGit({ silent: true }).catch(() => {});
+    refreshWorkspaceGit({ silent: true, automatic: true }).catch(() => {});
   },
   { immediate: true }
 );
@@ -780,12 +792,14 @@ watch(
 watch(
   () => [state.ready, state.isAuthenticated, route.name, route.params.sessionId],
   async () => {
-    await syncRouteSession();
+    await syncCurrentChatRoute();
   },
   { immediate: true }
 );
 
 onMounted(async () => {
+  appViewport.start();
+  const generation = authGeneration;
   const handleAuthExpired = () => {
     forceBackToLogin("登录状态已失效，请重新登录。");
   };
@@ -795,27 +809,36 @@ onMounted(async () => {
     savedToken: getSavedToken(),
     autoLoginTried,
     requestAuthSession,
-    bootstrapWorkspace,
     handleAutoLogin: async (token) => {
       autoLoginTried = true;
       state.accessToken = token;
-      await handleLogin({ auto: true });
+      return handleLogin({ auto: true });
     },
-    routeName: String(route.name || "")
+    isCurrent: () => generation === authGeneration
   });
+  if (!next || generation !== authGeneration) return;
   state.accessToken = next.accessToken;
   state.rememberToken = next.rememberToken;
   state.isAuthenticated = next.isAuthenticated;
   autoLoginTried = next.autoLoginTried;
+  if (next.statusText) setStatus(next.statusText);
   state.ready = next.ready;
+  if (state.isAuthenticated) startWorkspaceBootstrap(generation);
+  if (state.isAuthenticated && route.name === "sessions") startSessionListSyncLoop();
 });
 
 onBeforeUnmount(() => {
+  appViewport.dispose();
+  invalidateLocalPreviewPosition();
+  authGeneration += 1;
+  invalidateWorkspaceBootstrap();
   if (state.authExpiredHandler) {
     window.removeEventListener(AUTH_EXPIRED_EVENT, state.authExpiredHandler);
     state.authExpiredHandler = null;
   }
   stopHistorySyncLoop();
+  stopSessionListSyncLoop();
+  invalidateActivation();
   closeSocket();
 });
 
@@ -847,6 +870,8 @@ if (typeof window !== 'undefined') {
 </script>
 
 <template>
+  <div class="app-preview-layout" :class="{ 'has-preview': previewState.open && state.isAuthenticated }">
+    <div class="app-content">
   <div class="app-shell">
     <div v-if="!state.ready" class="splash-screen">
       <div class="splash-card">正在加载会话…</div>
@@ -862,18 +887,40 @@ if (typeof window !== 'undefined') {
     />
 
     <template v-else>
-      <section v-if="route.name === 'sessions'" class="mobile-shell">
+      <section v-if="route.name === 'sessions'" class="mobile-shell session-list-shell">
         <SessionListView
+          v-model:search-query="state.sessionSearch"
+          :view-state="state.sessionListViewState"
+          :get-position-generation="viewLoading.getGeneration"
           :groups="groupedSessions"
+          :loaded="state.sessionListReady"
+          :complete="state.sessionListComplete"
+          :counts="state.sessionListCounts"
+          :loading="state.sessionListLoading"
+          :load-error="state.sessionListError?.message || String(state.sessionListError || '')"
+          :pagination="state.sessionCatalog"
           :active-session-id="state.routeSessionId"
           :pending-session-id="state.pendingSessionId"
           :format-relative-time="formatRelativeTime"
-          @open="openSessionItem"
-          @create-group-session="createSessionInGroup"
+          @open="openSession"
+          @create-group-session="createCodexSession"
+          @retry="refreshSessions().catch(() => {})"
+          @catalog-view="setSessionCatalogView($event)?.catch(() => {})"
+          @load-group="({ key, more }) => loadSessionCatalogGroup(key, { more })?.catch(() => {})"
+          @load-more="loadMoreSessionCatalog()?.catch(() => {})"
         />
 
         <div v-if="state.statusText" class="notice-strip">{{ state.statusText }}</div>
       </section>
+
+      <CodexThreadView
+        v-else-if="codexThreadId"
+        :key="codexThreadId"
+        :thread-id="codexThreadId"
+        :load-config="requestWorkspaceConfig"
+        @back="backToSessionList"
+        @status="setStatus"
+      />
 
       <ChatView
         v-else-if="canRenderChatView"
@@ -906,11 +953,25 @@ if (typeof window !== 'undefined') {
         @retry-attachment="retryAttachment"
         @switch-git-branch="switchGitBranch"
         @create-git-branch="createGitBranch"
+        @refresh-git="refreshWorkspaceGit()"
       />
 
       <section v-else class="mobile-shell centered-shell">
-        <div class="splash-card">正在加载会话页面…</div>
+        <div class="splash-card">{{ state.statusText || "正在加载会话页面…" }}</div>
       </section>
     </template>
   </div>
+    </div>
+    <PreviewHost v-if="state.isAuthenticated" />
+  </div>
 </template>
+
+<style scoped>
+.app-preview-layout { position: fixed; left: 0; right: 0; top: var(--app-viewport-top, 0px); height: var(--app-viewport-height, 100dvh); min-height: 0; min-width: 0; overflow: hidden; }
+.app-content { height: 100%; min-height: 0; min-width: 0; overflow: hidden; }
+.session-list-shell { display: flex; flex-direction: column; overflow: hidden; }
+.session-list-shell > .notice-strip { flex: 0 1 auto; min-height: 0; max-height: 40%; overflow-y: auto; overflow-wrap: anywhere; }
+@media (min-width: 960px) {
+  .app-preview-layout.has-preview { display: grid; grid-template-columns: minmax(400px, .9fr) minmax(480px, 1.1fr); grid-template-rows: minmax(0, 1fr); }
+}
+</style>

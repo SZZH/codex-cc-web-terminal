@@ -1,16 +1,16 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from "vue";
 
 import {
+  PERMISSION_MODE_OPTIONS,
   canSendComposerMessage,
   formatComposerContextSummary,
   hasOnlyFileAttachments
 } from "../../lib/composer.js";
-import AddContentMenu from "./AddContentMenu.vue";
 import AttachmentChips from "./AttachmentChips.vue";
 import ComposerPopover from "./ComposerPopover.vue";
 import ComposerSettings from "./ComposerSettings.vue";
-import GitBranchMenu from "./GitBranchMenu.vue";
+import ComposerSendActions from "./ComposerSendActions.vue";
 
 const MAX_COMPOSER_HEIGHT = 170;
 
@@ -18,10 +18,16 @@ const props = defineProps({
   draft: { type: String, default: "" },
   composerOptions: { type: Object, required: true },
   models: { type: Array, default: () => [] },
+  permissionModeOptions: { type: Array, default: () => PERMISSION_MODE_OPTIONS },
   gitState: { type: Object, required: true },
   providerId: { type: String, default: "codex" },
   canSend: Boolean,
   canInterrupt: Boolean,
+  allowFollowups: Boolean,
+  canSteer: Boolean,
+  runningTask: Boolean,
+  followUpMode: { type: String, default: "steer" },
+  interrupting: Boolean,
   loading: Boolean
 });
 
@@ -33,23 +39,27 @@ const emit = defineEmits([
   "add-attachments",
   "remove-attachment",
   "retry-attachment",
-  "switch-git-branch",
-  "create-git-branch",
+  "refresh-git",
   "status"
 ]);
 
 const textareaEl = ref(null);
+const composerEl = ref(null);
 const captureInputEl = ref(null);
 const imageInputEl = ref(null);
-const fileInputEl = ref(null);
 const activePopover = ref("");
 const isTouchDevice = ref(false);
+const settingsDialogId = `composer-settings-${useId()}`;
+let popoverRevision = 0;
 
-const inputLocked = computed(() => Boolean(props.loading || props.canInterrupt));
-const primaryActionLabel = computed(() => (inputLocked.value ? "发送中" : "发送"));
-const canPrimaryAction = computed(() => props.canSend && !inputLocked.value);
-const addDisabled = computed(() => props.loading || props.canInterrupt);
-const settingsDisabled = computed(() => props.loading || props.canInterrupt);
+const inputLocked = computed(() => Boolean(props.loading || (props.canInterrupt && !props.allowFollowups)));
+const followupRunning = computed(() => props.runningTask || props.canInterrupt);
+const hasDraftInput = computed(() => Boolean(String(props.draft || "").trim()) || Boolean(props.composerOptions.attachments?.length));
+const defaultSubmitMode = computed(() => followupRunning.value && props.followUpMode !== "queue" ? "steer" : "queue");
+const primaryActionLabel = computed(() => props.canInterrupt ? props.allowFollowups ? "加入队列" : "停止生成" : "发送消息");
+const canPrimaryAction = computed(() => (!props.allowFollowups && props.canInterrupt) || (props.canSend && !inputLocked.value));
+const addDisabled = computed(() => inputLocked.value);
+const settingsDisabled = computed(() => props.loading);
 const showPermissionMode = computed(() => String(props.providerId || "").trim().toLowerCase() === "codex");
 const contextSummary = computed(() => formatComposerContextSummary(props.composerOptions, props.models));
 const onlyFileAttachments = computed(() => hasOnlyFileAttachments(props.composerOptions.attachments || []));
@@ -68,23 +78,28 @@ function updateComposerOptions(patch) {
   emit("update:composer-options", patch);
 }
 
-function togglePopover(name) {
-  if ((name === "add" && addDisabled.value) || ((name === "settings" || name === "git") && settingsDisabled.value)) {
+async function togglePopover(name) {
+  if ((name === "add" && addDisabled.value) || (name === "settings" && settingsDisabled.value)) {
     return;
   }
-  if (name === "git" && !props.gitState.available) {
-    emit("status", "Git 状态暂不可用");
-    return;
+  if (activePopover.value === name) { closePopover(); return; }
+  const version = ++popoverRevision;
+  if (activePopover.value) {
+    activePopover.value = "";
+    await nextTick();
+    if (version !== popoverRevision || settingsDisabled.value) return;
   }
-  if (name === "git" && !props.gitState.isGitRepo) {
-    emit("status", "当前目录不是 Git 仓库");
-    return;
-  }
-  activePopover.value = activePopover.value === name ? "" : name;
+  activePopover.value = name;
 }
 
 function closePopover() {
+  popoverRevision += 1;
   activePopover.value = "";
+}
+
+function focusComposer() {
+  const target = !inputLocked.value ? textareaEl.value : composerEl.value;
+  target?.focus?.({ preventScroll: true });
 }
 
 function handleInput(event) {
@@ -97,6 +112,13 @@ function handleComposerKeydown(event) {
     return;
   }
 
+  if (props.allowFollowups && event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey) {
+    if (props.canSend && !inputLocked.value) {
+      event.preventDefault(); emit("submit", { mode: followupRunning.value ? "steer" : "queue" });
+    }
+    return;
+  }
+
   const wantsSubmitShortcut =
     event.key === "Enter" &&
     !event.shiftKey &&
@@ -105,13 +127,17 @@ function handleComposerKeydown(event) {
     !event.metaKey &&
     !isTouchDevice.value;
 
-  if (wantsSubmitShortcut && canPrimaryAction.value && canSendComposerMessage(props.draft, props.composerOptions.attachments || [])) {
+  if (wantsSubmitShortcut && !inputLocked.value && canPrimaryAction.value && canSendComposerMessage(props.draft, props.composerOptions.attachments || [])) {
     event.preventDefault();
-    emit("submit");
+    emit("submit", props.allowFollowups ? { mode: defaultSubmitMode.value } : undefined);
   }
 }
 
-function handlePrimaryAction() {
+function handlePrimaryAction(selection) {
+  if (props.canInterrupt && !props.allowFollowups) {
+    emit("interrupt");
+    return;
+  }
   if (!canPrimaryAction.value) {
     return;
   }
@@ -119,7 +145,7 @@ function handlePrimaryAction() {
     emit("status", "当前版本文件附件仅保存选择状态，暂不随消息发送。");
     return;
   }
-  emit("submit");
+  emit("submit", props.allowFollowups ? { mode: selection?.mode || defaultSubmitMode.value } : undefined);
 }
 
 function triggerInput(inputRef) {
@@ -127,7 +153,7 @@ function triggerInput(inputRef) {
     return;
   }
   closePopover();
-  inputRef.value?.click();
+  (inputRef?.value || inputRef)?.click();
 }
 
 function handleSelectedFiles(event, kindHint, source) {
@@ -141,6 +167,7 @@ function handleSelectedFiles(event, kindHint, source) {
 }
 
 function handleTextareaPaste(event) {
+  if (addDisabled.value) return;
   const items = [...(event.clipboardData?.items || [])];
   const files = items
     .filter((item) => item.kind === "file" && String(item.type || "").startsWith("image/"))
@@ -191,9 +218,9 @@ watch(
 );
 
 watch(
-  () => props.canInterrupt || props.loading,
+  () => props.loading,
   () => {
-    if (props.canInterrupt || props.loading) {
+    if (props.loading) {
       closePopover();
     }
   }
@@ -209,7 +236,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  activePopover.value = "";
+  closePopover();
 });
 
 defineExpose({
@@ -218,40 +245,20 @@ defineExpose({
 </script>
 
 <template>
-  <div class="chat-composer-wrap">
+  <div ref="composerEl" class="chat-composer-wrap" tabindex="-1">
     <form class="chat-composer" @submit.prevent="handlePrimaryAction">
-      <!-- 文件上传入口暂时下线，相关交互保留在代码里方便后续恢复。 -->
-      <!--
-      <ComposerPopover :open="activePopover === 'add'" title="添加内容" @close="closePopover">
-        <AddContentMenu
-          @capture-photo="triggerInput(captureInputEl)"
-          @upload-images="triggerInput(imageInputEl)"
-          @upload-files="triggerInput(fileInputEl)"
-          @paste-clipboard="handleClipboardPasteRequest"
-        />
-      </ComposerPopover>
-      -->
-
-      <ComposerPopover :open="activePopover === 'settings'" title="输入设置" @close="closePopover">
+      <ComposerPopover :id="settingsDialogId" :open="activePopover === 'settings'" title="输入设置" :fallback-focus="focusComposer" @close="closePopover">
         <ComposerSettings
           :models="models"
+          :permission-mode-options="permissionModeOptions"
           :composer-options="composerOptions"
           :git-state="gitState"
           :disabled="settingsDisabled"
           :show-permission-mode="showPermissionMode"
           @select-model="updateComposerOptions({ model: $event })"
           @select-reasoning="updateComposerOptions({ reasoningEffort: $event })"
-          @open-git="togglePopover('git')"
-        />
-      </ComposerPopover>
-
-      <ComposerPopover :open="activePopover === 'git'" title="Git 分支" @close="closePopover">
-        <GitBranchMenu
-          :git-state="gitState"
-          :disabled="settingsDisabled || !gitState.isGitRepo"
-          :busy="gitState.loading"
-          @select-branch="emit('switch-git-branch', $event)"
-          @create-branch="emit('create-git-branch', $event)"
+          @select-permission="updateComposerOptions({ permissionMode: $event })"
+          @refresh-git="emit('refresh-git')"
         />
       </ComposerPopover>
 
@@ -260,7 +267,7 @@ defineExpose({
         :value="draft"
         class="chat-composer-draft"
         rows="1"
-        :placeholder="isTouchDevice ? '给 Codex 发消息…' : 'Enter 发送，Shift + Enter 换行'"
+        :placeholder="allowFollowups && followupRunning ? '补充消息…' : isTouchDevice ? '给 Codex 发消息…' : 'Enter 发送，Shift + Enter 换行'"
         :disabled="inputLocked"
         :enterkeyhint="isTouchDevice ? 'enter' : 'send'"
         @input="handleInput"
@@ -276,42 +283,61 @@ defineExpose({
       />
 
       <div class="chat-composer-actions">
-        <!--
         <button
           class="chat-composer-icon-button"
           type="button"
-          aria-label="添加内容"
+          aria-label="添加图片"
+          title="添加图片"
           :disabled="addDisabled"
-          @click="togglePopover('add')"
+          @click="triggerInput(imageInputEl)"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 5v14M5 12h14"></path>
           </svg>
         </button>
-        -->
+        <button
+          v-if="isTouchDevice"
+          class="chat-composer-icon-button"
+          type="button"
+          aria-label="拍照"
+          title="拍照"
+          :disabled="addDisabled"
+          @click="triggerInput(captureInputEl)"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h3l2-3h4l2 3h3v13H5z"></path><circle cx="12" cy="13" r="3"></circle></svg>
+        </button>
 
         <button
           class="chat-composer-context-button"
           type="button"
+          aria-haspopup="dialog"
+          :aria-expanded="Boolean(activePopover)"
+          :aria-controls="activePopover === 'git' ? gitDialogId : settingsDialogId"
           :disabled="settingsDisabled"
           @click="togglePopover('settings')"
         >
           <span class="chat-composer-context-copy">{{ contextSummary }}</span>
         </button>
 
+        <ComposerSendActions v-if="allowFollowups" :running-task="followupRunning" :follow-up-mode="followUpMode"
+          :has-input="hasDraftInput" :can-interrupt="canInterrupt" :disabled="!canPrimaryAction" :fallback-focus="focusComposer"
+          :can-steer="canSteer" :interrupting="interrupting" @interrupt="emit('interrupt')"
+          @submit="handlePrimaryAction" />
         <button
+          v-else
           class="primary-button chat-composer-send"
           type="button"
-          aria-label="发送消息"
+          :aria-label="primaryActionLabel"
+          :title="primaryActionLabel"
           :disabled="!canPrimaryAction"
           @click="handlePrimaryAction"
         >
-          {{ primaryActionLabel }}
+          <span v-if="canInterrupt && !allowFollowups" class="chat-composer-stop" aria-hidden="true"></span>
+          <template v-else>发送</template>
         </button>
       </div>
     </form>
 
-    <!--
     <input
       ref="captureInputEl"
       class="chat-composer-hidden-input"
@@ -328,14 +354,6 @@ defineExpose({
       multiple
       @change="handleSelectedFiles($event, 'image', 'upload-image')"
     >
-    <input
-      ref="fileInputEl"
-      class="chat-composer-hidden-input"
-      type="file"
-      multiple
-      @change="handleSelectedFiles($event, 'file', 'upload-file')"
-    >
-    -->
   </div>
 </template>
 
@@ -462,6 +480,14 @@ defineExpose({
   padding: 0 18px;
   border-radius: 999px;
   touch-action: manipulation;
+}
+
+.chat-composer-stop {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  background: currentColor;
+  border-radius: 2px;
 }
 
 .chat-composer-hidden-input {

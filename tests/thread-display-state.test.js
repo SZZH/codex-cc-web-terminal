@@ -277,6 +277,32 @@ test("display state maps assistant image body blocks into image items", () => {
   assert.equal(snapshot.turns[0].items[2].text, "图已经生成好了");
 });
 
+test("display state maps assistant output_image variants into image items", () => {
+  const snapshot = buildDisplayedThreadSnapshot({
+    liveConversation: {
+      turns: [
+        {
+          id: "turn-assistant-output-image",
+          user: { text: "生成一张图" },
+          assistant: {
+            status: "completed",
+            body: [
+              { type: "output_image", image_url: "/tmp/generated.png", alt: "生成结果" },
+              { type: "markdown", text: "已完成" }
+            ]
+          }
+        }
+      ]
+    },
+    threadId: "thread-assistant-output-image"
+  });
+
+  assert.equal(snapshot.turns[0].items[1].kind, "ImageView");
+  assert.equal(snapshot.turns[0].items[1].payload.url, "/tmp/generated.png");
+  assert.equal(snapshot.turns[0].items[1].payload.alt, "生成结果");
+  assert.equal(snapshot.turns[0].items[2].text, "已完成");
+});
+
 test("display state maps live assistant process events into thread items for rendering", () => {
   const snapshot = buildDisplayedThreadSnapshot({
     liveConversation: {

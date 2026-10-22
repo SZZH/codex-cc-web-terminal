@@ -1,44 +1,103 @@
-export const AUTH_EXPIRED_EVENT = "codex-auth-expired";
+import { withReadDeadline } from "./api-read-deadline.js";
+import { readJsonWithProgress } from "./api-read-json.js";
+import { readSessionSidebarStream } from "./session-sidebar-stream.js";
 
-function notifyAuthExpired() {
-  if (typeof window === "undefined") {
+export const AUTH_EXPIRED_EVENT = "codex-auth-expired";
+let authenticationGeneration = 0;
+let initialHistoryCapability = false;
+
+export function supportsInitialHistory() { return initialHistoryCapability; }
+
+function rememberAuthCapabilities(payload, generation, authenticated) {
+  if (generation === authenticationGeneration) initialHistoryCapability = authenticated && payload?.capabilities?.initialHistory === 1;
+}
+
+function notifyAuthExpired(generation) {
+  if (generation === authenticationGeneration) initialHistoryCapability = false;
+  if (generation !== authenticationGeneration || typeof window === "undefined") {
     return;
   }
   window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
 }
 
+function httpError(response, payload) {
+  const error = new Error(payload?.error || response.statusText);
+  error.status = response.status;
+  if (typeof payload?.code === "string" && /^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(payload.code)) error.code = payload.code;
+  if (["not-applied", "applied", "unknown"].includes(payload?.executionState)) error.executionState = payload.executionState;
+  return error;
+}
+
 export async function request(url, options = {}, attempt = 0) {
+  const pathname = new URL(String(url), "http://localhost").pathname;
+  const isRead = String(options.method || "GET").toUpperCase() === "GET";
+  if (isRead && options.readContext) return requestWithAuth(url, options, attempt, pathname, options.readContext);
+  const isInitializationRead = isRead
+    && (pathname === "/api/config" || pathname === "/api/sessions" || pathname === "/api/session-catalog"
+      || /^\/api\/threads\/[^/]+\/[^/]+\/composer-state$/.test(pathname));
+  if (isInitializationRead) {
+    return withReadDeadline(options.signal, (read) => requestWithAuth(url, options, attempt, pathname, read),
+      ["/api/sessions", "/api/session-catalog"].includes(pathname) ? { totalTimeoutMs: 120000, idleTimeoutMs: 30000 } : undefined);
+  }
+  return requestWithAuth(url, options, attempt, pathname);
+}
+
+async function requestWithAuth(url, options, attempt, pathname, read) {
+  read?.assertActive();
+  const isAuthEndpoint = pathname === "/api/login" || pathname === "/api/logout";
+  if (isAuthEndpoint && String(options.method || "GET").toUpperCase() === "POST") {
+    authenticationGeneration += 1;
+    initialHistoryCapability = false;
+  }
+  const generation = authenticationGeneration;
+  const canRecoverAuth = !isAuthEndpoint;
+  const { onSidebarBootstrap, readContext: _readContext, ...fetchOptions } = options;
   const response = await fetch(url, {
-    ...options,
+    ...fetchOptions,
+    ...(read ? { signal: read.signal } : {}),
     credentials: "same-origin",
     headers: {
       ...(options.body ? { "Content-Type": "application/json" } : {}),
       ...(options.headers || {})
     }
   });
+  read?.assertActive();
+  read?.progress();
+  const readJson = () => read ? readJsonWithProgress(response, read) : response.json();
 
-  if (response.status === 401 && attempt === 0) {
-    const relogged = await retryLoginFromSavedToken();
+  if (response.status === 401 && canRecoverAuth && generation === authenticationGeneration && attempt === 0) {
+    const relogged = await retryLoginFromSavedToken(generation, read);
+    read?.assertActive();
     if (relogged) {
-      return request(url, options, attempt + 1);
+      return requestWithAuth(url, options, attempt + 1, pathname, read);
     }
   }
-  if (response.status === 401) {
-    notifyAuthExpired();
+  if (response.status === 401 && canRecoverAuth && !read) {
+    notifyAuthExpired(generation);
   }
 
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(payload.error || response.statusText);
+    const payload = await readJson().catch(() => ({ error: response.statusText }));
+    read?.assertActive();
+    if (response.status === 401 && canRecoverAuth && read) notifyAuthExpired(generation);
+    throw httpError(response, payload);
   }
 
-  return response.json();
+  const isSidebarStream = pathname === "/api/sessions" && String(options.method || "GET").toUpperCase() === "GET"
+    && response.headers?.get("Content-Type")?.split(";")[0].trim().toLowerCase() === "application/x-ndjson";
+  const payload = isSidebarStream
+    ? await readSessionSidebarStream(response, { ...read, onSidebarBootstrap })
+    : await readJson();
+  read?.assertActive();
+  if (pathname === "/api/login") rememberAuthCapabilities(payload, generation, payload?.ok === true);
+  return payload;
 }
 
 const TOKEN_STORAGE_KEY = "codex-web-terminal.saved-token";
 
-async function retryLoginFromSavedToken() {
-  if (typeof window === "undefined") {
+async function retryLoginFromSavedToken(generation, read) {
+  read?.assertActive();
+  if (generation !== authenticationGeneration || typeof window === "undefined") {
     return false;
   }
 
@@ -47,22 +106,32 @@ async function retryLoginFromSavedToken() {
     return false;
   }
 
+  initialHistoryCapability = false;
+
   const response = await fetch("/api/login", {
     method: "POST",
+    ...(read ? { signal: read.signal } : {}),
     credentials: "same-origin",
     headers: {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ token })
   });
+  read?.assertActive();
+  read?.progress();
 
-  return response.ok;
+  if (!response.ok || generation !== authenticationGeneration) return false;
+  const payload = await (read ? readJsonWithProgress(response, read) : response.json());
+  read?.assertActive();
+  rememberAuthCapabilities(payload, generation, payload?.ok === true);
+  return generation === authenticationGeneration;
 }
 
 export async function requestHistoryMessages(session, historyApiAvailable, attempt = 0) {
   if (!session?.resumeSessionId) {
     return null;
   }
+  const generation = authenticationGeneration;
 
   const params = new URLSearchParams({
     provider: session.provider,
@@ -73,14 +142,14 @@ export async function requestHistoryMessages(session, historyApiAvailable, attem
     credentials: "same-origin"
   });
 
-  if (response.status === 401 && attempt === 0) {
-    const relogged = await retryLoginFromSavedToken();
+  if (response.status === 401 && generation === authenticationGeneration && attempt === 0) {
+    const relogged = await retryLoginFromSavedToken(generation);
     if (relogged) {
       return requestHistoryMessages(session, historyApiAvailable, attempt + 1);
     }
   }
   if (response.status === 401) {
-    notifyAuthExpired();
+    notifyAuthExpired(generation);
   }
 
   if (response.status === 503 && attempt === 0) {
@@ -95,7 +164,7 @@ export async function requestHistoryMessages(session, historyApiAvailable, attem
 
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(payload.error || response.statusText);
+    throw httpError(response, payload);
   }
 
   historyApiAvailable.value = true;
@@ -111,9 +180,11 @@ export async function requestSessionById(sessionId) {
   return payload?.session || null;
 }
 
-export async function requestWorkspaceChanges(cwd) {
+export async function requestWorkspaceChanges(cwd, { summary = false, paths = [], signal } = {}) {
   const params = new URLSearchParams({ cwd: String(cwd || "") });
-  return request(`/api/workspace-changes?${params.toString()}`);
+  if (summary) params.set("summary", "1");
+  for (const path of paths) params.append("path", String(path));
+  return request(`/api/workspace-changes?${params.toString()}`, { ...(signal ? { signal } : {}) });
 }
 
 export async function requestWorkspaceGit(cwd) {
@@ -156,24 +227,58 @@ export async function reversePatchWorkspaceChanges(cwd, files = []) {
   });
 }
 
-export async function requestAuthSession(attempt = 0) {
-  const response = await fetch("/api/auth/session", {
-    credentials: "same-origin"
-  });
+export async function requestAuthSession(options = {}, attempt = 0) {
+  if (typeof options === "number") {
+    attempt = options;
+    options = {};
+  }
+  return withReadDeadline(options.signal, (read) => readAuthSession(attempt, read));
+}
 
-  if (response.status === 401 && attempt === 0) {
-    const relogged = await retryLoginFromSavedToken();
+async function readAuthSession(attempt, read) {
+  read.assertActive();
+  const generation = authenticationGeneration;
+  const response = await fetch("/api/auth/session", {
+    credentials: "same-origin",
+    signal: read.signal
+  });
+  read.assertActive();
+
+  if (response.status === 401 && generation === authenticationGeneration && attempt === 0) {
+    const relogged = await retryLoginFromSavedToken(generation, read);
+    read.assertActive();
     if (relogged) {
-      return requestAuthSession(attempt + 1);
+      return readAuthSession(attempt + 1, read);
     }
   }
 
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(payload.error || response.statusText);
+    read.assertActive();
+    throw httpError(response, payload);
   }
 
-  return response.json();
+  const payload = await response.json();
+  read.assertActive();
+  rememberAuthCapabilities(payload, generation, payload?.authenticated === true);
+  return payload;
+}
+
+// Only a failed new endpoint probes again; normal navigation uses the existing auth read.
+export async function recheckInitialHistorySupport(options = {}) {
+  const generation = authenticationGeneration;
+  let auth;
+  try { auth = await requestAuthSession(options); }
+  catch (error) {
+    if (error.status === 401) notifyAuthExpired(generation);
+    throw error;
+  }
+  if (generation !== authenticationGeneration) throw new DOMException("登录状态已变化。", "AbortError");
+  if (auth?.authenticated !== true) {
+    notifyAuthExpired(generation);
+    throw Object.assign(new Error("登录状态已失效，请重新登录。"), { status: 401 });
+  }
+  return supportsInitialHistory();
 }
 
 function parseSseEventBlocks(buffer) {
@@ -226,6 +331,7 @@ export async function requestSessionInputStream(sessionId, body, { onPayload, si
   if (!id) {
     throw new Error("Session id is required");
   }
+  const generation = authenticationGeneration;
 
   const response = await fetch(`/api/sessions/${encodeURIComponent(id)}/input-stream`, {
     method: "POST",
@@ -239,11 +345,11 @@ export async function requestSessionInputStream(sessionId, body, { onPayload, si
   });
 
   if (response.status === 401) {
-    notifyAuthExpired();
+    notifyAuthExpired(generation);
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(payload.error || response.statusText);
+    throw httpError(response, payload);
   }
   if (!response.body) {
     throw new Error("Streaming response body is unavailable");
@@ -298,6 +404,7 @@ export async function requestThreadInputStream(provider, threadId, body, { onPay
   if (!id) {
     throw new Error("Thread id is required");
   }
+  const generation = authenticationGeneration;
 
   const response = await fetch(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/input-stream`, {
     method: "POST",
@@ -311,11 +418,11 @@ export async function requestThreadInputStream(provider, threadId, body, { onPay
   });
 
   if (response.status === 401) {
-    notifyAuthExpired();
+    notifyAuthExpired(generation);
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(payload.error || response.statusText);
+    throw httpError(response, payload);
   }
   if (!response.body) {
     throw new Error("Streaming response body is unavailable");
@@ -371,7 +478,7 @@ export async function requestThreadComposerState(provider, threadId) {
   if (!id) {
     throw new Error("Thread id is required");
   }
-  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state`);
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state?git=0`);
 }
 
 export async function patchThreadComposerState(provider, threadId, patch = {}) {
@@ -380,7 +487,7 @@ export async function patchThreadComposerState(provider, threadId, patch = {}) {
   if (!id) {
     throw new Error("Thread id is required");
   }
-  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state`, {
+  return request(`/api/threads/${encodeURIComponent(providerId)}/${encodeURIComponent(id)}/composer-state?git=0`, {
     method: "PATCH",
     body: JSON.stringify(patch || {})
   });

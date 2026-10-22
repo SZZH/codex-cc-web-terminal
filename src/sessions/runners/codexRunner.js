@@ -1,8 +1,17 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import { buildEventPartFromItem } from "../history/historicalPayloads.js";
 import { extractAgentTextFromItem, extractTurnItems, isAgentMessageType, normalizeSymbolToken, nowIso } from "../shared/text.js";
-import { buildCodexPermissionArgs } from "../shared/composerOptions.js";
+import { assertPermissionModeSupported, buildCodexPermissionArgs } from "../shared/composerOptions.js";
+import { normalizeRunnerInput } from "../shared/imageAttachments.js";
+import {
+  beginRunnerTurn,
+  completeAppServerInterruption,
+  completeJsonExecInterruption,
+  isInterruptedTurn,
+  observeAppServerTurn,
+  settleRunnerTurn
+} from "../control/sessionInterrupt.js";
 
 const STDERR_NOISE_PATTERNS = [
   /codex_core_plugins?::manifest:/i,
@@ -11,6 +20,25 @@ const STDERR_NOISE_PATTERNS = [
   /maximum of 3 prompts is supported/i,
   /\[MODULE_TYPELESS_PACKAGE_JSON]/i
 ];
+
+const imageCliSupport = new Map();
+
+function extractOutputText(item) {
+  const text = extractAgentTextFromItem(item);
+  return text && typeof item?.text === "string" ? item.text : text;
+}
+
+function assertCliImageSupport(manager, session) {
+  const args = ["exec", ...(session.resumeSessionId ? ["resume"] : []), "--help"];
+  const key = JSON.stringify([manager.config.codexBin, args]);
+  if (!imageCliSupport.has(key)) {
+    const result = spawnSync(manager.config.codexBin, args, { encoding: "utf8", timeout: 5000, maxBuffer: 128 * 1024, windowsHide: true });
+    imageCliSupport.set(key, result.status === 0 && /--image\b/.test(String(result.stdout || "")));
+  }
+  if (!imageCliSupport.get(key)) {
+    throw new Error("Installed Codex CLI does not support image attachments in this exec mode. Upgrade Codex or enable app-server.");
+  }
+}
 
 function emitNoReplyFallback(manager, session, turnId = "") {
   if (!session || session.turnNoReplyNotified) {
@@ -56,13 +84,39 @@ function emitNoReplyFallback(manager, session, turnId = "") {
   }
 }
 
-function normalizeAppServerErrorMessage(error = {}) {
-  const primary = String(error?.message || "").trim();
-  const extra = String(error?.additionalDetails || "").trim();
-  if (primary && extra && !extra.includes(primary)) {
-    return `${primary} ${extra}`.trim();
+function nestedErrorMessage(value, depth = 0) {
+  if (depth > 5 || value == null) return "";
+  if (typeof value === "object") {
+    return nestedErrorMessage(value.error, depth + 1) || nestedErrorMessage(value.message, depth + 1);
   }
-  return primary || extra || "未知错误";
+  const text = String(value).trim();
+  try {
+    const start = text.indexOf("{");
+    const parsed = JSON.parse(start >= 0 ? text.slice(start) : text);
+    return typeof parsed === "object" ? nestedErrorMessage(parsed, depth + 1) : "";
+  } catch {
+    return text.startsWith("{") ? "" : text;
+  }
+}
+
+export function normalizeAppServerErrorMessage(error = {}) {
+  const primary = nestedErrorMessage(error?.message) || String(error?.message || "").trim();
+  const extra = String(error?.additionalDetails || "").trim();
+  const readableExtra = nestedErrorMessage(extra) || extra;
+  if (primary && readableExtra && !readableExtra.includes(primary)) {
+    return `${primary} ${readableExtra}`.trim();
+  }
+  return primary || readableExtra || nestedErrorMessage(error?.error) || "未知错误";
+}
+
+function normalizeExecutionError(error = {}) {
+  const rawMessage = String(error?.message || (typeof error === "string" ? error : "")).trim();
+  const message = normalizeAppServerErrorMessage(typeof error === "string" ? { message: error } : error);
+  return {
+    ...(error && typeof error === "object" ? error : {}),
+    message,
+    ...(rawMessage && rawMessage !== message ? { rawMessage } : {})
+  };
 }
 
 function normalizeTurnResultStatus(result = {}) {
@@ -160,9 +214,20 @@ function schedulePendingTurnCompletion(manager, session, params = {}, { status =
   if (!turnId) {
     return;
   }
+  const existingTurn = session.threadSnapshot?.turns?.find((turn) => String(turn.id) === turnId);
+  if (existingTurn && ["completed", "failed", "aborted", "interrupted"].includes(String(existingTurn.status))) {
+    return;
+  }
+  const failure = status === "failed" || error ? normalizeExecutionError(error || { message: "turn failed" }) : null;
+  if (completeAppServerInterruption(manager, session, { ...params, turnId, status, error })) {
+    return;
+  }
   clearPendingTurnCompletion(session);
   const completeTurn = () => {
     session.pendingTurnCompletion = null;
+    if (completeAppServerInterruption(manager, session, { ...params, turnId, status, error })) {
+      return;
+    }
     const completedAt = nowIso();
     session.updatedAt = completedAt;
     const knownExplicitTurn = !explicitTurnId || manager.hasConversationTurn?.(session, turnId);
@@ -176,7 +241,7 @@ function schedulePendingTurnCompletion(manager, session, params = {}, { status =
       broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
         type: status === "failed" || error ? "turn.failed" : "turn.completed",
         status: status === "failed" || error ? "failed" : "completed",
-        error: status === "failed" || error ? error || { message: "turn failed" } : null
+        error: failure
       });
       manager.scheduleConversationHistoryResync(session);
       manager.broadcast(session, { type: "session_updated", session: manager.serialize(session) });
@@ -185,16 +250,17 @@ function schedulePendingTurnCompletion(manager, session, params = {}, { status =
 
     if (completesActiveTurn) {
       session.turnRunning = false;
+      settleRunnerTurn(session, turnId, status === "failed" || error ? "failed" : "completed");
     }
     const finalizeOptions = explicitTurnId ? { turnId } : {};
     if (status === "failed" || error) {
       broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
         type: "turn.failed",
         status: "failed",
-        error: error || { message: "turn failed" }
+        error: failure
       });
-      emitAppServerError(manager, session, error || { message: "turn failed" }, completedAt);
-      manager.finalizeConversationTurn(session, "failed", completedAt, finalizeOptions);
+      emitAppServerError(manager, session, failure, completedAt);
+      manager.finalizeConversationTurn(session, "failed", completedAt, { ...finalizeOptions, error: failure });
     } else {
       const shouldEmitNoReplyFallback = !session.turnHadVisibleOutput;
       broadcastTypedTurnLifecycle(manager, session, { ...params, turnId }, {
@@ -294,9 +360,13 @@ function resolveAppServerTurnId(manager, session, params = {}) {
       const bound = manager.bindConversationTurnAlias?.(session, activePendingTurnId, serverTurnId, {
         source: "active-pending-turn"
       });
+      if (bound) {
+        observeAppServerTurn(manager, session, { turnId: serverTurnId });
+      }
       return bound ? { turnId: serverTurnId, clientTurnId: activePendingTurnId, aliasSource: "active-pending-turn" } : { turnId: "", clientTurnId: "", aliasSource: "" };
     }
   }
+  observeAppServerTurn(manager, session, { turnId: serverTurnId });
   return { turnId: serverTurnId, clientTurnId: "", aliasSource: "" };
 }
 
@@ -342,7 +412,7 @@ function broadcastTypedMessage(manager, session, params = {}, {
   phase = "completed"
 } = {}) {
   const { sessionId, threadId, turnId, ts } = buildTypedEventContext(session, params);
-  const normalizedText = String(text || "").trim();
+  const normalizedText = String(text ?? "");
   if (!sessionId || !threadId || !turnId || !normalizedText) {
     return false;
   }
@@ -366,7 +436,7 @@ function splitStreamingText(text = "", chunkSize = 80) {
   for (let index = 0; index < chars.length; index += size) {
     chunks.push(chars.slice(index, index + size).join(""));
   }
-  return chunks.filter((chunk) => chunk.trim());
+  return chunks.filter((chunk) => chunk.length);
 }
 
 function streamCompletedMessageAsDeltas(manager, session, params = {}, text = "") {
@@ -379,6 +449,7 @@ function streamCompletedMessageAsDeltas(manager, session, params = {}, text = ""
       type: "message_part",
       role: "assistant",
       part: { type: "text", text: chunk, format: "markdown" },
+      messageId: params?.itemId || params?.item_id || params?.item?.id || "",
       phase: "streaming",
       timestamp: nowIso()
     });
@@ -758,32 +829,29 @@ function buildJsonExecFailurePresentation(code, stderr = "") {
 }
 
 export function enqueueRunnerInput(manager, session, data) {
-  const text = String(data || "");
-  if (!text) {
+  const input = normalizeRunnerInput(data);
+  // A trailing newline is the legacy submit delimiter; all message lines stay in one turn.
+  const text = input.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n$/, "");
+  if (!text.trim() && !input.images.length) {
     return "";
   }
-  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = normalized
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (!lines.length) {
-    return "";
+  if (session.runnerMode === "json_exec") {
+    if (input.images.length) {
+      assertCliImageSupport(manager, session);
+    }
+    buildCodexJsonExecArgs(manager, session, text, input.images);
   }
 
   const queueLimit = Math.max(1, Number(manager.config.maxQueuedInputs) || 200);
-  if (session.queuedInputs.length + lines.length > queueLimit) {
+  if (session.queuedInputs.length >= queueLimit) {
     throw new Error(`当前会话待处理消息过多（上限 ${queueLimit}），请稍后重试。`);
   }
 
+  session.queuedInputs.push(input.images.length ? { text, images: input.images } : text);
   let lastTurnId = "";
-  for (const line of lines) {
-    session.queuedInputs.push(line);
-    if (session.provider === "codex") {
-      const turnId = manager.createConversationTurn(session, line, nowIso(), { activate: false });
-      session.queuedTurnIds.push(turnId);
-      lastTurnId = turnId;
-    }
+  if (session.provider === "codex") {
+    lastTurnId = manager.createConversationTurn(session, text, nowIso(), { activate: false, images: input.images });
+    session.queuedTurnIds.push(lastTurnId);
   }
   session.updatedAt = nowIso();
   if (session.runnerMode === "app_server") {
@@ -806,12 +874,19 @@ export async function startAppServerTurn(manager, session) {
     return;
   }
   session.turnRunning = true;
+  const control = beginRunnerTurn(session);
   session.turnHadVisibleOutput = false;
   session.turnNoReplyNotified = false;
   session.updatedAt = nowIso();
   manager.updateConversationTurnStatus(session, "running", session.updatedAt);
   try {
-    const result = await manager.appServerBridge.startTurn(session, prompt);
+    const input = normalizeRunnerInput(prompt);
+    const result = await manager.appServerBridge.startTurn(session, input.text, input.images);
+    if (control.settled || session.runnerTurnControl !== control) {
+      return;
+    }
+    const resultParams = result?.turn ? { turn: result.turn } : result || {};
+    resolveAppServerTurnId(manager, session, resultParams);
     const hadOutput = handleAppServerTurnResult(manager, session, result);
     const resultStatus = normalizeTurnResultStatus(result);
     const resultError = normalizeTurnResultError(result);
@@ -831,8 +906,12 @@ export async function startAppServerTurn(manager, session) {
       delayMs: hadOutput ? 0 : 1200
     });
   } catch (error) {
+    if (control.settled || session.runnerTurnControl !== control) {
+      return;
+    }
     session.turnRunning = false;
     session.updatedAt = nowIso();
+    settleRunnerTurn(session, session.currentTurnId || control.localTurnId, "failed");
     manager.broadcast(session, {
       type: "message_part",
       role: "system",
@@ -847,7 +926,7 @@ export async function startAppServerTurn(manager, session) {
       phase: "final",
       timestamp: nowIso()
     });
-    manager.finalizeConversationTurn(session, "failed", session.updatedAt);
+    manager.finalizeConversationTurn(session, "failed", session.updatedAt, { error: normalizeExecutionError(error) });
     manager.scheduleConversationHistoryResync(session);
     startAppServerTurn(manager, session);
   }
@@ -861,7 +940,7 @@ export function handleAppServerTurnResult(manager, session, result) {
   }
   let hadOutput = false;
   for (const item of items) {
-    const text = extractAgentTextFromItem(item);
+    const text = extractOutputText(item);
     if (!text) {
       const eventPart = buildEventPartFromItem(item);
       if (eventPart) {
@@ -904,27 +983,59 @@ export function handleAppServerTurnResult(manager, session, result) {
   return hadOutput;
 }
 
-export function buildCodexJsonExecArgs(manager, session, prompt) {
-  const args = ["exec"];
-  const isResume = Boolean(String(session.resumeSessionId || "").trim());
-  if (session.resumeSessionId) {
-    args.push("resume", "--all", session.resumeSessionId);
+function sessionCompatibleExtraArgs(extraArgs, model) {
+  const permissionFlags = ["--sandbox", "-s", "--ask-for-approval", "-a", "--approve-for-me", "--full-auto", "--dangerously-bypass-approvals-and-sandbox", "--yolo"];
+  const result = [];
+  for (let index = 0; index < extraArgs.length; index += 1) {
+    const argument = String(extraArgs[index]);
+    const permissionFlag = permissionFlags.find((flag) => argument === flag || argument.startsWith(`${flag}=`) || (flag.length === 2 && argument.startsWith(flag)));
+    const configValue = argument === "-c" || argument === "--config"
+      ? String(extraArgs[index + 1] || "")
+      : argument.startsWith("--config=") ? argument.slice(9) : argument.startsWith("-c") ? argument.slice(2) : "";
+    const configKey = configValue.split("=", 1)[0].trim().replace(/^["']|["']$/g, "");
+    if (permissionFlag || ["approval_policy", "sandbox_mode", "approvals_reviewer"].includes(configKey)) {
+      throw new Error(`Codex extra argument conflicts with the selected access permissions: ${argument}`);
+    }
+    if (configKey === "model_reasoning_effort") {
+      if (argument === "-c" || argument === "--config") {
+        index += 1;
+      }
+    } else if (model && (argument === "--model" || argument === "-m")) {
+      index += 1;
+    } else if (!(model && (argument.startsWith("--model=") || argument.startsWith("-m")))) {
+      result.push(argument);
+    }
   }
+  return result;
+}
+
+export function buildCodexJsonExecArgs(manager, session, prompt, images = []) {
+  assertPermissionModeSupported(session.permissionMode, { runnerMode: "json_exec" });
+  const input = normalizeRunnerInput(prompt, images);
+  const args = [...buildCodexPermissionArgs(session.permissionMode || "default"), "exec"];
   args.push("--json", "--skip-git-repo-check");
-  const model = String(session.model || "").trim();
-  if (model) {
-    args.push("--model", model);
-  }
   if (manager.config.codexProfile) {
     args.push("--profile", manager.config.codexProfile);
   }
-  if (!isResume) {
-    args.push(...buildCodexPermissionArgs(session.permissionMode || "default", manager.config));
+  const model = String(session.model || "").trim();
+  args.push(...sessionCompatibleExtraArgs(manager.config.codexExtraArgs || [], model));
+  if (model) {
+    args.push("--model", model);
   }
-  if (Array.isArray(manager.config.codexExtraArgs) && manager.config.codexExtraArgs.length > 0) {
-    args.push(...manager.config.codexExtraArgs);
+  const effort = String(session.reasoningEffort || "").trim();
+  if (effort) {
+    args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
   }
-  args.push(prompt);
+  if (String(session.resumeSessionId || "").trim()) {
+    args.push("resume", "--all", session.resumeSessionId);
+  }
+  for (const image of input.images) {
+    args.push("--image", image.path);
+  }
+  if (input.images.length || input.text.startsWith("-")) {
+    args.push("--");
+  }
+  args.push(input.text);
   return args;
 }
 
@@ -949,7 +1060,7 @@ export function handleCodexJsonEvent(manager, session, event) {
   }
   if (event.type === "item.completed") {
     const item = event.item || {};
-    const text = extractAgentTextFromItem(item);
+    const text = extractOutputText(item);
     if (!text) {
       const eventPart = buildEventPartFromItem(item);
       if (eventPart) {
@@ -986,10 +1097,12 @@ export function handleCodexJsonEvent(manager, session, event) {
 }
 
 export function startJsonExecRun(manager, session) {
-  if (!session || session.runnerMode !== "json_exec" || session.runningProcess) {
+  if (!session || session.runnerMode !== "json_exec" || session.turnRunning || session.runningProcess) {
     return;
   }
-  const prompt = session.queuedInputs.shift();
+  const prompt = session.queuedInputs[0];
+  const args = prompt ? buildCodexJsonExecArgs(manager, session, prompt) : null;
+  session.queuedInputs.shift();
   session.currentTurnId = session.queuedTurnIds.shift() || session.currentTurnId || "";
   session.activePendingTurnId = session.currentTurnId || "";
   if (!prompt) {
@@ -997,7 +1110,9 @@ export function startJsonExecRun(manager, session) {
     return;
   }
 
-  const args = buildCodexJsonExecArgs(manager, session, prompt);
+  const control = beginRunnerTurn(session);
+  session.turnRunning = true;
+
   const child = spawn(manager.config.codexBin, args, {
     cwd: session.cwd,
     env: process.env,
@@ -1015,12 +1130,18 @@ export function startJsonExecRun(manager, session) {
   let stderrBuffer = "";
   let emittedAssistant = false;
   const parseLine = (line) => {
+    if (control.settled || session.runningProcess !== child || session.runnerTurnControl !== control) {
+      return;
+    }
     const trimmed = String(line || "").trim();
     if (!trimmed) {
       return;
     }
     try {
       const event = JSON.parse(trimmed);
+      if (control.interruptRequested && event.type !== "thread.started") {
+        return;
+      }
       if (handleCodexJsonEvent(manager, session, event)) {
         emittedAssistant = true;
       }
@@ -1046,11 +1167,19 @@ export function startJsonExecRun(manager, session) {
   });
 
   child.on("close", (code) => {
+    if (session.runningProcess !== child) {
+      return;
+    }
     if (stdoutBuffer.trim()) {
       parseLine(stdoutBuffer.trim());
     }
     session.runningProcess = null;
     session.updatedAt = nowIso();
+    if (completeJsonExecInterruption(manager, session, child, control)) {
+      return;
+    }
+    session.turnRunning = false;
+    settleRunnerTurn(session, session.currentTurnId || control.localTurnId, code && code !== 0 ? "failed" : "completed");
     if (code && code !== 0) {
       const failure = buildJsonExecFailurePresentation(code, stderrBuffer);
       manager.broadcast(session, {
@@ -1072,7 +1201,7 @@ export function startJsonExecRun(manager, session) {
         phase: "final",
         timestamp: nowIso()
       });
-      manager.finalizeConversationTurn(session, "failed", session.updatedAt);
+      manager.finalizeConversationTurn(session, "failed", session.updatedAt, { error: { ...failure.payload, message: failure.text } });
       manager.scheduleConversationHistoryResync(session);
     } else if (!emittedAssistant) {
       const concise = summarizeRelevantStderr(stderrBuffer);
@@ -1119,6 +1248,12 @@ export function handleAppServerNotification(manager, msg) {
   }
 
   for (const session of targets) {
+    if (isInterruptedTurn(session, params)) {
+      if (method === "turn/completed" || normalizedMethod === "turncompleted") {
+        completeAppServerInterruption(manager, session, params);
+      }
+      continue;
+    }
     session.updatedAt = nowIso();
     if (!(method === "turn/completed" || normalizedMethod === "turncompleted")) {
       extendPendingTurnCompletion(manager, session, params);
@@ -1141,7 +1276,7 @@ export function handleAppServerNotification(manager, msg) {
     }
     if (directEvent?.type === "message.completed") {
       const item = params?.item || directEvent.payload || {};
-      const text = extractAgentTextFromItem(item) || String(directEvent.payload?.text || directEvent.summary || "").trim();
+      const text = extractOutputText(item) || String(directEvent.payload?.text || directEvent.summary || "");
       const streamedCompletion = !session.turnHadVisibleOutput && text
         ? streamCompletedMessageAsDeltas(manager, session, params, text)
         : false;
@@ -1191,7 +1326,7 @@ export function handleAppServerNotification(manager, msg) {
     }
     if (method === "item/agentMessage/delta" || normalizedMethod === "itemagentmessagedelta") {
       const delta = String(params?.delta || "");
-      if (!delta.trim()) {
+      if (!delta.length) {
         continue;
       }
       const itemId = String(params?.itemId || params?.item_id || "").trim();
@@ -1222,6 +1357,7 @@ export function handleAppServerNotification(manager, msg) {
           type: "message_part",
           role: "assistant",
           part: { type: "text", text: delta, format: "markdown" },
+          messageId: itemId,
           phase: "streaming",
           timestamp: nowIso()
         });
@@ -1243,7 +1379,7 @@ export function handleAppServerNotification(manager, msg) {
       if (!isAgentMessageType(item?.type) && normalizeSymbolToken(item?.type) !== "functioncalloutput") {
         continue;
       }
-      const text = extractAgentTextFromItem(item) || summarizeRawNotificationPayload(item);
+      const text = extractOutputText(item) || summarizeRawNotificationPayload(item);
       if (!text) {
         const eventPart = buildEventPartFromItem(item);
         if (eventPart) {

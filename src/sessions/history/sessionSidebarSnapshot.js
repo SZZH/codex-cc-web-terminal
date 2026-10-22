@@ -1,6 +1,5 @@
 import path from "node:path";
-
-const SIDEBAR_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+import { isVisibleSidebarSession } from "./codexDesktopSidebar.js";
 
 function normalizeComparablePath(value) {
   const text = String(value || "").trim();
@@ -36,23 +35,9 @@ export function byUpdatedAtDesc(left, right) {
   return String(right?.updatedAt || "").localeCompare(String(left?.updatedAt || ""));
 }
 
-function isRecentEnough(session, nowMs = Date.now()) {
-  const updatedAtMs = Date.parse(String(session?.updatedAt || "").trim());
-  if (!Number.isFinite(updatedAtMs)) {
-    return false;
-  }
-  return nowMs - updatedAtMs <= SIDEBAR_SESSION_MAX_AGE_MS;
-}
-
-export function filterSidebarSessionsByRecency(sessions = [], { nowMs = Date.now() } = {}) {
-  return (Array.isArray(sessions) ? sessions : []).filter((session) => {
-    const kind = String(session?.kind || "").trim().toLowerCase();
-    const status = String(session?.status || "").trim().toLowerCase();
-    if (kind === "archived" || status === "archived" || session?.archived || session?.archivedAt) {
-      return false;
-    }
-    return isRecentEnough(session, nowMs);
-  });
+export function filterSidebarSessionsByRecency(sessions = []) {
+  // Preserve the public helper name; Codex does not hide older unarchived threads.
+  return (Array.isArray(sessions) ? sessions : []).filter(isVisibleSidebarSession);
 }
 
 function dedupeSessionsByIdentity(sessions = []) {
@@ -97,7 +82,7 @@ export function mergeProjectGroupsWithLiveSessions(baseGroups = [], liveSessions
     group.sessions = dedupeSessionsByIdentity(filterSidebarSessionsByRecency(group.sessions));
   }
 
-  return groups.sort((left, right) => byUpdatedAtDesc(left?.sessions?.[0], right?.sessions?.[0]));
+  return groups;
 }
 
 export function buildSidebarSnapshotFromGroups(sessions = [], projectGroups = []) {

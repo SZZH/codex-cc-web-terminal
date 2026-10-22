@@ -109,7 +109,9 @@ test("conversation delta payload emits versioned delta entries", () => {
   assert.equal(payload.fromVersion, 1);
   assert.equal(payload.toVersion, 2);
   assert.equal(payload.continuation.threadId, "thread-1");
-  assert.equal(payload.thread.continuation.sessionId, "session-1");
+  assert.equal(payload.continuation.sessionId, "session-1");
+  assert.equal(Object.hasOwn(payload, "thread"), false);
+  assert.equal(Object.hasOwn(payload, "threadSnapshot"), false);
   assert.equal(payload.deltas.length, 1);
   assert.equal(payload.deltas[0].version, 2);
 });

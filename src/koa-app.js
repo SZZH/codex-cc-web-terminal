@@ -3,14 +3,18 @@ import path from "node:path";
 import Koa from "koa";
 
 import { handleAuthRoute } from "./routes/auth.js";
+import { handleAttachmentRoute } from "./routes/attachments.js";
+import { handleCodexV2Route } from "./routes/codexV2.js";
 import { handleConfigRoute } from "./routes/config.js";
 import { handleHistoryRoute } from "./routes/history.js";
 import { handleSessionRoute } from "./routes/sessions.js";
+import { handleSessionCatalogRoute } from "./routes/sessionCatalog.js";
 import { handleWorkspaceChangesRoute } from "./routes/workspaceChanges.js";
+import { handlePreviewRoute } from "./routes/previews.js";
 import { createRuntime } from "./runtime/createRuntime.js";
 
-export function createKoaApp({ config, sessionManager }) {
-  const runtime = createRuntime({ config, sessionManager });
+export function createKoaApp({ config, sessionManager, codexThreads = null }) {
+  const runtime = createRuntime({ config, sessionManager, codexThreads });
 
   const app = new Koa();
   app.use(async (ctx, next) => {
@@ -48,25 +52,22 @@ export function createKoaApp({ config, sessionManager }) {
       return;
     }
 
-    if (ctx.method === "GET" && !ctx.path.startsWith("/api/")) {
+    const isApiPath = ctx.path === "/api" || ctx.path.startsWith("/api/");
+    if (["GET", "HEAD"].includes(ctx.method) && !isApiPath) {
       if (runtime.routeVendor(ctx, ctx.path)) {
         return;
       }
       if (runtime.tryServeFrontendAsset(ctx, ctx.path)) {
         return;
       }
-      if (!path.extname(ctx.path)) {
+      const isAssetPath = ["/assets", "/vendor"].some((prefix) => ctx.path === prefix || ctx.path.startsWith(`${prefix}/`));
+      if (!isAssetPath && !path.extname(ctx.path)) {
         runtime.serveFrontendIndex(ctx);
         return;
       }
     }
 
-    if (ctx.path === "/") {
-      runtime.serveFrontendIndex(ctx);
-      return;
-    }
-
-    const handled = [handleAuthRoute, handleConfigRoute, handleHistoryRoute, handleSessionRoute, handleWorkspaceChangesRoute];
+    const handled = [handleAuthRoute, handleAttachmentRoute, handlePreviewRoute, handleConfigRoute, handleCodexV2Route, handleHistoryRoute, handleSessionCatalogRoute, handleSessionRoute, handleWorkspaceChangesRoute];
     for (const route of handled) {
       if (await route(ctx, runtime)) {
         return;
@@ -75,6 +76,7 @@ export function createKoaApp({ config, sessionManager }) {
 
     await next();
     if (ctx.body == null && ctx.status === 404) {
+      ctx.status = 404;
       ctx.body = "Not found";
     }
   });

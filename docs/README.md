@@ -1,6 +1,6 @@
 # Docs Index
 
-Last updated: 2026-04-21
+Last updated: 2026-10-16
 
 ## Purpose
 
@@ -43,13 +43,17 @@ docs/
 
 ## Current Documents
 
-- [Documentation Standards](/workspace/codex-cc-web-terminal/docs/contributing/documentation-standards.md)
-- [Document Templates](/workspace/codex-cc-web-terminal/docs/contributing/document-templates.md)
-- [Change Scope Rules](/workspace/codex-cc-web-terminal/docs/contributing/change-scope-rules.md)
-- [Verification Matrix](/workspace/codex-cc-web-terminal/docs/contributing/verification-matrix.md)
-- [Sync Checklists](/workspace/codex-cc-web-terminal/docs/contributing/sync-checklists.md)
-- [Regression Plan](/workspace/codex-cc-web-terminal/docs/testing/regression-plan.md)
-- [Codex Thread / Turn / Item Bridge Refactor](/workspace/codex-cc-web-terminal/docs/refactoring/codex-thread-item-bridge-refactor.md)
+- [Codex V2 聊天契约（当前主链路）](refactoring/codex-chat-v2.md)
+- [Codex 桌面兼容边界](architecture/codex-desktop-compatibility.md)
+- [本地文件与网页预览运维](operations/local-preview.md)
+- [公网前端静态发布与回退](operations/frontend-release.md)
+- [Documentation Standards](contributing/documentation-standards.md)
+- [Document Templates](contributing/document-templates.md)
+- [Change Scope Rules](contributing/change-scope-rules.md)
+- [Verification Matrix](contributing/verification-matrix.md)
+- [Sync Checklists](contributing/sync-checklists.md)
+- [Regression Plan](testing/regression-plan.md)
+- [旧 Thread / Turn / Item Bridge 方案（superseded，历史参考）](refactoring/codex-thread-item-bridge-refactor.md)
 
 ## Placement Quick Rules
 

@@ -2,26 +2,27 @@
 import { computed } from "vue";
 import {
   PERMISSION_MODE_OPTIONS,
-  REASONING_EFFORT_OPTIONS
+  getModelReasoningEffortOptions
 } from "../../lib/composer.js";
 
 const props = defineProps({
   models: { type: Array, default: () => [] },
+  permissionModeOptions: { type: Array, default: () => PERMISSION_MODE_OPTIONS },
   composerOptions: { type: Object, required: true },
   gitState: { type: Object, required: true },
   disabled: Boolean,
   showPermissionMode: Boolean
 });
 
-const activePermissionOption = computed(() =>
-  PERMISSION_MODE_OPTIONS.find((option) => option.value === props.composerOptions.permissionMode) ||
-  PERMISSION_MODE_OPTIONS[0]
+const reasoningOptions = computed(() =>
+  getModelReasoningEffortOptions(props.models, props.composerOptions.model)
 );
 
 defineEmits([
   "select-model",
   "select-reasoning",
-  "open-git"
+  "select-permission",
+  "refresh-git"
 ]);
 </script>
 
@@ -35,6 +36,7 @@ defineEmits([
           :key="model.value"
           class="option-chip"
           :class="{ active: composerOptions.model === model.value }"
+          :aria-pressed="composerOptions.model === model.value"
           type="button"
           :disabled="disabled"
           @click="$emit('select-model', model.value)"
@@ -45,14 +47,15 @@ defineEmits([
       </div>
     </section>
 
-    <section class="settings-group">
+    <section v-if="reasoningOptions.length" class="settings-group">
       <header class="settings-heading">思考强度</header>
       <div class="chip-row">
         <button
-          v-for="option in REASONING_EFFORT_OPTIONS"
+          v-for="option in reasoningOptions"
           :key="option.value"
           class="option-chip"
           :class="{ active: composerOptions.reasoningEffort === option.value }"
+          :aria-pressed="composerOptions.reasoningEffort === option.value"
           type="button"
           :disabled="disabled"
           @click="$emit('select-reasoning', option.value)"
@@ -64,20 +67,26 @@ defineEmits([
 
     <section v-if="showPermissionMode" class="settings-group">
       <header class="settings-heading">Codex 权限</header>
-      <div class="permission-display" aria-live="polite">
-        <span class="permission-display-label">当前权限</span>
-        <span class="permission-display-value">{{ activePermissionOption.label }}</span>
-        <span class="permission-display-desc">{{ activePermissionOption.description }}</span>
+      <div class="chip-row">
+        <button
+          v-for="option in permissionModeOptions"
+          :key="option.value"
+          class="option-chip permission-option"
+          :class="{ active: composerOptions.permissionMode === option.value }"
+          :aria-pressed="composerOptions.permissionMode === option.value"
+          :title="option.description"
+          type="button"
+          :disabled="disabled"
+          @click="$emit('select-permission', option.value)"
+        >
+          {{ option.label }}
+        </button>
       </div>
     </section>
 
     <section class="settings-group git-entry-wrap">
-      <button
-        class="git-entry"
-        type="button"
-        :disabled="disabled || !gitState.available || !gitState.isGitRepo"
-        @click="$emit('open-git')"
-      >
+      <div class="git-entry-row">
+      <div class="git-entry">
         <span class="git-copy">
           <span class="settings-heading">Git 分支</span>
           <span class="git-desc">
@@ -85,12 +94,22 @@ defineEmits([
               !gitState.available
                 ? "Git 状态暂不可用"
                 : gitState.isGitRepo
-                  ? (gitState.currentBranch || composerOptions.gitBranch || "未选择分支")
+                  ? (gitState.currentBranch || "分离 HEAD")
                   : "当前目录不是 Git 仓库"
             }}
           </span>
         </span>
-      </button>
+      </div>
+      <button
+        class="git-refresh"
+        type="button"
+        title="刷新 Git 状态"
+        aria-label="刷新 Git 状态"
+        :disabled="disabled || gitState.loading"
+        @click="$emit('refresh-git')"
+      >&#x21bb;</button>
+      </div>
+      <p v-if="gitState.error" class="git-error" role="status">{{ gitState.error }}</p>
     </section>
   </div>
 </template>
@@ -143,8 +162,37 @@ defineEmits([
   color: #3d342d;
 }
 
-.permission-display,
+.git-entry-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.git-refresh {
+  flex: 0 0 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 1px solid rgba(221, 211, 201, 0.95);
+  border-radius: 8px;
+  background: rgba(250, 245, 239, 0.88);
+  color: #60534a;
+  font-size: 24px;
+  cursor: pointer;
+}
+
+.git-error {
+  margin: 0;
+  max-height: 96px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  color: #9b4537;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .git-entry {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -171,26 +219,14 @@ defineEmits([
   gap: 3px;
 }
 
-.permission-display-label {
-  font-size: 12px;
-  line-height: 1.35;
-  color: #8a7b6f;
-}
-
-.permission-display-value,
 .git-desc {
   font-size: 14px;
   line-height: 1.35;
   color: #3f342d;
+  overflow-wrap: anywhere;
 }
 
-.permission-display-desc {
-  font-size: 12px;
-  line-height: 1.45;
-  color: #8a7b6f;
-}
-
-.git-entry:disabled {
+.git-refresh:disabled {
   opacity: 0.5;
   cursor: default;
 }

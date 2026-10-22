@@ -17,6 +17,13 @@ export function installAuthSessionRuntime(runtime) {
 
   runtime.loadAuthSessions = () => {
     try {
+      fs.chmodSync(authSessionsPath, 0o600);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    try {
       const payload = JSON.parse(fs.readFileSync(authSessionsPath, "utf8"));
       runtime.authSessions.clear();
       for (const [id, session] of Object.entries(payload || {})) {
@@ -32,13 +39,35 @@ export function installAuthSessionRuntime(runtime) {
   };
 
   runtime.saveAuthSessions = () => {
-    fs.mkdirSync(runtime.config.dataDir, { recursive: true });
+    fs.mkdirSync(runtime.config.dataDir, { recursive: true, mode: 0o700 });
     const payload = Object.fromEntries(
       [...runtime.authSessions.entries()]
         .sort((left, right) => left[0].localeCompare(right[0]))
         .map(([id, session]) => [id, serializeAuthSession(session)])
     );
-    fs.writeFileSync(authSessionsPath, JSON.stringify(payload, null, 2), "utf8");
+    const temporaryPath = `${authSessionsPath}.${crypto.randomUUID()}.tmp`;
+    let temporaryCreated = false;
+    try {
+      const fd = fs.openSync(temporaryPath, "wx", 0o600);
+      temporaryCreated = true;
+      try {
+        if (process.platform === "win32") {
+          fs.chmodSync(temporaryPath, 0o600);
+        } else {
+          fs.fchmodSync(fd, 0o600);
+        }
+        fs.writeFileSync(fd, JSON.stringify(payload, null, 2), "utf8");
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(temporaryPath, authSessionsPath);
+    } catch (error) {
+      if (temporaryCreated) {
+        fs.rmSync(temporaryPath, { force: true });
+      }
+      throw error;
+    }
   };
 
   runtime.loadAuthSessions();

@@ -61,7 +61,7 @@ function mapConversationTurnToThreadTurn(turn = {}) {
   };
   if (userText || userPayload.content.length || userPayload.images.length || userPayload.local_images.length) {
     orderedItems.push({
-      id: `${turn.id || "turn"}-user`,
+      id: String(turn.user?.id || `${turn.id || "turn"}-user`),
       kind: "UserMessage",
       text: userText,
       status: "completed",
@@ -76,17 +76,22 @@ function mapConversationTurnToThreadTurn(turn = {}) {
   }
 
   const assistantBody = Array.isArray(turn?.assistant?.body) ? turn.assistant.body : [];
-  let assistantText = "";
   let assistantTextIndex = 0;
   for (const block of assistantBody) {
-    const blockKind = String(block?.kind || "markdown").trim().toLowerCase();
-    if (blockKind === "image" && String(block?.payload?.url || "").trim()) {
+    const blockKind = String(block?.kind || block?.type || "markdown").trim().toLowerCase();
+    const imagePayload = block?.payload && typeof block.payload === "object" ? block.payload : block;
+    const imageUrl = String(imagePayload?.url || imagePayload?.image_url || imagePayload?.path || "").trim();
+    if (["image", "output_image", "outputimage", "local_image", "localimage", "input_image", "inputimage"].includes(blockKind) && imageUrl) {
       orderedItems.push({
         id: String(block?.id || `${turn.id || "turn"}-assistant-image-${orderedItems.length}`),
         kind: "ImageView",
         status: String(turn?.assistant?.status || "completed"),
-        payload: JSON.parse(JSON.stringify(block?.payload || {})),
-        summary: String(block?.payload?.alt || "image"),
+        payload: {
+          ...JSON.parse(JSON.stringify(imagePayload)),
+          url: imageUrl,
+          alt: String(imagePayload?.alt || imagePayload?.name || "image").trim() || "image"
+        },
+        summary: String(imagePayload?.alt || imagePayload?.name || "image"),
         timestamp: String(block?.ts || "").trim()
       });
       continue;
@@ -95,20 +100,17 @@ function mapConversationTurnToThreadTurn(turn = {}) {
     if (!text) {
       continue;
     }
-    assistantText = assistantText ? `${assistantText}\n\n${text}` : text;
     assistantTextIndex += 1;
-  }
-  if (assistantText) {
     orderedItems.push({
-      id: `${turn.id || "turn"}-assistant-${assistantTextIndex || "body"}`,
+      id: String(block.id || `${turn.id || "turn"}-assistant-${assistantTextIndex}`),
       kind: "AgentMessage",
-      text: assistantText,
+      text,
       status: String(turn?.assistant?.status || "completed"),
-      timestamp: String(assistantBody[assistantBody.length - 1]?.ts || "").trim()
+      timestamp: String(block.ts || "").trim()
     });
   }
 
-  const items = orderedItems
+  const items = mergeTurnItems([], orderedItems)
     .map((item, index) => ({ ...item, __index: index, __ts: parseItemTimestamp(item) }))
     .sort((left, right) => {
       if (left.__ts && right.__ts && left.__ts !== right.__ts) {
@@ -164,6 +166,11 @@ function timestampsClose(left, right, toleranceMs = 10_000) {
 }
 
 function areEquivalentTurns(existingTurn = {}, incomingTurn = {}) {
+  const existingId = String(existingTurn.id || "");
+  const incomingId = String(incomingTurn.id || "");
+  if (existingId && existingId === incomingId) return true;
+  const isGeneratedId = (id) => /^(?:history-turn-\d+|turn[:_-]\d+|runtime-draft:.+|(?:synthetic|legacy|local)-turn:.+|live-shell(?:[:_-].*)?|.+-turn-\d{13}-\d+-[a-f0-9]{8})$/.test(id);
+  if (!isGeneratedId(existingId) && !isGeneratedId(incomingId)) return false;
   const existingUserText = extractTurnUserText(existingTurn);
   const incomingUserText = extractTurnUserText(incomingTurn);
   if (!existingUserText || !incomingUserText || existingUserText !== incomingUserText) {
@@ -207,14 +214,58 @@ function turnStatusRank(value) {
   return 1;
 }
 
+function isSyntheticItem(item = {}) {
+  return /^(?:historymsg[_:]|live(?:message|overlay|image)[_:]|agent-message:|user-message:|message[-:]|overlay[-:])|-(?:assistant-\d+|user)$/i.test(String(item.id || ""));
+}
+
+function imageIdentity(value) {
+  let source = String(value || "").trim();
+  if (!source) return "";
+  try {
+    const parsed = new URL(source, "http://history.local");
+    if (parsed.pathname === "/api/local-file-image" && parsed.searchParams.has("path")) source = parsed.searchParams.get("path");
+    else if (parsed.protocol === "file:") source = decodeURIComponent(parsed.pathname);
+    else if (/^https?:|^data:/.test(source)) return parsed.href;
+  } catch { /* Keep local paths as opaque image references. */ }
+  const normalized = [];
+  for (const segment of source.replaceAll("\\", "/").split("/")) {
+    if (segment === ".") continue;
+    if (segment === ".." && normalized.length && normalized.at(-1) !== "..") normalized.pop();
+    else normalized.push(segment);
+  }
+  return normalized.join("/");
+}
+
+function imageKeys(item = {}) {
+  const payload = item.payload || {};
+  const images = [...(payload.content || []), ...(payload.images || []), ...(payload.local_images || [])];
+  if (/image/i.test(item.kind || "")) images.push(payload);
+  return [...new Set(images.filter((part) => /image/i.test(String(part.type || "")) || part.url || part.image_url || part.path)
+    .map((part) => imageIdentity(part.image_url || part.url || part.path)).filter(Boolean))].sort();
+}
+
+function areEquivalentItems(existing = {}, incoming = {}) {
+  if (existing.kind !== incoming.kind) return false;
+  const left = String(existing.text || "").trim();
+  const right = String(incoming.text || "").trim();
+  if (existing.kind === "UserMessage" || /image/i.test(existing.kind || "")) {
+    if (existing.kind !== "UserMessage" && !isSyntheticItem(existing) && !isSyntheticItem(incoming)) return false;
+    const images = imageKeys(existing);
+    return left === right && (left || images.length) && JSON.stringify(images) === JSON.stringify(imageKeys(incoming));
+  }
+  if (!isSyntheticItem(existing) && !isSyntheticItem(incoming)) return false;
+  return Boolean(left && right && (left === right || left.startsWith(right) || right.startsWith(left)));
+}
+
 function mergeTurnItems(existingItems = [], incomingItems = []) {
-  const nextItems = [...(Array.isArray(existingItems) ? existingItems : [])];
-  for (const incoming of Array.isArray(incomingItems) ? incomingItems : []) {
+  const nextItems = [];
+  for (const incoming of [...existingItems, ...incomingItems]) {
     const kind = String(incoming?.kind || "").trim();
     if (!kind) {
       continue;
     }
-    const existingIndex = nextItems.findIndex((item) => String(item?.kind || "").trim() === kind);
+    let existingIndex = nextItems.findIndex((item) => item.id && item.id === incoming.id);
+    if (existingIndex < 0) existingIndex = nextItems.findIndex((item) => areEquivalentItems(item, incoming));
     if (existingIndex < 0) {
       nextItems.push(incoming);
       continue;
@@ -226,7 +277,7 @@ function mergeTurnItems(existingItems = [], incomingItems = []) {
     nextItems[existingIndex] = {
       ...existing,
       ...(shouldReplaceText ? incoming : {}),
-      id: String(existing?.id || incoming?.id || ""),
+      id: String(isSyntheticItem(existing) && !isSyntheticItem(incoming) ? incoming.id : existing?.id || incoming?.id || ""),
       kind: existing?.kind || incoming?.kind,
       text: shouldReplaceText ? incomingText || existingText : existingText || incomingText,
       status: turnStatusRank(incoming?.status) > turnStatusRank(existing?.status) ? incoming?.status : existing?.status,

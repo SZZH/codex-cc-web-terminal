@@ -10,9 +10,12 @@ export function createLiveSessionRuntimeController({
   threadRuntime,
   liveBootstrapLinePatterns,
   decorateSession,
-  stopHistorySyncLoop
+  stopHistorySyncLoop,
+  refreshSessions,
+  onSocketUnavailable
 } = {}) {
   let replaySuppressionLines = new Set();
+  let socketSessionId = "";
 
   function clearPendingReplyStatus() {
     if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
@@ -486,7 +489,7 @@ export function createLiveSessionRuntimeController({
     }
 
     if (payload.type === "transport.error") {
-      const errorText = String(payload.error || "会话发生未知错误。").trim();
+      const errorText = String(payload.message || payload.error?.message || payload.error || "会话发生未知错误。").trim();
       clearPendingReplyStatus();
       appendNormalizedParts(
         [
@@ -587,6 +590,7 @@ export function createLiveSessionRuntimeController({
 
     if (payload.type === "session_updated" && payload.session) {
       const updated = decorateSession(payload.session);
+      if (state.liveView.liveSessionId && updated.id !== state.liveView.liveSessionId) return;
       state.liveView.sessionMeta = updated;
       if (state.liveView.sessionId === updated.id) {
         state.liveView.liveSessionId = updated.id;
@@ -599,12 +603,18 @@ export function createLiveSessionRuntimeController({
           id: state.threadView.sessionId || `history:${updated.provider}:${updated.resumeSessionId}`
         };
       }
+      if (!state.threadView.threadId && updated.resumeSessionId) {
+        state.threadView.threadId = String(updated.resumeSessionId).trim();
+        state.threadView.sessionId = `history:${updated.provider}:${updated.resumeSessionId}`;
+        state.threadView.meta = { ...updated, kind: "thread", id: state.threadView.sessionId };
+      }
       const index = state.sessions.findIndex((item) => item.id === updated.id);
       if (index >= 0) {
         const next = [...state.sessions];
         next[index] = updated;
         state.sessions = next;
       }
+      refreshSessions?.()?.catch(() => {});
       return;
     }
 
@@ -648,6 +658,9 @@ export function createLiveSessionRuntimeController({
   }
 
   function attachLiveSocket(sessionId, { closeSocket, resolveWsUrl, detectSystemFailureText, isDisposableAssistantFragment } = {}) {
+    if (state.liveView.socket && socketSessionId === sessionId && state.liveView.socket.readyState <= WebSocket.OPEN) {
+      return waitForSocketOpen(state.liveView.socket);
+    }
     closeSocket({ silent: true });
     finalizeAssistantStream();
     state.liveView.liveSessionId = sessionId;
@@ -657,9 +670,11 @@ export function createLiveSessionRuntimeController({
     state.liveView.hasReducerConversationDelta = false;
     state.liveView.muteSocketLifecycleStatus = false;
     const socket = new WebSocket(resolveWsUrl(sessionId));
+    socketSessionId = sessionId;
     state.liveView.socket = socket;
 
     socket.addEventListener("message", (event) => {
+      if (state.liveView.socket !== socket || state.liveView.liveSessionId !== sessionId) return;
       let payload;
       try {
         payload = JSON.parse(event.data);
@@ -674,6 +689,7 @@ export function createLiveSessionRuntimeController({
     });
 
     socket.addEventListener("close", () => {
+      if (state.liveView.socket !== socket) return;
       const silentClose = state.liveView.muteSocketLifecycleStatus;
       state.liveView.muteSocketLifecycleStatus = false;
       if (state.liveView.socket === socket) {
@@ -681,6 +697,10 @@ export function createLiveSessionRuntimeController({
       }
       finalizeAssistantStream();
       if (silentClose) {
+        return;
+      }
+      if (onSocketUnavailable) {
+        onSocketUnavailable(sessionId);
         return;
       }
       if (state.statusText === "已发送中断指令。") {
@@ -693,7 +713,15 @@ export function createLiveSessionRuntimeController({
     });
 
     socket.addEventListener("error", () => {
+      if (state.liveView.socket !== socket) return;
       if (state.liveView.muteSocketLifecycleStatus) {
+        return;
+      }
+      if (onSocketUnavailable) {
+        state.liveView.socket = null;
+        socket.close();
+        finalizeAssistantStream();
+        onSocketUnavailable(sessionId);
         return;
       }
       if (state.statusText === "等待 Codex 回复…" || state.statusText === "正在发送…") {
