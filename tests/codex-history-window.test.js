@@ -29,6 +29,30 @@ test("the initial history view never displays old summary items while waiting fo
   assert.equal(f.hasOlderHistory(), true);
 });
 
+test("only latest history pages select the initial window until it has loaded", () => {
+  const store = createCodexChatStore("thread");
+  store.upsertTurn({ id: "live", items: [item("live-item")] });
+  assert.equal(store.state.initialHistoryTurnId, "");
+  store.applyTurnsPage({ turns: [{ id: "first", items: [] }] });
+  assert.equal(store.state.initialHistoryTurnId, "first");
+  store.applyTurnsPage({ turns: [{ id: "older", items: [] }] }, undefined, { older: true });
+  assert.equal(store.state.initialHistoryTurnId, "first");
+  store.applyTurnsPage({ turns: [{ id: "newer", items: [] }] });
+  assert.equal(store.state.initialHistoryTurnId, "newer", "a retry may discover a newer initial window");
+  store.applyLatestItemsPage("newer", { items: [item("latest")], hasMore: false }, undefined, { reset: true });
+  store.applyTurnsPage({ turns: [{ id: "next", items: [] }] });
+  assert.equal(store.state.initialHistoryTurnId, "newer", "later refreshes must not hide an established timeline");
+});
+
+test("an empty initial history stays ready when a later turn arrives", () => {
+  const store = createCodexChatStore("thread");
+  store.applyTurnsPage({ turns: [], hasMore: false });
+  assert.equal(store.state.initialized, true);
+  assert.equal(store.state.initialHistoryTurnId, "");
+  store.applyTurnsPage({ turns: [{ id: "later", items: [item("new")] }] });
+  assert.equal(store.state.initialHistoryTurnId, "");
+});
+
 test("a failed earlier page preserves its cursor and retry reads exactly that page", async () => {
   let failed = true;
   const f = fixture((url) => {

@@ -67,7 +67,7 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
   const state = reactive({
     threadId, thread: null, turns: {}, turnOrder: [], requests: {}, requestOrder: [], submittedRequestIds: [],
     draft: { text: "", attachments: [] }, epoch: "", seq: 0, revision: 0, presentationRevision: 0,
-    connection: "offline", olderCursor: null, hasMore: false, initialized: false,
+    connection: "offline", olderCursor: null, hasMore: false, initialized: false, initialHistoryTurnId: "",
     loading: false, submitting: false, interrupting: false, error: "", historyReadError: "", persistenceError: "",
     requestListReady: false, requestListError: "", interactionState: interactions.state
   });
@@ -202,6 +202,10 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
   function applyTurnsPage(page, read = beginRead(), { older = false } = {}) {
     if (page?.threadId && page.threadId !== threadId) return;
     if (read.epochGeneration !== epochGeneration) return;
+    // Only authoritative latest history identifies the initial content window.
+    if (!older && (!state.initialized || state.initialHistoryTurnId && !state.turns[state.initialHistoryTurnId]?.itemsLatestLoaded)) {
+      state.initialHistoryTurnId = page.turns?.at(-1)?.id || "";
+    }
     const originalOrder = [...state.turnOrder];
     const beforeId = older ? undefined : originalOrder.find((id) => !historyTurnIds.has(id));
     for (const turn of page.turns || []) upsertTurn(turn, read);

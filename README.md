@@ -181,6 +181,10 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.4.2`
+
+- Fixed old receipts or live messages appearing before the latest history loads when opening a chat; messages now appear together after the initial history window is ready, with loading and retry states preserved.
+
 ### `v0.4.1`
 
 - Added a warm pixel companion, matching logo and favicon, and consistent loading, empty, error, and waiting states.

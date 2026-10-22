@@ -430,6 +430,19 @@ test("initial latest messages settle at the bottom instantly when their loading 
   } finally { await chat.cleanup(); }
 });
 
+test("initial loading hides even a nonempty receipt timeline until the latest history is ready", async () => {
+  const chat = await mountedChat({ historyLoading: true, threadViewModel: viewModel() });
+  try {
+    const timeline = elements(chat.stream(), (node) => hasClass(node, "thread-turn-timeline"))[0];
+    assert.equal(timeline.style.display, "none");
+    chat.geometry.baseHeight = 1800;
+    chat.render({ historyLoading: false, threadSnapshot: { version: 2, turns: [] }, threadViewModel: viewModel() });
+    await flush();
+    assert.notEqual(timeline.style.display, "none");
+    assert.equal(chat.stream().scrollTop, chat.stream().scrollHeight - chat.stream().clientHeight);
+  } finally { await chat.cleanup(); }
+});
+
 test("scrolling, context changes and disposal prevent an old history anchor from overriding the reader", async () => {
   for (const change of ["scroll", "context", "dispose"]) {
     const f = historyFixture();

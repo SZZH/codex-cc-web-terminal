@@ -61,8 +61,10 @@ const canRetryReads = computed(() => Boolean(state.value?.historyReadError || st
 const displayModel = computed(() => active.value?.buildDisplayModel(snapshot.value || {}, { assistantName: "Codex" }) || { turns: [] });
 const hasDisplayItems = computed(() => displayModel.value.turns.some((turn) =>
   turn.segments.some((segment) => (segment.visibleItems || segment.items || []).length)));
-const pendingInitialTurns = computed(() => hasDisplayItems.value ? [] : Object.values(state.value?.turns || {})
-  .filter((turn) => turn.itemsLatestRequested && !turn.itemsLatestLoaded));
+const pendingInitialTurns = computed(() => {
+  const turn = state.value?.turns[state.value.initialHistoryTurnId];
+  return turn && !turn.itemsLatestLoaded ? [turn] : [];
+});
 const initialHistoryError = computed(() => state.value?.historyReadError || pendingInitialTurns.value.find((turn) => turn.itemsError)?.itemsError || "");
 const initialHistoryLoading = computed(() => !state.value?.initialized || pendingInitialTurns.value.length > 0);
 const visibleDetailItems = computed(() => displayModel.value.turns.flatMap((turn) => turn.segments.flatMap((segment) => {
@@ -367,7 +369,7 @@ function showRequestFooter(request, turnId) {
       :can-send="canSend" :can-interrupt="canInterrupt" :loading="loading" :status-text="statusText"
       :running-task="runningTask" :follow-up-mode="pendingSettings ? 'queue' : active.followUpMode.value"
       :can-answer-questions="canAnswerQuestions" @question-answer="answerQuestion"
-      :history-loading="initialHistoryLoading && !hasDisplayItems"
+      :history-loading="initialHistoryLoading"
       :has-older="active.runtime.hasOlderHistory()" :loading-older="Boolean(active.actions.older)" :on-reach-top="active.readOlder"
       allow-followups :can-steer="active.running.value && !unconfirmed && !pendingSettings" :interrupting="state.interrupting"
       :process-expanded="active.expandedProcesses" @process-toggle="toggleProcess"
@@ -397,7 +399,7 @@ function showRequestFooter(request, turnId) {
       <template #history-start="{ loadOlder }">
         <InterfaceState v-if="initialHistoryLoading || initialHistoryError && !hasDisplayItems"
           :kind="initialHistoryError ? 'error' : 'loading'" :title="initialHistoryError ? '消息暂时没有读取成功' : '正在加载消息…'"
-          :detail="initialHistoryError || ''" :layout="hasDisplayItems ? 'inline' : 'messages'"
+          :detail="initialHistoryError || ''" :layout="initialHistoryLoading || !hasDisplayItems ? 'messages' : 'inline'"
           :action-label="initialHistoryError ? '重试加载' : ''" :disabled="Boolean(active.actions.reload)" @action="reload" />
         <InterfaceState v-else-if="!displayModel.turns.length" kind="empty" title="从一个想法开始" detail="描述你的任务，或添加一张图片。" />
         <div v-if="active.actions.older || active.olderError.value" class="codex-history-actions">

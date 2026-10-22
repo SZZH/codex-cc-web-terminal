@@ -2066,7 +2066,7 @@ async function mountThreadView(api = {}) {
   const calls = [], sockets = [];
   const history = declaredHistoryPages();
   const settings = { model: "model", reasoningEffort: "high", permissionMode: "default", git: { isGitRepo: true, currentBranch: "main", cwd: "/tmp" } };
-  globalThis.window = { localStorage: memoryStorage() };
+  globalThis.window = { localStorage: api.storage || memoryStorage() };
   globalThis.WebSocket = class { constructor() { sockets.push(this); } close() {} };
   globalThis.__codexChatTestApi = {
     supportsInitialHistory: () => api.supportsInitialHistory === true,
@@ -2225,6 +2225,79 @@ test("mounted chat waits eighteen seconds for the latest window without showing 
     assert.equal(new URL(pages[0].url, "https://example.test").searchParams.get("sortDirection"), "desc");
     assert.ok(harness.calls.filter((call) => call.url.includes("/turns?")).every((call) => call.url.endsWith("/turns?limit=1")));
   } finally { latest.resolve({ items: [], hasMore: false }); harness.close(); }
+});
+
+for (const combined of [true, false]) {
+  test(`mounted ${combined ? "combined" : "legacy"} history keeps early receipts behind the initial window`, async () => {
+    const firstPage = deferred(), latest = deferred(), storage = memoryStorage();
+    let retryItems = false;
+    const receipt = { id: "old-request", threadId: "thread", state: "failed", turnId: "old-turn",
+      input: { text: "old saved input" }, error: { message: "old failure" } };
+    storage.setItem("codex-chat-v2:thread", JSON.stringify({ threadId: "thread", draft: { text: "", attachments: [] }, requests: [receipt] }));
+    const harness = await mountThreadView({ storage, supportsInitialHistory: combined, runtime: { maxPolls: 0 }, request: (url) => {
+      if (url.endsWith("/initial-history") || url.includes("/turns?")) return firstPage.promise;
+      if (url.includes("/items?")) return retryItems ? itemsPage : latest.promise;
+      if (url.endsWith("/requests")) return { requests: [receipt] };
+    } });
+    const history = () => nodeText(elements(harness.root, (node) => node.type === "history-start")[0]);
+    const turnsPage = { threadId: "thread", turns: [{ id: "latest-turn", status: "completed", items: [] }], hasMore: false, olderCursor: null };
+    const itemsPage = { threadId: "thread", turnId: "latest-turn", items: [
+      { id: "latest-answer", type: "agentMessage", text: "latest complete answer" }
+    ], hasMore: false, nextCursor: null, latestItemId: "latest-answer" };
+    try {
+      assert.equal(harness.store.state.requestListReady, true);
+      assert.equal(harness.store.state.initialized, false);
+      assert.equal(harness.chat.props.historyLoading, true, "an early receipt must not reveal the timeline");
+      assert.match(history(), /正在加载消息/);
+      if (combined) firstPage.resolve({ turnsPage, itemsPage });
+      else {
+        firstPage.resolve(turnsPage); await flush();
+        assert.equal(harness.chat.props.historyLoading, true, "turn metadata is not the latest content window");
+        assert.match(history(), /正在加载消息/);
+        latest.reject(new Error("latest page unavailable")); await flush();
+        assert.equal(harness.chat.props.historyLoading, true);
+        assert.match(history(), /latest page unavailable/);
+        assert.match(history(), /重试加载/);
+        retryItems = true;
+        await harness.runtime.setTurnVisibility("latest-turn", true);
+      }
+      await flush();
+      assert.equal(harness.chat.props.historyLoading, false);
+      assert.doesNotMatch(history(), /正在加载消息|从一个想法开始|latest page unavailable/);
+      assert.ok(elements(harness.root, (node) => node.type === "item-display" && node.text === "latest complete answer").length);
+      assert.equal(harness.store.state.requests[receipt.id].error.message, "old failure", "receipt recovery data remains intact");
+    } finally { firstPage.resolve({ turnsPage, itemsPage }); latest.resolve(itemsPage); harness.close(); }
+  });
+}
+
+test("a live turn arriving during legacy initialization cannot strand the initial history window", async () => {
+  const turns = deferred();
+  const previousObserver = globalThis.IntersectionObserver;
+  // A hidden browser timeline has no visible turns to trigger observer hydration.
+  globalThis.IntersectionObserver = class { observe() {} disconnect() {} };
+  const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
+    if (url.includes("/turns?")) return turns.promise;
+    if (url.includes("/items?")) {
+      const live = url.includes("/turns/live/");
+      return { items: [{ id: live ? "live-item" : "initial-item", type: "agentMessage", text: live ? "live output" : "initial complete history" }], hasMore: false };
+    }
+  } });
+  try {
+    const socket = harness.sockets[0];
+    const send = (seq, type, payload) => socket.onmessage({ data: JSON.stringify({ schemaVersion: 2, threadId: "thread", epoch: "epoch", seq, type, payload }) });
+    send(0, "sync.required", {});
+    send(1, "turn.upsert", { turn: { id: "live", status: "inProgress", items: [
+      { id: "live-item", type: "agentMessage", text: "live output" }
+    ] } });
+    await flush();
+    assert.equal(harness.chat.props.historyLoading, true, "live events cannot open the initial timeline");
+    turns.resolve({ threadId: "thread", turns: [{ id: "initial", status: "completed", items: [] }], hasMore: false });
+    await flush();
+    assert.equal(harness.chat.props.historyLoading, false);
+    assert.equal(harness.store.state.turns.initial.itemsLatestLoaded, true);
+    assert.deepEqual(harness.store.state.turnOrder, ["initial", "live"]);
+    assert.ok(elements(harness.root, (node) => node.type === "item-display" && node.text === "live output").length);
+  } finally { turns.resolve({ turns: [], hasMore: false }); harness.close(); globalThis.IntersectionObserver = previousObserver; }
 });
 
 test("mounted chat returns false for a failed within-turn older read and retries that cursor without loading another turn", async () => {

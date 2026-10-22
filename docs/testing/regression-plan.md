@@ -21,6 +21,7 @@ Owner: backend
 - 桌面队列回归包含模型/权限覆盖值拒绝、按官方队列 ID 撤回及已领取时冲突、后发消息保持顺序、重启后按 clientId 分页核对。
 - `tests/codex-chat-store.test.js`、`tests/codex-chat-runtime.test.js`：单状态与读取竞态、草稿/未确认请求恢复、可见历史自动补读及并发上限、最新轮增量尾读、旧轮终态复用、自动核对、跨线程/旧 socket 隔离与实际组件挂载交互。
 - `tests/codex-read-refresh.test.js`、`tests/codex-runtime-errors.test.js`：metadata/turns/回执错误独立、有效响应与迟到代次、稳定回执下的历史自动恢复；固定动作归属、目标 ID、成功清理和旧成功不清新失败；真实连接构造失败的 2 秒重连与 HTTP 退避分别验证，卸载清零。
+- 首屏历史额外覆盖恢复的旧回执及 HTTP 回执先到、合并/兼容读取延迟与失败重试，均不能提前显示时间线；最新窗口完成后才显示正文并贴底。`codex-history-window` 同时覆盖初读目标轮在重试中更新、空历史及后续刷新/向前分页不重新隐藏正文，`message-stream-scroll` 用实际组件验证非空时间线的隐藏状态。
 - `tests/codex-item-hydration.test.js`、`tests/message-stream-scroll.test.js`：双槽按页让出、显式展开优先及所有优先级的 FIFO 有界进展；展开增长的阅读位置、旧强制回调、真实回底和 1000ms 连续惯性、同手势反向、静止/布局负例及上下文/卸载。
 - `tests/app-viewport.test.js`、`tests/session-list-position.test.js`、`tests/session-list-ui.test.js`、`tests/preview-ui.test.js`：共享可视高度与顶底偏移、小数/零值、样式 priority 恢复与卸载后旧回调；列表元素自身的坐标/范围/根相对锚点、两模式与搜索分页往返、认证对象及即时代次隔离，预览受控滚动主体与原服务/焦点契约。CSS 是否可达另由真实浏览器核对。
 - `tests/app-server-request.test.js`、`tests/codex-v2-read-cancellation.test.js`：真实桥接单ID取消、序列化/send/回复/错误/超时/reset竞态首次结算；HTTP读独立signal、共享ready waiter、五类历史GET及正常req.close/finish/keepalive、缓存/两段detail/legacy/图片、迟到transport、对账与JSON边界。未绑定写/后台/其他客户端独立，pending/deadline/listener无残留；本地退出不代表远端中断。

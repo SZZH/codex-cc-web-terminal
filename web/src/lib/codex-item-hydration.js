@@ -24,6 +24,7 @@ export function createCodexItemHydration({ store, loadItems, isDisposed, syncVis
   }
   function isRelevant(turnId) {
     return visibleTurns.has(turnId) || expandedTurns.has(turnId) || turnId === latestTurnId() || turnId === state.turnOrder.at(-1) ||
+      turnId === state.initialHistoryTurnId && !state.turns[turnId]?.itemsLatestLoaded ||
       ["inProgress", "running"].includes(state.turns[turnId]?.status) || Boolean(needsFinalization(turnId));
   }
   function needsItemHydration(turnId) {
