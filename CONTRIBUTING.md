@@ -67,3 +67,6 @@ including HTTP, WebSocket, thread state, and frontend runtime contracts. CI runs
 - Prefer version-style tag names such as `v0.1.0`.
 - Write tag annotations in Chinese.
 - Tag annotations should summarize the recent core work of that release or milestone.
+- Before pushing code to the remote, add the user-visible additions and fixes in that push to the Changelog in both `README.md` and `README.zh-CN.md`. Do not push until both entries exist.
+- Keep one push in one version section. If that section was already published, open the next version section.
+- Write `README.md` in English only and `README.zh-CN.md` in Chinese only. Keep commands, configuration keys, URLs, package names, filenames, and user-facing error text literal inside code. The detailed rule is in [documentation-standards.md](./docs/contributing/documentation-standards.md).

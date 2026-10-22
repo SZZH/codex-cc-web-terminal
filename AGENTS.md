@@ -43,7 +43,8 @@
 - Tag annotations should record the recent milestone changes as grouped bullet points, covering the main new features and major bug fixes included since the previous version tag.
 - Tag annotations should not be step-by-step terminal logs, but they also should not be overly brief; they should preserve the core shipped changes in a readable release-note style.
 - If many fixes happened in the same milestone, summarize them by functional area instead of listing noisy implementation details.
-- Keep `README.md` updated with a `Changelog` section organized by tag, and for each new tag add a concise summary of the main shipped changes without dumping every low-level detail.
+- Before pushing code to the remote, update the Changelog in both `README.md` and `README.zh-CN.md` with the user-visible additions and fixes included in that push. Do not push until both entries exist. Group one push under one version heading. If that heading was already published by an earlier push, start the next version heading. Summarize by feature and fix, not by commit.
+- `README.md` is English only. `README.zh-CN.md` is Chinese only. Prose, headings, changelog sentences, and link text stay in that document's language. Commands, configuration keys, URLs, package names, filenames, and user-facing error strings stay literal inside code. The full rule is in `docs/contributing/documentation-standards.md`.
 - Commit titles should still describe the main shipped outcome, but they do not need a forced `feat(...)` / `fix(...)` prefix unless the maintainer asks for it.
 - If a commit body is used, list only the core additions or a few key fixes.
 - Do not write step-by-step work logs, terminal actions, or review narration into commit messages.

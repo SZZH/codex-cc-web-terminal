@@ -1,6 +1,6 @@
 # Sync Checklists
 
-Last updated: 2026-04-14
+Last updated: 2026-10-22
 Status: active
 Owner: maintainers
 
@@ -45,6 +45,16 @@ Owner: maintainers
 - `CONTRIBUTING.md`
 - `docs/testing/*`
 - 必要时 `verification-matrix.md`
+
+## Checklist: 推送代码到远端
+
+必须同步：
+
+- `README.md` 的 `Changelog`
+- `README.zh-CN.md` 的更新日志
+- 两份日志描述同一次推送，并各自只用对应语言
+
+没有写上这次推送里用户能看到的变化，就不要推送。
 
 ## Checklist: 贡献流程变化
 
