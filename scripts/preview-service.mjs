@@ -92,15 +92,14 @@ function render(runtime, runtimePath) {
   fs.writeFileSync(configPath, properties, { mode: 0o600 });
   fs.writeFileSync(plistPath, renderLaunchd(runtime, runtimePath), { mode: 0o600 });
   return { configPath, plistPath, registration: { name: "codex-kkfileview", label: runtime.label, plist: plistPath,
-    port: 8012, healthUrl: "http://127.0.0.1:8012/viewer/actuator/health" },
-    managerAction: { endpoint: "http://127.0.0.1:9/api/action", body: { service: "codex-kkfileview", action: "start" } } };
+    port: 8012, healthUrl: "http://127.0.0.1:8012/viewer/actuator/health" } };
 }
 
 async function main() {
   const [action = "help", ...args] = process.argv.slice(2);
   if (action === "help" || action === "--help") {
     json({ usage: "node scripts/preview-service.mjs doctor|render|run [--runtime /absolute/runtime.json]",
-      note: "render only writes runtime artifacts. run is a foreground launcher for the service manager; it never installs or starts other services." });
+      note: "render only writes runtime artifacts. run is a foreground launcher; it never installs or starts other services." });
     return;
   }
   if (!["doctor", "render", "run"].includes(action)) throw new Error(`Unknown action: ${action}`);
@@ -113,7 +112,7 @@ async function main() {
   doctor(runtime);
   const existingOffice = spawnSync("pgrep", ["-x", "soffice.bin"], { encoding: "utf8" });
   if (existingOffice.error || ![0, 1].includes(existingOffice.status)) throw new Error("Unable to check existing Office processes before startup");
-  if (existingOffice.status === 0) throw new Error("An Office process already exists; the service manager must resolve it before kkFileView starts");
+  if (existingOffice.status === 0) throw new Error("An Office process already exists; resolve it before kkFileView starts");
   const javaHome = path.dirname(path.dirname(runtime.javaBin));
   const child = spawn(runtime.javaBin, ["-Xms128m", "-Xmx768m", "-XX:MaxMetaspaceSize=256m", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true",
     `-Djava.io.tmpdir=${path.join(runtime.dataDir, "tmp")}`, `-Dspring.config.location=${pathToFileURL(generated.configPath).href}`, "-jar", runtime.jarPath],

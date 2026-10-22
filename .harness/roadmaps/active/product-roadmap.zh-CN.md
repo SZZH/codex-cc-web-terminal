@@ -10,8 +10,8 @@ Superseded By:
 
 基于两个竞品项目做出的当前版本路线判断：
 
-- [`remodex`](remodex) 更像“Codex 专用遥控器”
-- [`hapi`](hapi) 更像“多 Agent 远程协作平台”
+- `remodex` 更像“Codex 专用遥控器”
+- `hapi` 更像“多 Agent 远程协作平台”
 - 本项目当前阶段更适合优先吸收 `remodex` 的产品骨架，再择机补 `hapi` 的平台能力
 
 ## 核心判断

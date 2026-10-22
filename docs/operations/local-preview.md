@@ -1,6 +1,6 @@
 # 本地文件与网页预览运维
 
-Last updated: 2026-10-16
+Last updated: 2026-10-22
 Status: active
 Owner: infra
 
@@ -14,7 +14,7 @@ Owner: infra
 
 - 运行 Codex Web Terminal 的电脑保持在线、唤醒，聊天服务、预览网关及所需本地网页服务可用。文件保留在这台电脑上，预览链接不等于上传到独立的永久托管服务。
 - 文件预览运行时为 kkFileView 5.0.3、Java 21 和适配本机架构的 LibreOffice。外部访问还需要现有 frp、Caddy 链路和有效 HTTPS 配置。
-- 由进程管理管理 `codex-cc-web-terminal`、`codex-kkfileview` 及已登记的 frp/Caddy 服务。启动、停止、重启、状态与日志检查均从进程管理进入；不要另起一套后台进程。
+- 聊天服务用 `npm run service:start`、`service:restart`、`service:status` 和 `service:logs` 管理。kkFileView 用 `node scripts/preview-service.mjs run --runtime …` 前台启动，或把 `render` 生成的 launchd 配置交给你自己的进程管理器。不要另起一套未登记的后台进程。
 - 预览配置、授权记录、转换缓存和日志保存在本机私有运行目录。仓库只保存配置样例，不提交实际路径、令牌、证书或预览授权 URL。
 
 ## 配置与端口
@@ -52,10 +52,10 @@ Owner: infra
    node scripts/preview-service.mjs render --runtime /absolute/preview-runtime/runtime.json
    ```
 
-3. 将 `render` 输出的 `registration` 信息登记到进程管理：服务名 `codex-kkfileview`、launchd 配置及健康检查地址。`render` 只生成文件；脚本的 `run` 动作是进程管理使用的前台启动入口，不负责安装或启动其他服务。脚本也接受导出的 `PREVIEW_RUNTIME_CONFIG`；它不会自动读取项目 `.env`，显式 `--runtime` 最清楚。
-4. 通过进程管理启动预览运行时与聊天服务，确认现有 frp/Caddy 配置将五个预览入口转到对应网关。保留 kkFileView 的 `/viewer` 路径及 HTTP/WebSocket 转发能力。更新应用 `.env` 后，由进程管理重启对应服务使配置生效。
+3. 将 `render` 输出的 `registration` 登记到你的进程管理器：服务名 `codex-kkfileview`、launchd 配置及健康检查地址。`render` 只生成文件；`run` 是前台启动入口，不负责安装或启动其他服务。未传 `--runtime` 时，脚本默认读取 `~/.local/share/codex-cc-web-terminal/preview-runtime/runtime.json`。已经放在其他目录的 `runtime.json` 要继续通过 `--runtime` 或 `PREVIEW_RUNTIME_CONFIG` 指定。脚本不会自动读取项目 `.env`。
+4. 启动预览运行时与聊天服务。更新应用 `.env` 后执行 `npm run service:restart`。若使用 frp/Caddy，确认五个预览入口转到对应网关。保留 kkFileView 的 `/viewer` 路径及 HTTP/WebSocket 转发能力。
 
-生成配置将 kkFileView 限定在 `127.0.0.1:8012`，关闭上传、删除及编辑相关入口。启动脚本发现已有 `soffice.bin` 时会拒绝继续启动；由进程管理核对归属并处理冲突，不强行终止用户正在使用的 Office 进程。
+生成配置将 kkFileView 限定在 `127.0.0.1:8012`，关闭上传、删除及编辑相关入口。启动脚本发现已有 `soffice.bin` 时会拒绝继续启动；先确认该进程归属并处理冲突，不强行终止正在使用的 Office 进程。
 
 ## 文件授权与关联资源
 
@@ -83,14 +83,14 @@ Markdown 相对图片使用 [`scripts/preview/markdown-assets.js`](../../scripts
 
 已知上游包可能包含 PDF.js viewer，却缺少配套 `build` 资源，表现为 PDF 或 Office 转换后的 PDF 预览空白、模块 404。使用 [`scripts/preview/restore-pdfjs.mjs`](../../scripts/preview/restore-pdfjs.mjs) 补齐：
 
-1. 通过进程管理停止 kkFileView。
+1. 先停止 kkFileView。
 2. 运行固定版本修复脚本：
 
    ```bash
    node scripts/preview/restore-pdfjs.mjs --runtime /absolute/preview-runtime/runtime.json
    ```
 
-3. 通过进程管理重新启动 kkFileView，再验证 PDF 与 Office 文件。
+3. 重新启动 kkFileView，再验证 PDF 与 Office 文件。
 
 脚本确认当前 viewer 为 `5.4.530`，从官方 `pdfjs-dist` 同版本包补入 API、worker 与 sandbox 的兼容构建，校验归档和文件摘要，保存原 JAR 备份与修复记录。不得使用 `latest` 或混配其他版本的 worker；升级 kkFileView 后应先核对 viewer 版本，再更新修复脚本及校验值。
 
@@ -102,7 +102,7 @@ Markdown 相对图片使用 [`scripts/preview/markdown-assets.js`](../../scripts
 node scripts/preview/install-fonts.mjs --runtime /absolute/preview-runtime/runtime.json
 ```
 
-安装后通过进程管理重启 kkFileView，使 Office 进程重新加载字体。已生成的缺字 PDF 缓存需要清除后重新转换；先核对缓存归属，不能删除源文档。
+安装后重启 kkFileView，使 Office 进程重新加载字体。已生成的缺字 PDF 缓存需要清除后重新转换；先核对缓存归属，不能删除源文档。
 
 ## 公网静态资源
 
@@ -127,7 +127,7 @@ handle {
 
 ## 验证
 
-- 在进程管理确认聊天、kkFileView、frp/Caddy 所需服务在线。网关健康路径为 `/__preview_health`，kkFileView 健康路径为 `http://127.0.0.1:8012/viewer/actuator/health`；前者通过不代表转换器也已就绪。
+- 确认聊天服务和 kkFileView 在线。若使用 frp/Caddy，同时确认对应转发在线。网关健康路径为 `/__preview_health`，kkFileView 健康路径为 `http://127.0.0.1:8012/viewer/actuator/health`；前者通过不代表转换器也已就绪。
 - 使用不含私密信息的样例检查 PDF、Word/Excel/PowerPoint、图片、Markdown 及相对配图。验证文字、中文字体和多页内容，不能只以 HTTP 200 判定转换成功。
 - 在手机打开同一文件和一个本地网页，确认使用外部预览 origin、页面/API/资源加载正常，并验证关闭、重试、新窗口打开及聊天草稿保留。
 - 核对无授权或过期地址、目录越界、受保护文件被拒绝；网页场景确认聊天凭据不转发、Service Worker 被拒绝。
