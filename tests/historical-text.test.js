@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { cleanHistoricalMessageText, extractHistoricalTitleCandidate } from "../src/sessions/history/historicalText.js";
+import { cleanHistoricalMessageText, extractHistoricalTitleCandidate, isSystemTemporaryCwd } from "../src/sessions/history/historicalText.js";
 
 test("historical text cleaning strips codex git directives from assistant content", () => {
   const text = cleanHistoricalMessageText(`
@@ -31,4 +31,12 @@ test("historical title extraction ignores codex directives", () => {
   `);
 
   assert.equal(title, "修复会话历史里的 directive 泄漏");
+});
+
+test("temporary cwd only matches operating-system temp directories", () => {
+  assert.equal(isSystemTemporaryCwd("/tmp/workspace"), true);
+  assert.equal(isSystemTemporaryCwd("/var/folders/ab/cd"), true);
+  assert.equal(isSystemTemporaryCwd("/private/var/folders/ab/cd"), true);
+  assert.equal(isSystemTemporaryCwd("/workspace/codex-cc-web-terminal"), false);
+  assert.equal(isSystemTemporaryCwd(""), false);
 });

@@ -813,7 +813,7 @@ npm run web:build
 
 ### 14.4 服务验证
 
-必须通过进程管理重启：
+重启服务：
 
 ```bash
 npm run service:restart
