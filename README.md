@@ -1,6 +1,6 @@
 # Codex Web Terminal
 
-English | [简体中文](./README.zh-CN.md)
+English | [Chinese](./README.zh-CN.md)
 
 One thing only: use local `codex` sessions in your browser (including mobile).
 
@@ -89,7 +89,7 @@ npm run service:status
 npm run service:logs
 ```
 
-使用公网静态托管时，应用重启不会自动更新远端前端。请将管理入口构建出的同一份产物按[静态发布与回退流程](docs/operations/frontend-release.md)发布；不要仅重启本机后就认为公网页面已更新。
+Restarting the app does not update a publicly hosted static frontend. Publish the same build produced by the service entry, using the [static release and rollback guide](docs/operations/frontend-release.md). A local restart alone does not mean the public page has changed.
 
 Codex app-server receives the thread's model, reasoning effort, and permission
 settings explicitly. The browser currently declines command/file approval and
@@ -180,6 +180,18 @@ netstat -ano | findstr :5173
 - If you changed `PORT`, use the same port in your phone URL.
 
 ## Changelog
+
+### `v0.4.0`
+
+Core updates since `v0.3.0`:
+
+- Connected chat to official Codex threads, including queued sends, follow-up input to the active turn, and an explicit stop for that turn.
+- A message can include up to six PNG, JPEG, WebP, or GIF images. Failed sends keep the original text and attachments.
+- The web app no longer takes over a desktop-owned thread. On a writer conflict, the message stays in the desktop queue and remains pending.
+- Added local file and loopback web previews, in a side panel on desktop and full screen on mobile.
+- Workspace changes can now be reverted or restored per turn.
+- The session list pages by project identity.
+- Hid empty successful command logs, showed session permissions as read-only, and removed the blue highlight when opening a chat.
 
 ### `v0.3.0`
 
