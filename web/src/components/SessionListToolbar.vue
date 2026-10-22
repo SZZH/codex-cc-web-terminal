@@ -4,10 +4,11 @@ import { computed, ref } from "vue";
 const props = defineProps({
   search: { type: String, default: "" },
   mode: { type: String, default: "groups" },
+  runningOnly: Boolean,
   runningCount: { type: Number, default: 0 },
   resultCount: { type: Number, default: null }
 });
-const emit = defineEmits(["update:search", "update:mode"]);
+const emit = defineEmits(["update:search", "update:mode", "toggle-running"]);
 const input = ref(null);
 const query = computed({ get: () => props.search, set: (value) => emit("update:search", value) });
 function clearSearch() {
@@ -31,11 +32,13 @@ function handleKeydown(event) {
     </div>
     <div class="session-list-controls">
       <div class="session-view-switch" role="group" aria-label="会话视图">
-        <button type="button" :aria-pressed="mode === 'groups'" @click="emit('update:mode', 'groups')">分组</button>
+        <button type="button" :aria-pressed="mode === 'groups'" @click="emit('update:mode', 'groups')">按项目</button>
         <button type="button" :aria-pressed="mode === 'activity'" @click="emit('update:mode', 'activity')">最近活动</button>
       </div>
-      <span v-if="query.trim() && resultCount !== null" class="session-search-count" role="status">{{ resultCount }} 个匹配会话</span>
-      <span v-else-if="runningCount" class="session-running-count">{{ runningCount }} 个运行中</span>
+      <div class="session-result-controls">
+        <span v-if="query.trim() && resultCount !== null" class="session-search-count" role="status">{{ resultCount }} 个匹配会话</span>
+        <button v-if="runningCount || runningOnly" class="session-running-count" type="button" :aria-pressed="runningOnly" @click="emit('toggle-running')"><span class="running-dot" aria-hidden="true"></span>{{ runningCount }} 个运行中<span v-if="runningOnly" aria-hidden="true"> ×</span></button>
+      </div>
     </div>
   </div>
 </template>
@@ -55,4 +58,10 @@ function handleKeydown(event) {
 .session-view-switch button[aria-pressed="true"] { background: #fffcf8; color: #594a3d; box-shadow: 0 1px 4px #6d554715; }
 .session-view-switch button:focus-visible, .session-search-clear:focus-visible { outline: 2px solid #b6a08b; outline-offset: 2px; }
 .session-running-count, .session-search-count { min-width: 0; color: #846b54; font-size: 11px; overflow-wrap: anywhere; text-align: right; }
+.session-running-count { display: inline-flex; align-items: center; gap: 5px; min-height: 40px; padding: 4px 8px; border-radius: 9px; }
+.session-result-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 2px 8px; min-width: 0; }
+.session-running-count[aria-pressed="true"] { background: #e9dfd4; color: #514338; }
+.running-dot { width: 5px; height: 5px; background: #8b7f73; }
+.session-running-count:focus-visible { outline: 2px solid #8b7f73; outline-offset: 2px; }
+@media (pointer: coarse) { .session-view-switch button, .session-running-count { min-height: 44px; } }
 </style>

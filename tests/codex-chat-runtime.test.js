@@ -2155,14 +2155,14 @@ test("mounted initial history shows loading, failure and empty states without wa
   const historyText = () => nodeText(elements(harness.root, (node) => node.type === "history-start")[0]);
   try {
     assert.match(historyText(), /正在加载消息/);
-    assert.doesNotMatch(historyText(), /暂无消息/);
+    assert.doesNotMatch(historyText(), /从一个想法开始/);
     firstPage.reject(new Error("history unavailable"));
     await flush();
     assert.match(historyText(), /history unavailable/);
     assert.match(historyText(), /重试加载/);
-    assert.doesNotMatch(historyText(), /正在加载消息|暂无消息/);
+    assert.doesNotMatch(historyText(), /正在加载消息|从一个想法开始/);
     await harness.runtime.refreshLatest(); await flush();
-    assert.match(historyText(), /暂无消息/);
+    assert.match(historyText(), /从一个想法开始/);
     assert.doesNotMatch(historyText(), /正在加载消息|history unavailable|重试加载/);
     assert.equal(harness.chat.props.loading, true, "settings still protect submission after history settles");
   } finally { options.resolve({ model: "model" }); harness.close(); }
@@ -2208,17 +2208,17 @@ test("mounted chat waits eighteen seconds for the latest window without showing 
   const history = () => nodeText(elements(harness.root, (node) => node.type === "history-start")[0]);
   try {
     assert.match(history(), /正在加载消息/);
-    assert.doesNotMatch(history(), /暂无消息/);
+    assert.doesNotMatch(history(), /从一个想法开始/);
     assert.equal(elements(harness.root, (node) => node.type === "item-display").length, 0);
     assert.equal(harness.chat.props.historyLoading, true);
     await clock.advance(18000);
     assert.match(history(), /正在加载消息/);
-    assert.doesNotMatch(history(), /暂无消息/);
+    assert.doesNotMatch(history(), /从一个想法开始/);
     assert.equal(elements(harness.root, (node) => node.type === "item-display").length, 0);
     latest.resolve({ items: [{ id: "latest", type: "agentMessage", text: "newest answer" }], hasMore: false, latestItemId: "latest" });
     await flush();
     assert.equal(harness.chat.props.historyLoading, false);
-    assert.doesNotMatch(history(), /正在加载消息|暂无消息/);
+    assert.doesNotMatch(history(), /正在加载消息|从一个想法开始/);
     assert.deepEqual(elements(harness.root, (node) => node.type === "item-display").map((node) => node.text), ["newest answer"]);
     const pages = harness.calls.filter((call) => call.url.includes("/items?"));
     assert.equal(pages.length, 1);
@@ -2324,7 +2324,7 @@ test("a pending latest window exposes loading and read failures while its old su
     assert.equal(harness.chat.props.historyLoading, true);
     page.reject(Object.assign(new Error("primary page offline"), { status: 503 })); await flush();
     assert.match(nodeText(elements(harness.root, (node) => node.type === "history-start")[0]), /primary page offline/);
-    assert.doesNotMatch(nodeText(elements(harness.root, (node) => node.type === "history-start")[0]), /暂无消息/);
+    assert.doesNotMatch(nodeText(elements(harness.root, (node) => node.type === "history-start")[0]), /从一个想法开始/);
     failing = false;
     await harness.runtime.setTurnVisibility("turn", true); await flush();
     assert.match(nodeText(harness.root), /complete body/);
@@ -4394,14 +4394,14 @@ test("a late initial preference read cannot replace a newer foreground preferenc
   } finally { initial.resolve({ model: "model" }); harness.close(); }
 });
 
-test("ChatComposer switches between send and stop based on draft content; legacy remains unchanged", async () => {
+test("ChatComposer retains stop alongside a follow-up draft without submitting or clearing it; legacy remains unchanged", async () => {
   const component = (await import(compileComponentUrl(new URL("../web/src/components/composer/ChatComposer.vue", import.meta.url), {
     [new URL("../web/src/components/composer/ComposerPopover.vue", import.meta.url).href]: sourceUrl("export default { render() { return null; } };")
   }))).default;
-  const renderer = testRenderer(), root = { children: [] }, submitted = [], stopped = [];
+  const renderer = testRenderer(), root = { children: [] }, submitted = [], stopped = [], draftUpdates = [];
   const props = { draft: "follow up", composerOptions: { attachments: [] }, gitState: {}, canSend: true,
     canInterrupt: true, canSteer: true, allowFollowups: true, runningTask: true, followUpMode: "queue",
-    onSubmit: (body) => submitted.push(body), onInterrupt: () => stopped.push(true) };
+    onSubmit: (body) => submitted.push(body), onInterrupt: () => stopped.push(true), "onUpdate:draft": (draft) => draftUpdates.push(draft) };
   try {
     renderer.render(h(component, props), root); await flush();
     const textarea = elements(root, (node) => node.type === "textarea")[0];
@@ -4411,20 +4411,26 @@ test("ChatComposer switches between send and stop based on draft content; legacy
     textarea.props.onKeydown({ key: "Enter", ctrlKey: true, preventDefault() {} });
     textarea.props.onKeydown({ key: "Enter", preventDefault() {} });
     assert.deepEqual(submitted.map((body) => body.mode), ["queue", "steer", "queue"]);
-    assert.equal(elements(root, (node) => node.props?.["aria-label"] === "停止生成").length, 0);
+    const stopWithDraft = elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0];
+    assert.equal(stopWithDraft.props.disabled, false);
+    stopWithDraft.props.onClick();
+    assert.equal(stopped.length, 1);
+    assert.deepEqual(submitted.map((body) => body.mode), ["queue", "steer", "queue"]);
+    assert.deepEqual(draftUpdates, []);
+    assert.equal(textarea.props.value, "follow up");
     renderer.render(h(component, { ...props, loading: true }), root); await flush();
-    assert.equal(elements(root, (node) => node.props?.["aria-label"] === "停止生成").length, 0);
+    assert.equal(elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0].props.disabled, false);
     assert.equal(elements(root, (node) => node.props?.["aria-label"] === "加入队列")[0].props.disabled, true);
     renderer.render(h(component, { ...props, draft: "", canSend: false, loading: true }), root); await flush();
     assert.equal(elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0].props.disabled, false);
     assert.equal(elements(root, (node) => node.props?.["aria-label"] === "加入队列").length, 0);
     elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0].props.onClick();
-    assert.equal(stopped.length, 1);
+    assert.equal(stopped.length, 2);
     renderer.render(h(component, { ...props, allowFollowups: false, canSteer: false }), root); await flush();
     assert.equal(elements(root, (node) => node.type === "textarea")[0].props.disabled, true);
     assert.equal(elements(root, (node) => node.props?.["aria-label"] === "加入队列").length, 0);
     elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0].props.onClick();
-    assert.equal(stopped.length, 2);
+    assert.equal(stopped.length, 3);
   } finally { renderer.render(null, root); }
 });
 
@@ -4451,7 +4457,7 @@ test("compact send control follows a configured queue default and reveals the ex
     assert.deepEqual(submitted.map((body) => body.mode), ["queue", "steer"]);
     assert.equal(elements(root, (node) => node.props?.role === "dialog").length, 0);
     renderer.render(h(component, { ...props, disabled: true }), root); await flush();
-    assert.equal(elements(root, (node) => node.props?.["aria-label"] === "停止生成").length, 0);
+    assert.equal(elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0].props.disabled, false);
     renderer.render(h(component, { ...props, disabled: true, hasInput: false }), root); await flush();
     const stop = elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0];
     assert.equal(stop.props.disabled, false);
@@ -4483,7 +4489,7 @@ test("the running primary button treats images as input throughout upload and ne
       for (const loading of [false, true]) {
         renderer.render(h(component, { ...props, loading, canSend: true,
           composerOptions: { attachments: [{ id: "image", kind: "image", status, url: "/image.png" }] } }), root); await flush();
-        assert.equal(byLabel("停止生成").length, 0, `${status} image must not turn send into stop`);
+        assert.equal(byLabel("停止生成").length, 1, `${status} image keeps stopping independently available`);
         assert.equal(byLabel("加入队列").length, 1);
         assert.equal(byLabel("加入队列")[0].props.disabled, loading);
       }
@@ -4498,6 +4504,33 @@ test("the running primary button treats images as input throughout upload and ne
     renderer.render(h(component, { ...props, runningTask: false, canInterrupt: false }), root); await flush();
     assert.equal(byLabel("停止生成").length, 0);
     assert.equal(byLabel("发送消息")[0].props.disabled, true);
+  } finally { renderer.render(null, root); }
+});
+
+test("stopping with an attachment preserves the draft and image without submitting across upload states", async () => {
+  const component = (await import(compileComponentUrl(new URL("../web/src/components/composer/ChatComposer.vue", import.meta.url), {
+    [new URL("../web/src/components/composer/ComposerPopover.vue", import.meta.url).href]: sourceUrl("export default { render() { return null; } };")
+  }))).default;
+  const renderer = testRenderer(), root = { children: [] }, events = [];
+  try {
+    for (const status of ["pending", "uploading", "uploaded", "failed"]) {
+      for (const loading of [false, true]) {
+        events.length = 0;
+        const attachment = { id: "keep-image", name: "keep.png", kind: "image", status, url: "/image.png" };
+        renderer.render(h(component, { draft: "keep this draft", composerOptions: { attachments: [attachment] }, gitState: {},
+          runningTask: true, canInterrupt: true, canSteer: true, canSend: true, allowFollowups: true, loading,
+          onInterrupt: () => events.push("interrupt"), onSubmit: () => events.push("submit"),
+          "onUpdate:draft": () => events.push("draft"), "onUpdate:composer-options": () => events.push("options"),
+          onRemoveAttachment: () => events.push("remove") }), root); await flush();
+        const stop = elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0];
+        assert.equal(stop.props.disabled, false);
+        stop.props.onClick();
+        assert.deepEqual(events, ["interrupt"]);
+        assert.equal(elements(root, (node) => node.type === "textarea")[0].props.value, "keep this draft");
+        assert.equal(elements(root, (node) => node.props?.["aria-label"] === "移除 keep.png").length, 1);
+        assert.equal(attachment.status, status);
+      }
+    }
   } finally { renderer.render(null, root); }
 });
 
@@ -4520,7 +4553,9 @@ test("configured steer follows button and Enter while the send menu can explicit
     elements(menu, (node) => node.type === "button")[0].props.onClick(); await flush();
     assert.deepEqual(submitted.map((entry) => entry.mode), ["steer", "steer", "queue"]);
     renderer.render(h(component, { ...props, canInterrupt: false, canSteer: false }), root); await flush();
-    assert.equal(elements(root, (node) => node.props?.["aria-label"] === "停止生成").length, 0);
+    const externalStop = elements(root, (node) => node.props?.["aria-label"] === "停止生成")[0];
+    assert.equal(externalStop.props.disabled, true);
+    assert.match(externalStop.props.title, /桌面端/);
     assert.equal(elements(root, (node) => node.type === "textarea")[0].props.disabled, false);
     elements(root, (node) => node.props?.["aria-label"] === "立即引导")[0].props.onClick();
     elements(root, (node) => node.type === "textarea")[0].props.onKeydown({ key: "Enter", metaKey: true, preventDefault() {} });

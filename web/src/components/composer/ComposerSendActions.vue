@@ -9,7 +9,7 @@ const menuOpen = ref(false);
 const dialogId = `composer-send-${useId()}`;
 const defaultMode = computed(() => props.runningTask && props.followUpMode !== "queue" ? "steer" : "queue");
 const actionLabel = computed(() => !props.runningTask ? "发送消息" : defaultMode.value === "queue" ? "加入队列" : "立即引导");
-const showStop = computed(() => props.runningTask && !props.hasInput);
+const showStop = computed(() => props.runningTask);
 const stopTitle = computed(() => !props.canInterrupt ? "请在桌面端停止当前任务" : props.interrupting ? "正在停止…" : "停止生成");
 watch(() => [props.runningTask, props.hasInput, props.disabled, props.followUpMode], () => { menuOpen.value = false; });
 function closeMenu() { menuOpen.value = false; }
@@ -32,7 +32,7 @@ function stop() {
   <div class="send-actions">
     <button v-if="showStop" class="stop-button" type="button" aria-label="停止生成" :title="stopTitle" :aria-description="stopTitle"
       :disabled="!canInterrupt || interrupting" :aria-busy="interrupting" @click="stop"><span aria-hidden="true"></span></button>
-    <div v-else class="send-button-group">
+    <div v-if="!runningTask || hasInput" class="send-button-group">
       <button v-if="runningTask && hasInput" class="send-menu-toggle" type="button" aria-label="选择发送方式" title="选择发送方式"
         aria-haspopup="dialog" :aria-expanded="menuOpen" :aria-controls="dialogId" :disabled="disabled" @click="toggleMenu">
         <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
@@ -60,6 +60,7 @@ function stop() {
 button { cursor: pointer; font: inherit; touch-action: manipulation; }
 button:disabled { opacity: .45; cursor: default; }
 .stop-button, .send-button { display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%; background: #3c342d; color: #fffdfb; }
+.stop-button { background: #eee6de; color: #65564a; border: 1px solid #d9d0c7; }
 .stop-button span { width: 11px; height: 11px; background: currentColor; border-radius: 2px; }
 .send-button svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .send-button-group { display: flex; align-items: center; gap: 2px; }

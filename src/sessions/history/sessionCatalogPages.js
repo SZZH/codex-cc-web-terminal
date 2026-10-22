@@ -20,15 +20,18 @@ function fail(message, status = 400, code = "CATALOG_INVALID_REQUEST") {
 
 function parseParams(input) {
   const params = input instanceof URLSearchParams ? input : new URLSearchParams(input);
-  for (const key of ["view", "q", "group", "limit", "cursor", "loaded"]) {
+  for (const key of ["view", "q", "group", "limit", "cursor", "loaded", "running"]) {
     if (params.getAll(key).length > 1) fail(`Repeated catalog parameter: ${key}`);
   }
   const view = params.get("view") || "groups";
   const query = normalize(params.get("q")).trim().split(/\s+/).filter(Boolean).join(" ");
   const group = params.get("group") || "";
   const limitText = params.get("limit") ?? String(MAX_PAGE_SIZE);
+  const runningText = params.get("running") ?? "0";
+  const runningOnly = runningText === "1";
   if (!["groups", "activity"].includes(view) || query.length > 1000 || group.length > 2048
-    || !/^(?:[1-9]|1[0-9]|20)$/.test(limitText) || view === "activity" && group) fail("Invalid catalog context or page limit");
+    || !/^(?:[1-9]|1[0-9]|20)$/.test(limitText) || view === "activity" && group
+    || !["0", "1"].includes(runningText) || runningOnly && view !== "activity") fail("Invalid catalog context or page limit");
   const cursor = params.get("cursor") || "";
   let loaded = null;
   if (params.has("loaded")) {
@@ -39,7 +42,7 @@ function parseParams(input) {
     if (entries.some(([key, count]) => !key || key.length > 2048 || !Number.isSafeInteger(count) || count < 0)
       || view === "activity" && entries.some(([key]) => key !== "activity")) fail("Invalid loaded catalog ranges");
   }
-  return { view, query, group, limit: Number(limitText), cursor, loaded };
+  return { view, query, group, limit: Number(limitText), cursor, loaded, runningOnly };
 }
 
 function canonicalGroups(source) {
@@ -148,7 +151,7 @@ export function createSessionCatalogPages({ loadSnapshot, now = Date.now } = {})
   }
   function encodeCursor(snapshot, context, group, offset) {
     const body = Buffer.from(JSON.stringify({ revision: snapshot.revision, view: context.view, query: context.query,
-      group, limit: context.limit, offset })).toString("base64url");
+      group, limit: context.limit, offset, runningOnly: context.runningOnly })).toString("base64url");
     return `${body}.${sign(body).toString("base64url")}`;
   }
   function decodeCursor(context) {
@@ -159,7 +162,7 @@ export function createSessionCatalogPages({ loadSnapshot, now = Date.now } = {})
     let cursor;
     try { cursor = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")); } catch { fail("Invalid catalog cursor payload"); }
     if (!record(cursor) || cursor.view !== context.view || cursor.query !== context.query || cursor.group !== context.group
-      || cursor.limit !== context.limit || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0
+      || cursor.limit !== context.limit || cursor.runningOnly !== context.runningOnly || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0
       || typeof cursor.revision !== "string") fail("Catalog cursor does not match this request");
     prune();
     const snapshot = snapshots.get(cursor.revision);
@@ -171,7 +174,9 @@ export function createSessionCatalogPages({ loadSnapshot, now = Date.now } = {})
     const context = parseParams(input);
     const { snapshot, offset } = context.cursor ? decodeCursor(context) : { snapshot: await freshSnapshot(), offset: 0 };
     const groups = searchGroups(snapshot.indexed, context.query);
-    const activities = activitySessions(groups);
+    const allActivities = activitySessions(groups);
+    const runningActivities = allActivities.filter(running);
+    const activities = context.runningOnly ? runningActivities : allActivities;
     const keys = new Set(groups.map(groupKey));
     if (context.group && !keys.has(context.group)) fail("Unknown catalog group");
     const counts = new Map(), selected = new Map();
@@ -208,11 +213,12 @@ export function createSessionCatalogPages({ loadSnapshot, now = Date.now } = {})
     });
     const sessionsTotal = new Set(groups.flatMap((group) => group.sessions.map((row) => row.id))).size;
     return { catalogFormat: "paged-v1", revision: snapshot.revision, view: context.view, query: context.query, sessions, projectGroups,
+      ...(context.runningOnly ? { runningOnly: true } : {}),
       ...(snapshot.sidebarPreferences ? { sidebarPreferences: snapshot.sidebarPreferences } : {}),
       ...(snapshot.sidebarStatus ? { sidebarStatus: snapshot.sidebarStatus } : {}),
       catalogPage: { total: context.group ? groups.find((group) => groupKey(group) === context.group).sessions.length
         : context.view === "activity" ? activities.length : sessionsTotal,
-      runningTotal: activities.filter(running).length, sessionsTotal, activitiesTotal: activities.length, nextCursor,
+      runningTotal: runningActivities.length, sessionsTotal, activitiesTotal: activities.length, nextCursor,
       degraded: snapshot.sidebarStatus?.degraded === true } };
   }
   return { read };

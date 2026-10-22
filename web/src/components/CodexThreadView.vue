@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref, shallowRef, watch } from "vue";
 import ChatView from "./ChatView.vue";
+import InterfaceState from "./InterfaceState.js";
 import CodexSubmissionFeedback from "./composer/CodexSubmissionFeedback.vue";
 import CodexQueuedMessages from "./composer/CodexQueuedMessages.vue";
 import CodexInteractionPanel from "./composer/interactions/CodexInteractionPanel.vue";
@@ -17,7 +18,7 @@ import { codexRequestLabel, codexRequestError, codexSubmissionFeedbackRequest, c
 import { createThreadViewModelBuilder } from "../lib/thread-view-model.js";
 import { buildQuestionAnswer } from "../lib/codex-question-history.js";
 
-const props = defineProps({ threadId: { type: String, required: true }, loadConfig: { type: Function, default: () => request("/api/config") } });
+const props = defineProps({ threadId: { type: String, required: true }, initialTitle: { type: String, default: "" }, initialCwd: { type: String, default: "" }, loadConfig: { type: Function, default: () => request("/api/config") } });
 const emit = defineEmits(["back", "status"]);
 const active = shallowRef(null);
 const state = computed(() => active.value?.store.state);
@@ -360,7 +361,7 @@ function showRequestFooter(request, turnId) {
 <template>
   <section v-if="state" class="codex-thread-view">
     <ChatView :key="threadId" class="codex-thread-chat" :session-key="threadId" :thread-id="threadId" :expected-thread-id="threadId"
-      :title="state.thread?.name || 'Codex 会话'" :thread-snapshot="snapshot" :thread-view-model="displayModel" :workspace-cwd="state.thread?.cwd || ''"
+      :title="state.thread?.name || initialTitle || 'Codex 会话'" :thread-snapshot="snapshot" :thread-view-model="displayModel" :workspace-cwd="state.thread?.cwd || initialCwd"
       :draft="state.draft.text" :composer-options="composerOptions" :models="models" :git-state="gitState"
       :permission-mode-options="CODEX_PERMISSION_MODE_OPTIONS"
       :can-send="canSend" :can-interrupt="canInterrupt" :loading="loading" :status-text="statusText"
@@ -394,18 +395,13 @@ function showRequestFooter(request, turnId) {
           @restore="restoreRequest" @check="checkSubmission" />
       </template>
       <template #history-start="{ loadOlder }">
-        <div v-if="initialHistoryLoading || initialHistoryError && !hasDisplayItems" class="codex-history-actions">
-          <template v-if="initialHistoryError">
-            <span class="codex-history-status" role="alert">{{ initialHistoryError }}</span>
-            <button type="button" :disabled="Boolean(active.actions.reload)" @click="reload">重试加载</button>
-          </template>
-          <span v-else class="codex-history-status" role="status" aria-busy="true">正在加载消息…</span>
-        </div>
-        <div v-else-if="!displayModel.turns.length" class="codex-history-actions">
-          <span class="codex-history-status">暂无消息</span>
-        </div>
+        <InterfaceState v-if="initialHistoryLoading || initialHistoryError && !hasDisplayItems"
+          :kind="initialHistoryError ? 'error' : 'loading'" :title="initialHistoryError ? '消息暂时没有读取成功' : '正在加载消息…'"
+          :detail="initialHistoryError || ''" :layout="hasDisplayItems ? 'inline' : 'messages'"
+          :action-label="initialHistoryError ? '重试加载' : ''" :disabled="Boolean(active.actions.reload)" @action="reload" />
+        <InterfaceState v-else-if="!displayModel.turns.length" kind="empty" title="从一个想法开始" detail="描述你的任务，或添加一张图片。" />
         <div v-if="active.actions.older || active.olderError.value" class="codex-history-actions">
-          <span v-if="active.actions.older" class="codex-history-status" role="status">正在加载更早消息…</span>
+          <InterfaceState v-if="active.actions.older" title="正在加载更早消息…" layout="inline" mood="reading" />
           <template v-else>
             <span class="codex-history-status" role="status">{{ active.olderError.value }}</span>
             <button type="button" @click="loadOlder">重试加载</button>

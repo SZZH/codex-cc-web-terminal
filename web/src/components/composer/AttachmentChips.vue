@@ -86,4 +86,9 @@ function iconForAttachment(attachment = {}) {
 .chip-icon {
   flex: 0 0 auto;
 }
+.chip-remove:focus-visible { outline: 2px solid #8b7f73; outline-offset: 2px; }
+@media (pointer: coarse) {
+  .chip { height: 46px; max-width: 220px; padding-right: 0; gap: 2px; }
+  .chip-remove { width: 44px; height: 44px; flex: 0 0 44px; background: transparent; font-size: 18px; }
+}
 </style>

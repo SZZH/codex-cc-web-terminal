@@ -1,10 +1,11 @@
 import { defineAsyncComponent, defineComponent, h, onBeforeUnmount } from "vue";
+import InterfaceState from "../components/InterfaceState.js";
 
 const viewLoaders = new WeakMap();
 
 const ViewLoading = defineComponent({
   setup() {
-    return () => h("section", { class: "mobile-shell centered-shell", role: "status", "aria-busy": true }, "正在加载页面…");
+    return () => h("section", { class: "mobile-shell centered-shell" }, h(InterfaceState, { title: "正在加载页面…" }));
   }
 });
 
@@ -12,10 +13,7 @@ const ViewLoadError = defineComponent({
   props: ["error"],
   setup() {
     return () => h("section", { class: "mobile-shell centered-shell" }, [
-      h("div", { class: "notice-strip", role: "alert" }, [
-        h("p", "页面加载失败，请重新加载。"),
-        h("button", { class: "primary-button", type: "button", onClick: () => window.location.reload() }, "重新加载")
-      ])
+      h(InterfaceState, { kind: "error", title: "页面加载失败", detail: "请重新加载后再试。", actionLabel: "重新加载", onAction: () => window.location.reload() })
     ]);
   }
 });

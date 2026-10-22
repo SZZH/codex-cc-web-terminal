@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref, watch } from "vue";
+import PixelCompanion from "../../PixelCompanion.js";
 import QuestionFields from "./QuestionFields.vue";
 import ApprovalDetails from "./ApprovalDetails.vue";
 import ApprovalActions from "./ApprovalActions.vue";
@@ -66,6 +67,7 @@ function openUrl(event) {
 <template>
   <section v-if="rows.length || state.error" class="codex-interaction-panel" aria-label="Codex 交互待办">
     <header class="interaction-header">
+      <PixelCompanion :size="28" :mood="busy ? 'loading' : terminal || state.error ? 'error' : 'waiting'" />
       <h2>{{ terminal ? '请求已失效' : title }}</h2><span v-if="status" class="interaction-status" role="status" aria-live="polite">{{ status }}</span>
       <button v-if="terminal" type="button" class="interaction-close" aria-label="关闭失效交互" title="关闭失效交互" @click="dismissed.push(activeId)">×</button>
       <select v-if="rows.length > 1" :value="activeId" aria-label="选择交互待办" @change="activeId = $event.target.value">

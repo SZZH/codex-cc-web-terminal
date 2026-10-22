@@ -45,6 +45,7 @@ docs/
 
 - [Codex V2 聊天契约（当前主链路）](refactoring/codex-chat-v2.md)
 - [Codex 桌面兼容边界](architecture/codex-desktop-compatibility.md)
+- [界面品牌、状态反馈与运行中筛选](architecture/interface-feedback.md)
 - [本地文件与网页预览运维](operations/local-preview.md)
 - [公网前端静态发布与回退](operations/frontend-release.md)
 - [Documentation Standards](contributing/documentation-standards.md)

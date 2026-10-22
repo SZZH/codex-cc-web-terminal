@@ -4,6 +4,8 @@ import { createSessionListViewState } from "../lib/app-state.js";
 import { createSessionListPosition } from "../lib/session-list-position.js";
 import { buildActivitySessions, createSessionSearch, isSessionRunning, sessionGroupKey } from "../lib/session-list.js";
 import { deriveSessionListProgress, sessionListGroupCounts } from "../lib/session-list-progress.js";
+import SessionListHeader from "./SessionListHeader.vue";
+import InterfaceState from "./InterfaceState.js";
 import SessionListRow from "./SessionListRow.vue";
 import SessionListToolbar from "./SessionListToolbar.vue";
 import { observeElementVisibility } from "../lib/element-visibility.js";
@@ -32,6 +34,7 @@ const viewState = reactive(ownedViewState);
 const { expandedGroups, localExpansion, expandedLists, activityLimit,
   searchCollapsed, searchLimits, searchActivityLimit, searchGroupLimit } = toRefs(viewState);
 const viewMode = ref("groups");
+const runningOnly = ref(Boolean(props.pagination?.runningOnly));
 const query = ref(props.searchQuery);
 const searching = computed(() => Boolean(query.value.trim()));
 const queryPending = computed(() => props.pagination && normalizeCatalogQuery(query.value) !== props.pagination.query);
@@ -57,32 +60,38 @@ watch(query, (value) => {
   emit("update:searchQuery", value);
   if (props.pagination) {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => emit("catalog-view", { view: viewMode.value, query: value }), 250);
+    searchTimer = setTimeout(() => emit("catalog-view", { view: viewMode.value, query: value, runningOnly: runningOnly.value }), 250);
   }
 });
 try { if (window.localStorage.getItem("codex-session-list-view") === "activity") viewMode.value = "activity"; } catch { /* Optional display preference. */ }
 if (props.pagination) viewMode.value = props.pagination.view;
-const activitySessions = computed(() => buildActivitySessions(visibleGroups.value));
-const runningCount = computed(() => progress.value.runningTotal ?? activitySessions.value.filter(isSessionRunning).length);
+const allActivitySessions = computed(() => buildActivitySessions(visibleGroups.value));
+const activitySessions = computed(() => runningOnly.value && !props.pagination ? allActivitySessions.value.filter(isSessionRunning) : allActivitySessions.value);
+const runningCount = computed(() => progress.value.runningTotal ?? allActivitySessions.value.filter(isSessionRunning).length);
 const visibleActivityLimit = computed(() => props.pagination ? Infinity : searching.value ? searchActivityLimit.value : activityLimit.value);
 const screenEl = ref(null);
 const positionGeneration = props.getPositionGeneration();
 const position = createSessionListPosition({ viewState, getRoot: () => screenEl.value,
-  getContext: () => ({ mode: viewMode.value, query: query.value, loaded: props.loaded }),
+  getContext: () => ({ mode: runningOnly.value ? "running" : viewMode.value, query: query.value, loaded: props.loaded }),
   isCurrent: () => props.viewState === ownedViewState && props.getPositionGeneration() === positionGeneration
 });
 onMounted(() => {
   position.restore();
-  if (props.pagination && queryPending.value) emit("catalog-view", { view: viewMode.value, query: query.value });
+  if (props.pagination && queryPending.value) emit("catalog-view", { view: viewMode.value, query: query.value, runningOnly: runningOnly.value });
 });
 watch(() => [props.loaded, props.groups], position.restore, { flush: "post" });
-watch(() => [query.value, viewMode.value, props.viewState, props.getPositionGeneration()], position.cancel, { flush: "sync" });
+watch(() => [query.value, viewMode.value, runningOnly.value, props.viewState, props.getPositionGeneration()], position.cancel, { flush: "sync" });
 onBeforeUnmount(() => { clearTimeout(searchTimer); position.capture(); position.dispose(); });
 
 function setViewMode(mode) {
   viewMode.value = mode;
-  if (props.pagination) { clearTimeout(searchTimer); emit("catalog-view", { view: mode, query: query.value }); }
+  if (mode === "groups") runningOnly.value = false;
+  if (props.pagination) { clearTimeout(searchTimer); emit("catalog-view", { view: mode, query: query.value, runningOnly: runningOnly.value }); }
   try { window.localStorage.setItem("codex-session-list-view", mode); } catch { /* The view still works without storage. */ }
+}
+function toggleRunning() {
+  runningOnly.value = !runningOnly.value;
+  setViewMode("activity");
 }
 function searchLimit(group) { return searchLimits.value.get(sessionGroupKey(group)) || 5; }
 function showAll(group) { return searching.value ? searchLimit(group) >= group.sessions.length : expandedLists.value.has(sessionGroupKey(group)); }
@@ -154,7 +163,7 @@ const vAutoPage = {
   },
   beforeUnmount(element) { autoPages.get(element)?.stop(); autoPages.delete(element); }
 };
-watch(() => [query.value, viewMode.value], () => {
+watch(() => [query.value, viewMode.value, runningOnly.value], () => {
   pagingIntent = false; requestedCursors.clear();
   for (const record of autoPages.values()) record.waiting = false;
 }, { flush: "sync" });
@@ -238,13 +247,14 @@ function createGroupSession(group) {
 <template>
   <main ref="screenEl" class="session-screen" data-app-scroll tabindex="0" aria-label="会话列表" :aria-busy="loading && !progress.complete"
     @wheel.passive="markPagingIntent" @touchstart.passive="markPagingIntent" @touchmove.passive="markPagingIntent" @keydown="markPagingIntent">
-    <SessionListToolbar v-model:search="query" :mode="viewMode" :running-count="runningCount"
+    <SessionListHeader :pending="Boolean(pendingSessionId)" @create="emit('create-group-session', $event)" />
+    <SessionListToolbar v-model:search="query" :running-only="runningOnly" @toggle-running="toggleRunning" :mode="viewMode" :running-count="runningCount"
       :result-count="progress.complete ? pagination?.page?.activitiesTotal ?? activitySessions.length : null" @update:mode="setViewMode" />
     <div v-if="loadError" class="session-list-error" role="alert">
       <span>{{ loadError }}</span>
       <button type="button" :disabled="loading" aria-label="重新加载会话" title="重新加载会话" @click="emit('retry')">&#x21bb;</button>
     </div>
-    <div v-else-if="(loading || queryPending) && !progress.complete" class="session-list-loading" role="status">{{ searching ? '正在搜索…' : '正在加载会话…' }}</div>
+    <InterfaceState v-else-if="(loading || queryPending) && !progress.complete" :title="searching ? '正在搜索…' : '正在加载会话…'" :layout="visibleGroups.length ? 'inline' : 'list'" />
     <section v-if="visibleGroups.length && viewMode === 'groups'" class="session-groups">
       <section v-for="group in renderedGroups" :key="sessionGroupKey(group)" v-visible-group="sessionGroupKey(group)" class="session-group" :data-group-id="sessionGroupKey(group)">
         <div class="session-group-head">
@@ -302,7 +312,10 @@ function createGroupSession(group) {
       <p v-if="pagination?.groupErrors.get('activity')" class="session-list-error" role="alert">{{ pagination.groupErrors.get('activity') }}</p>
       <button v-if="pagination ? pagination.page?.nextCursor : visibleActivityLimit < activitySessions.length" v-auto-page="'activity'" type="button" class="session-show-more" :disabled="!progress.complete || pagination?.loading || pagination?.loadingGroups.has('activity')" @click="moreActivity">{{ pagination?.loadingGroups.has('activity') ? '正在加载…' : '显示更早的会话' }} <span aria-hidden="true">⌄</span></button>
     </section>
-    <div v-if="progress.complete && !loadError && (viewMode === 'activity' ? !activitySessions.length : !visibleGroups.length)" class="empty-state">{{ searching ? '没有匹配的会话或项目。' : '还没有可展示的会话。' }}</div>
+    <InterfaceState v-if="progress.complete && !loadError && (viewMode === 'activity' ? !activitySessions.length : !visibleGroups.length)"
+      kind="empty" :mood="searching ? 'search' : 'idle'" :title="searching ? runningOnly ? '没有匹配的运行中会话' : '没有匹配的会话或项目。' : runningOnly ? '当前没有运行中的会话' : '还没有可展示的会话。'"
+      :detail="searching ? runningOnly ? '试试其他关键词，或关闭运行中筛选。' : '换个关键词试试，或清空搜索查看全部。' : runningOnly ? '有新任务开始时，会出现在这里。' : '点击上方新建会话，开始你的第一个任务。'"
+      :action-label="searching ? '清空搜索' : runningOnly ? '查看全部会话' : ''" @action="searching ? query = '' : toggleRunning()" />
   </main>
 </template>
 

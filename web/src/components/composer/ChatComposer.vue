@@ -266,6 +266,7 @@ defineExpose({
         ref="textareaEl"
         :value="draft"
         class="chat-composer-draft"
+        aria-label="消息输入框"
         rows="1"
         :placeholder="allowFollowups && followupRunning ? '补充消息…' : isTouchDevice ? '给 Codex 发消息…' : 'Enter 发送，Shift + Enter 换行'"
         :disabled="inputLocked"
@@ -282,6 +283,7 @@ defineExpose({
         @retry="emit('retry-attachment', $event)"
       />
 
+      <p v-if="allowFollowups && followupRunning && hasDraftInput" class="composer-followup-note" role="status">{{ defaultSubmitMode === 'queue' ? '加入队列 · 当前回复结束后发送' : '立即引导 · 补充给当前回复' }}</p>
       <div class="chat-composer-actions">
         <button
           class="chat-composer-icon-button"
@@ -309,6 +311,8 @@ defineExpose({
 
         <button
           class="chat-composer-context-button"
+          aria-label="输入设置：模型、思考强度、权限与分支"
+          title="输入设置"
           type="button"
           aria-haspopup="dialog"
           :aria-expanded="Boolean(activePopover)"
@@ -317,6 +321,7 @@ defineExpose({
           @click="togglePopover('settings')"
         >
           <span class="chat-composer-context-copy">{{ contextSummary }}</span>
+          <svg class="chat-context-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
         </button>
 
         <ComposerSendActions v-if="allowFollowups" :running-task="followupRunning" :follow-up-mode="followUpMode"
@@ -342,6 +347,8 @@ defineExpose({
       ref="captureInputEl"
       class="chat-composer-hidden-input"
       type="file"
+      tabindex="-1"
+      aria-hidden="true"
       accept="image/*"
       capture="environment"
       @change="handleSelectedFiles($event, 'image', 'camera')"
@@ -350,6 +357,8 @@ defineExpose({
       ref="imageInputEl"
       class="chat-composer-hidden-input"
       type="file"
+      tabindex="-1"
+      aria-hidden="true"
       accept="image/*"
       multiple
       @change="handleSelectedFiles($event, 'image', 'upload-image')"
@@ -403,6 +412,11 @@ defineExpose({
   color: #aa9b8f;
 }
 
+.chat-composer:focus-within { border-color: #ad9985; box-shadow: 0 0 0 2px #b6a08b26, 0 10px 30px #715b4810; }
+.chat-composer-icon-button:focus-visible, .chat-composer-context-button:focus-visible { outline: 2px solid #8b7f73; outline-offset: -2px; }
+
+.composer-followup-note { margin: 0; padding: 0 15px 8px; color: #8b7f73; font-size: 11px; line-height: 1.5; }
+
 .chat-composer-actions {
   display: flex;
   align-items: center;
@@ -448,6 +462,9 @@ defineExpose({
 }
 
 .chat-composer-context-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   flex: 1 1 0;
   min-width: 0;
   min-height: 36px;
@@ -459,6 +476,8 @@ defineExpose({
   text-align: left;
   overflow: hidden;
 }
+
+.chat-context-chevron { width: 14px; height: 14px; flex: 0 0 auto; fill: none; stroke: #8b7f73; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 
 .chat-composer-context-copy {
   display: block;
@@ -496,5 +515,9 @@ defineExpose({
   height: 1px;
   opacity: 0;
   pointer-events: none;
+}
+@media (pointer: coarse) {
+  .chat-composer-icon-button { width: 44px; height: 44px; }
+  .chat-composer-context-button { min-height: 44px; }
 }
 </style>

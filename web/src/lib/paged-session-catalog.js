@@ -7,13 +7,13 @@ function savedView() {
   catch { return "groups"; }
 }
 
-function emptyCatalog(view = savedView(), query = "") {
-  return { view, query, revision: "", page: null, loading: false, loadingGroups: new Set(), groupErrors: new Map() };
+function emptyCatalog(view = savedView(), query = "", runningOnly = false) {
+  return { view, query, runningOnly, revision: "", page: null, loading: false, loadingGroups: new Set(), groupErrors: new Map() };
 }
 
 function validate(payload, catalog) {
   if (payload?.catalogFormat !== "paged-v1" || typeof payload.revision !== "string" || !payload.revision
-    || payload.view !== catalog.view || normalizeCatalogQuery(payload.query) !== catalog.query
+    || payload.view !== catalog.view || Boolean(payload.runningOnly) !== catalog.runningOnly || normalizeCatalogQuery(payload.query) !== catalog.query
     || !Array.isArray(payload.sessions) || !Array.isArray(payload.projectGroups) || !payload.catalogPage) {
     throw new Error("会话列表格式无效，请重试。");
   }
@@ -55,7 +55,7 @@ export function createPagedSessionCatalog({ state, request, sessionCache = {} })
     const owner = { key, generation, controller: new AbortController() };
     const cancellation = new Promise((resolve) => { owner.cancel = () => resolve(null); });
     reads.set(key, owner);
-    const params = new URLSearchParams({ view: state.sessionCatalog.view, q: state.sessionCatalog.query, limit: "20", ...parameters });
+    const params = new URLSearchParams({ view: state.sessionCatalog.view, q: state.sessionCatalog.query, limit: "20", ...(state.sessionCatalog.runningOnly ? { running: "1" } : {}), ...parameters });
     owner.promise = Promise.race([request(`/api/session-catalog?${params}`, { signal: owner.controller.signal }), cancellation])
       .then((received) => {
         if (!current(owner) || !received) return;
@@ -100,12 +100,13 @@ export function createPagedSessionCatalog({ state, request, sessionCache = {} })
     return manifest;
   }
 
-  function setView({ view = state.sessionCatalog.view, query = state.sessionSearch || "" } = {}) {
+  function setView({ view = state.sessionCatalog.view, query = state.sessionSearch || "", runningOnly = state.sessionCatalog.runningOnly } = {}) {
     view = view === "activity" ? "activity" : "groups";
     query = normalizeCatalogQuery(query);
-    if (state.sessionCatalog.view === view && state.sessionCatalog.query === query) return refresh();
+    runningOnly = view === "activity" && Boolean(runningOnly);
+    if (state.sessionCatalog.runningOnly === runningOnly && state.sessionCatalog.view === view && state.sessionCatalog.query === query) return refresh();
     cancel();
-    state.sessionCatalog = emptyCatalog(view, query);
+    state.sessionCatalog = emptyCatalog(view, query, runningOnly);
     state.sessions = []; state.projectGroups = [];
     state.sessionListReady = false; state.sessionListComplete = false; state.sessionListError = null;
     return refresh();

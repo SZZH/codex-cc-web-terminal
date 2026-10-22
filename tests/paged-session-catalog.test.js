@@ -77,6 +77,82 @@ test("activity mode appends server pages and retains the same revision and group
   assert.equal(state.sessionCatalog.page.nextCursor, null);
 });
 
+test("running activity requests full filtered pages and preserves filter and loaded range through refresh", async () => {
+  const sessions = Array.from({ length: 120 }, (_, index) => ({ ...row(`s${index}`), updatedAt: index + 1,
+    activityState: index < 100 && index % 2 === 0 ? "running" : "idle" }));
+  const server = createSessionCatalogPages({ loadSnapshot: () => ({ sessions,
+    projectGroups: [{ id: "project:a", name: "A", sessions }] }) });
+  const { state, catalog, calls } = setup((params) => server.read(params));
+  assert.equal(state.sessionCatalog.runningOnly, false);
+  await catalog.refresh();
+  assert.equal(calls[0].params.has("running"), false);
+  await catalog.setView({ view: "activity", runningOnly: true });
+  assert.equal(state.sessionCatalog.runningOnly, true);
+  assert.equal(calls[1].params.get("running"), "1");
+  assert.equal(calls[1].params.has("loaded"), false);
+  assert.equal(state.sessions.length, 20);
+  assert.ok(state.sessions.every((entry) => entry.activityState === "running"));
+  const cursor = state.sessionCatalog.page.nextCursor;
+  await catalog.loadMore();
+  assert.equal(calls[2].params.get("cursor"), cursor);
+  assert.equal(calls[2].params.get("running"), "1");
+  assert.equal(state.sessions.length, 40);
+  sessions[98].activityState = "idle";
+  sessions[119].activityState = "running";
+  await catalog.refresh();
+  assert.equal(calls[3].params.get("running"), "1");
+  assert.deepEqual(JSON.parse(calls[3].params.get("loaded")), { activity: 40 });
+  assert.equal(state.sessions.length, 40);
+  assert.equal(state.sessions[0].id, "s119");
+  await catalog.loadMore();
+  assert.deepEqual(state.sessions.map((entry) => entry.id), sessions.filter((entry) => entry.activityState === "running").reverse().map((entry) => entry.id));
+  assert.equal(state.sessionCatalog.page.nextCursor, null);
+  await catalog.setView({ query: "s119" });
+  assert.equal(calls.at(-1).params.get("running"), "1");
+  assert.deepEqual(state.sessions.map((entry) => entry.id), ["s119"]);
+  await catalog.setView({ view: "groups", runningOnly: true });
+  assert.equal(state.sessionCatalog.runningOnly, false);
+  assert.equal(calls.at(-1).params.has("running"), false);
+});
+
+test("running response context mismatches cannot publish a manifest or append a page", async () => {
+  for (const response of [payload({ view: "activity" }), { ...payload({ view: "activity" }), runningOnly: false }]) {
+    const { state, catalog } = setup(() => Promise.resolve(response));
+    await assert.rejects(catalog.setView({ view: "activity", runningOnly: true }), /会话列表格式无效/);
+    assert.deepEqual(state.sessions, []);
+    assert.equal(state.sessionListReady, false);
+    assert.equal(state.sessionCatalog.loading, false);
+  }
+  const { state, catalog } = setup((_params, count) => Promise.resolve({ ...payload({ view: "activity", ids: count === 1 ? ["a"] : ["unfiltered"] }),
+    ...(count === 1 ? { runningOnly: true } : {}) }));
+  await catalog.setView({ view: "activity", runningOnly: true });
+  await assert.rejects(catalog.loadMore(), /会话列表格式无效/);
+  assert.deepEqual(state.sessions.map((entry) => entry.id), ["a"]);
+  assert.match(state.sessionCatalog.groupErrors.get("activity"), /会话列表格式无效/);
+  const ordinary = setup(() => Promise.resolve({ ...payload({ view: "activity" }), runningOnly: true }));
+  await assert.rejects(ordinary.catalog.setView({ view: "activity" }), /会话列表格式无效/);
+  assert.deepEqual(ordinary.state.sessions, []);
+});
+
+test("switching the running filter cancels an ordinary response and switching groups clears the filter", async () => {
+  const old = deferred();
+  const { state, catalog, calls } = setup((params, count) => count === 1 ? old.promise : Promise.resolve({
+    ...payload({ view: params.get("view"), ids: [params.has("running") ? "running" : "group"] }),
+    ...(params.has("running") ? { runningOnly: true } : {}) }));
+  const pending = catalog.setView({ view: "activity" });
+  await catalog.setView({ view: "activity", runningOnly: true });
+  assert.equal(calls[0].options.signal.aborted, true);
+  old.resolve(payload({ view: "activity", ids: ["late-unfiltered"] }));
+  await pending;
+  assert.deepEqual(state.sessions.map((entry) => entry.id), ["running"]);
+  await catalog.setView({ view: "groups" });
+  assert.equal(state.sessionCatalog.runningOnly, false);
+  assert.equal(calls.at(-1).params.has("running"), false);
+  assert.deepEqual(state.sessions.map((entry) => entry.id), ["group"]);
+  catalog.invalidate();
+  assert.equal(state.sessionCatalog.runningOnly, false);
+});
+
 test("an initially empty activity view discovers new sessions on the next refresh", async () => {
   const { state, catalog, calls } = setup((params, count) => Promise.resolve(payload({ view: params.get("view"),
     ids: count === 1 ? [] : ["new-thread"], next: null })));

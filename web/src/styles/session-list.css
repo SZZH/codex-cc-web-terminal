@@ -21,7 +21,7 @@
 .session-running-count { flex: 0 0 auto; color: #846b54; font-size: 11px; white-space: nowrap; }
 .session-show-more { display: flex; align-items: center; gap: 8px; align-self: flex-start; padding: 8px 12px; border: 0; border-radius: 8px; background: transparent; color: #88715e; font: inherit; font-size: 12px; cursor: pointer; }
 .session-show-more:hover { background: #f0e8df; }
-.session-activity { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid #dfd4ca; border-radius: 18px; background: #faf6f1; }
+.session-activity { display: flex; flex-direction: column; gap: 3px; padding: 0; border: 0; border-radius: 0; background: transparent; }
 
 .session-groups {
   display: flex;
@@ -36,7 +36,7 @@
   border: 1px solid rgba(201, 189, 177, 0.55);
   border-radius: 20px;
   background: linear-gradient(180deg, rgba(255, 251, 247, 0.98), rgba(247, 242, 237, 0.94));
-  box-shadow: 0 12px 30px rgba(120, 101, 84, 0.05);
+  box-shadow: none;
 }
 
 .session-group-head {
@@ -258,3 +258,6 @@
     padding: 14px 16px 20px;
   }
 }
+
+@media (pointer: coarse) { .session-group-add { flex-basis: 44px; width: 44px; height: 44px; } }
+@media (prefers-reduced-motion: reduce) { .session-group-add.loading::after { animation: none; } .session-group-toggle-area, .session-group-add { transition: none; } }

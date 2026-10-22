@@ -1,4 +1,5 @@
 @import "./thread-turn-item.css";
+@import "./interface-state.css";
 
 :root {
   color-scheme: light;

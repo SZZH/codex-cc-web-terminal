@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { defineAppView } from "./lib/async-view.js";
+import InterfaceState from "./components/InterfaceState.js";
 import { useRoute, useRouter } from "vue-router";
 import PreviewHost from "./components/preview/PreviewHost.vue";
 import { previewState, closeLocalPreview, invalidateLocalPreviewPosition } from "./lib/preview.js";
@@ -147,6 +148,11 @@ function syncThreadViewFromInteraction() {
 }
 
 const groupedSessions = createGroupedSessionsComputed(state);
+const initialCodexSession = computed(() => state.sessions.find((session) =>
+  (session.resumeSessionId || session.threadId) === codexThreadId.value));
+watch(() => route.name, (name) => {
+  if (name !== "chat" && typeof document !== "undefined") document.title = `Codex Web · ${name === 'login' ? '登录' : '会话'}`;
+}, { immediate: true });
 const selectors = createSessionSelectors({
   state,
   route,
@@ -874,7 +880,7 @@ if (typeof window !== 'undefined') {
     <div class="app-content">
   <div class="app-shell">
     <div v-if="!state.ready" class="splash-screen">
-      <div class="splash-card">正在加载会话…</div>
+      <InterfaceState title="正在读取会话…" detail="Codex Web" />
     </div>
 
     <LoginView
@@ -917,6 +923,8 @@ if (typeof window !== 'undefined') {
         v-else-if="codexThreadId"
         :key="codexThreadId"
         :thread-id="codexThreadId"
+        :initial-title="initialCodexSession?.name || initialCodexSession?.displayTitle || ''"
+        :initial-cwd="initialCodexSession?.cwd || ''"
         :load-config="requestWorkspaceConfig"
         @back="backToSessionList"
         @status="setStatus"
@@ -957,7 +965,7 @@ if (typeof window !== 'undefined') {
       />
 
       <section v-else class="mobile-shell centered-shell">
-        <div class="splash-card">{{ state.statusText || "正在加载会话页面…" }}</div>
+        <InterfaceState :title="state.statusText || '正在加载会话页面…'" />
       </section>
     </template>
   </div>

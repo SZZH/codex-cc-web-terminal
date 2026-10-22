@@ -82,6 +82,7 @@ defineEmits([
           {{ option.label }}
         </button>
       </div>
+      <p class="permission-description">{{ permissionModeOptions.find(option => option.value === composerOptions.permissionMode)?.description }}</p>
     </section>
 
     <section class="settings-group git-entry-wrap">
@@ -121,6 +122,9 @@ defineEmits([
   gap: 16px;
   padding: 14px 16px 16px;
 }
+.permission-description { margin: 0; color: #7f7165; font-size: 12px; line-height: 1.6; }
+.option-chip:focus-visible { outline: 2px solid #8b7f73; outline-offset: 2px; }
+@media (pointer: coarse) { .option-chip { min-height: 44px; } }
 
 .settings-group {
   display: flex;

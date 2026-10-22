@@ -188,6 +188,7 @@ function mountList(t, groups, props = {}) {
     renderComponent(component){renderer.render(null,root);renderer.render(h(component),root);}};
 }
 const fixtures=(count)=>Array.from({length:count},(_,index)=>({id:`s-${index}`,provider:'codex',resumeSessionId:`s-${index}`,displayTitle:`会话 ${index}`,updatedAt:new Date(Date.UTC(2026,9,16,0,index)).toISOString()}));
+const nodeText=node=>node.type==='comment'||node.text==='v-if'||node.props?.['aria-hidden']==='true'?'':[node.text||'',...(node.children||[]).map(nodeText)].join('');
 
 function retainedListState() {
   return reactive(createSessionListViewState());
@@ -212,12 +213,12 @@ test('returning during the search debounce submits the retained query on the new
   const ui=mountList(t,[],{loaded:true,pagination,onCatalogView:context=>contexts.push(context)});
   enterSearch(ui,'needle');await nextTick();
   ui.remount({searchQuery:'needle'});await nextTick();
-  assert.deepEqual(contexts,[{view:'groups',query:'needle'}]);
+  assert.deepEqual(contexts,[{view:'groups',query:'needle',runningOnly:false}]);
   pagination.query='needle';
   ui.update([{id:'a',name:'Project',sessions:fixtures(1),catalogPage:{total:1,running:0,nextCursor:null}}]);
   await nextTick();
   assert.equal(ui.byClass('session-row').length,1);
-  assert.equal(ui.byClass('session-list-loading').length,0);
+  assert.equal(ui.byClass('state-loading').length,0);
   await new Promise(resolve=>setTimeout(resolve,270));
   assert.equal(contexts.length,1,'the cancelled previous instance cannot issue a late duplicate search');
 });
@@ -521,7 +522,7 @@ test('legacy Response to API to App and List keeps early rows usable, cancels le
     assert.equal(streams.length,1);assert.equal(streams[0].url,'/api/sessions?compact=1&progressive=1');
     send(streams[0],bootstrap);await flushApp();
     assert.equal(ui.byClass('session-row').length,5);assert.equal(ui.byClass('session-group-count')[0].text,'31');
-    assert.equal(ui.byClass('session-running-count')[0].text,'2 个运行中');
+    assert.equal(nodeText(ui.byClass('session-running-count')[0]),'2 个运行中');
     assert.equal(ui.byClass('session-group-add')[0].props.disabled,true);
     ui.byClass('session-row')[0].props.onClick();await flushApp();
     assert.equal(route.name,'chat');assert.equal(route.params.sessionId,'history:codex:s-0');
@@ -530,16 +531,16 @@ test('legacy Response to API to App and List keeps early rows usable, cancels le
     assert.equal(ui.byClass('session-row').length,5,'reentry retains the readable first batch');
     send(streams[1],bootstrap);await flushApp();enterSearch(ui,'oldest hidden preview');await flushApp();
     assert.equal(ui.byClass('session-row').length,0);assert.equal(ui.byClass('session-search-count').length,0);
-    assert.equal(ui.byClass('empty-state').length,0);assert.equal(ui.byClass('session-list-loading').length,1);
+    assert.equal(ui.byClass('state-empty').length,0);assert.equal(ui.byClass('state-loading').length,1);
     streams[1].controller.close();await flushApp();
-    assert.equal(ui.byClass('session-list-error').length,1);assert.equal(ui.byClass('empty-state').length,0);
+    assert.equal(ui.byClass('session-list-error').length,1);assert.equal(ui.byClass('state-empty').length,0);
     assert.equal(ui.byClass('session-list-error')[0].children.find(node=>node.type==='span').text,'会话列表尚未完整加载，请重试。');
     assert(window.__codexWebDebug.state.sessionListError.cause instanceof Error);
     assert.equal(window.__codexWebDebug.state.sessionListComplete,false);
     ui.byClass('session-list-error')[0].children.find(node=>node.type==='button').props.onClick();await flushApp();
     assert.equal(streams.length,3);send(streams[2],bootstrap);send(streams[2],{...complete,protocol:'wrong'});streams[2].controller.close();await flushApp();
     assert.equal(ui.byClass('session-list-error')[0].children.find(node=>node.type==='span').text,'会话列表尚未完整加载，请重试。');
-    assert.equal(window.__codexWebDebug.state.sessionListComplete,false);assert.equal(ui.byClass('empty-state').length,0);
+    assert.equal(window.__codexWebDebug.state.sessionListComplete,false);assert.equal(ui.byClass('state-empty').length,0);
     ui.byClass('session-list-error')[0].children.find(node=>node.type==='button').props.onClick();await flushApp();
     assert.equal(streams.length,4);send(streams[3],bootstrap);send(streams[3],complete);streams[3].controller.close();await flushApp();
     assert.equal(ui.byClass('session-row').length,1);assert.equal(ui.byClass('session-row')[0].props['data-session-id'],'s-30');
@@ -653,8 +654,87 @@ test('recent activity switches view, opens the same session, pages older entries
   ui.remount();await nextTick();
   assert.equal(ui.find(node=>node.type==='button'&&node.text==='最近活动')[0].props['aria-pressed'],true);
   assert.equal(ui.byClass('session-row').length,20);
-  ui.find(node=>node.type==='button'&&node.text==='分组')[0].props.onClick();await nextTick();
+  ui.find(node=>node.type==='button'&&node.text==='按项目')[0].props.onClick();await nextTick();
   assert.equal(ui.byClass('session-row').length,5);
+});
+
+test('running filter opens activity, excludes idle and unknown sessions, and remains clearable when none remain',async(t)=>{
+  const sessions=fixtures(4);
+  sessions[0].activityState='running';sessions[1].activityState='idle';sessions[2].activityState='unknown';sessions[3].activityState='running';
+  const group={id:'a',name:'Project',sessions},ui=mountList(t,[group]);
+  const toggle=()=>ui.find(node=>node.type==='button'&&String(node.props?.class||'').split(' ').includes('session-running-count'))[0];
+  assert.equal(toggle().props['aria-pressed'],false);
+  toggle().props.onClick();await nextTick();
+  assert.equal(toggle().props['aria-pressed'],true);
+  assert.equal(ui.find(node=>node.type==='button'&&node.text==='最近活动')[0].props['aria-pressed'],true);
+  assert.deepEqual(ui.byClass('session-row').map(node=>node.props['data-session-id']),['s-3','s-0']);
+  ui.byClass('session-row')[0].props.onClick();assert.deepEqual(ui.opened,['s-3']);
+  const stopped={...group,sessions:sessions.map(session=>({...session,activityState:'idle'}))};
+  ui.update([stopped]);await nextTick();
+  assert.equal(ui.byClass('session-row').length,0);
+  assert.equal(toggle().props['aria-pressed'],true);
+  assert.equal(nodeText(toggle()),'0 个运行中');
+  toggle().props.onClick();await nextTick();
+  assert.equal(ui.byClass('session-row').length,4);
+  ui.update([group]);await nextTick();
+  toggle().props.onClick();await nextTick();
+  ui.find(node=>node.type==='button'&&node.text==='按项目')[0].props.onClick();await nextTick();
+  assert.equal(toggle().props['aria-pressed'],false);
+  assert.equal(ui.byClass('session-row').length,4);
+});
+
+test('search keeps the running filter visible and clearing it preserves the query, including an empty running result',async(t)=>{
+  const sessions=fixtures(3).map((session,index)=>({...session,
+    displayTitle:index<2?'needle task':'unrelated task',activityState:index===1?'idle':'running'}));
+  const group={id:'a',name:'Project',sessions},ui=mountList(t,[group]);
+  const toggle=()=>ui.find(node=>node.type==='button'&&String(node.props?.class||'').split(' ').includes('session-running-count'))[0];
+  const ids=()=>ui.byClass('session-row').map(node=>node.props['data-session-id']);
+  toggle().props.onClick();await nextTick();
+  enterSearch(ui,'needle');await nextTick();
+  assert.deepEqual(ids(),['s-0']);
+  assert.equal(ui.byClass('session-search-count')[0].text,'1 个匹配会话');
+  assert.equal(ui.byClass('session-search-clear').length,1);
+  assert.equal(toggle().props['aria-pressed'],true,'search results must not replace the active filter control');
+  toggle().props.onClick();await nextTick();
+  assert.equal(toggle().props['aria-pressed'],false);
+  assert.equal(ui.byClass('session-search-input')[0].value,'needle');
+  assert.deepEqual(ui.searches,['needle']);
+  assert.deepEqual(ids(),['s-1','s-0']);
+  assert.equal(ui.byClass('session-search-count')[0].text,'2 个匹配会话');
+  toggle().props.onClick();await nextTick();
+  ui.update([{...group,sessions:sessions.map(session=>({...session,activityState:'idle'}))}]);await nextTick();
+  assert.deepEqual(ids(),[]);
+  assert.equal(ui.byClass('session-search-count')[0].text,'0 个匹配会话');
+  assert.equal(toggle().props['aria-pressed'],true);
+  assert.match(nodeText(ui.byClass('state-empty')[0]),/没有匹配的运行中会话/);
+  assert.match(nodeText(ui.byClass('state-empty')[0]),/试试其他关键词，或关闭运行中筛选/);
+  toggle().props.onClick();await nextTick();
+  assert.equal(ui.byClass('session-search-input')[0].value,'needle');
+  assert.deepEqual(ui.searches,['needle']);
+  assert.deepEqual(ids(),['s-1','s-0']);
+  assert.equal(ui.byClass('state-empty').length,0);
+});
+
+test('paged running toggle requests server filtering and preserves its context in search and return navigation',async(t)=>{
+  const contexts=[];
+  const pagination=reactive({view:'groups',query:'',runningOnly:false,revision:'r1',page:{runningTotal:25,activitiesTotal:100},
+    loading:false,loadingGroups:new Set(),groupErrors:new Map()});
+  const ui=mountList(t,[],{loaded:true,pagination,onCatalogView:context=>contexts.push(context)});
+  const toggle=()=>ui.find(node=>node.type==='button'&&String(node.props?.class||'').split(' ').includes('session-running-count'))[0];
+  toggle().props.onClick();await nextTick();
+  assert.deepEqual(contexts,[{view:'activity',query:'',runningOnly:true}]);
+  Object.assign(pagination,{view:'activity',runningOnly:true});
+  const running=fixtures(2).map(session=>({...session,activityState:'running'}));
+  ui.update([{id:'a',name:'Project',sessions:running,catalogPage:{total:100,running:25,nextCursor:null}}]);await nextTick();
+  assert.equal(ui.byClass('session-row').length,2);
+  assert.equal(nodeText(toggle()),'25 个运行中','the toolbar uses the full server count, not loaded rows');
+  ui.remount();await nextTick();
+  assert.equal(toggle().props['aria-pressed'],true);
+  enterSearch(ui,'needle');await nextTick();
+  await new Promise(resolve=>setTimeout(resolve,270));
+  assert.deepEqual(contexts.at(-1),{view:'activity',query:'needle',runningOnly:true});
+  ui.find(node=>node.type==='button'&&node.text==='按项目')[0].props.onClick();await nextTick();
+  assert.deepEqual(contexts.at(-1),{view:'groups',query:'needle',runningOnly:false});
 });
 
 test('activity view reorders when actual usage changes and removes a finished running marker',async(t)=>{
@@ -767,16 +847,16 @@ test('partial list displays real counts and usable rows while withholding search
   const ui=mountList(t,[group],{loaded:true,complete:false,loading:true,counts});
   assert.equal(ui.byClass('session-row').length,5);
   assert.equal(ui.byClass('session-group-count')[0].text,'51');
-  assert.ok(ui.byClass('session-running-count').every(node=>node.text==='8 个运行中'));
+  assert.ok(ui.byClass('session-running-count').every(node=>nodeText(node)==='8 个运行中'));
   assert.equal(ui.byClass('session-group-add')[0].props.disabled,true);
   assert.equal(ui.byClass('session-show-more')[0].props.disabled,true);
   ui.byClass('session-row')[0].props.onClick();await nextTick();assert.equal(ui.opened.length,1);
   ui.setProps({searchQuery:'last hidden preview'});await nextTick();
   assert.equal(ui.byClass('session-row').length,0);
-  assert.equal(ui.byClass('session-search-count').length,0);assert.equal(ui.byClass('empty-state').length,0);
-  assert.equal(ui.byClass('session-list-loading').length,1);
+  assert.equal(ui.byClass('session-search-count').length,0);assert.equal(ui.byClass('state-empty').length,0);
+  assert.equal(ui.byClass('state-loading').length,1);
   ui.setProps({loading:false,loadError:'尚未完整加载，请重试。'});await nextTick();
-  assert.equal(ui.byClass('session-list-error').length,1);assert.equal(ui.byClass('empty-state').length,0);
+  assert.equal(ui.byClass('session-list-error').length,1);assert.equal(ui.byClass('state-empty').length,0);
   const last={...fixtures(1)[0],id:'last',resumeSessionId:'last',inputPreview:'last hidden preview'};
   ui.setProps({complete:true,counts:null,loading:false,loadError:''});ui.update([{...group,sessions:[...sessions,last]}]);await nextTick();
   assert.equal(ui.byClass('session-row').length,1);assert.equal(ui.byClass('session-search-count')[0].text,'1 个匹配会话');
@@ -788,21 +868,25 @@ test('partial activity mode keeps its actual running total and disables further 
     counts:{sessionsTotal:45,activitiesTotal:45,runningTotal:12,groups:[{key:'a',total:45,running:12}]}});
   const activity=ui.find(node=>node.type==='button'&&node.text==='最近活动')[0];activity.props.onClick();await nextTick();
   assert.equal(ui.byClass('session-row').length,20);assert.equal(ui.byClass('session-show-more')[0].props.disabled,true);
-  assert.equal(ui.byClass('session-running-count')[0].text,'12 个运行中');
+  assert.equal(nodeText(ui.byClass('session-running-count')[0]),'12 个运行中');
 });
 
 test('initial loading and failed reads never pretend to be an empty catalog, and refresh errors retain rows',async(t)=>{
   const ui=mountList(t,[],{loaded:false,loading:true});
-  assert.equal(ui.byClass('session-list-loading').length,1);
-  assert.equal(ui.byClass('empty-state').length,0);
+  assert.equal(ui.byClass('state-loading').length,1);
+  assert.equal(ui.byClass('state-loading')[0].props.role,'status');
+  assert.equal(ui.byClass('state-loading')[0].props['aria-busy'],true);
+  assert.match(nodeText(ui.byClass('state-loading')[0]),/正在加载会话/);
+  assert.equal(ui.byClass('state-empty').length,0);
   ui.setProps({loading:false,loadError:'读取失败'});await nextTick();
   assert.equal(ui.byClass('session-list-error').length,1);
-  assert.equal(ui.byClass('empty-state').length,0);
+  assert.equal(ui.byClass('state-empty').length,0);
   ui.find(node=>node.props?.['aria-label']==='重新加载会话')[0].props.onClick();assert.equal(ui.retries.length,1);
   ui.setProps({loading:true});await nextTick();
   assert.equal(ui.find(node=>node.props?.['aria-label']==='重新加载会话')[0].props.disabled,true);
   ui.setProps({loading:false,loaded:true,loadError:''});await nextTick();
-  assert.equal(ui.byClass('empty-state').length,1);
+  assert.equal(ui.byClass('state-empty').length,1);
+  assert.match(nodeText(ui.byClass('state-empty')[0]),/还没有可展示的会话/);
   ui.update([{id:'a',name:'Project',sessions:fixtures(8)}]);await nextTick();
   ui.setProps({loadError:'刷新失败'});await nextTick();
   assert.equal(ui.byClass('session-row').length,5);
@@ -811,7 +895,7 @@ test('initial loading and failed reads never pretend to be an empty catalog, and
 test('a degraded empty snapshot shows recovery feedback without asserting empty results',async(t)=>{
   const ui=mountList(t,[],{loaded:true,loadError:'数据暂时无法更新'});
   assert.equal(ui.byClass('session-list-error').length,1);
-  assert.equal(ui.byClass('empty-state').length,0);
+  assert.equal(ui.byClass('state-empty').length,0);
   ui.update([{id:'project',name:'Project',sessions:[]}]);await nextTick();
   assert.equal(ui.byClass('session-row-placeholder').length,0);
   ui.setProps({loadError:''});await nextTick();

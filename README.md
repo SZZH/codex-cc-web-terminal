@@ -181,6 +181,13 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.4.1`
+
+- Added a warm pixel companion, matching logo and favicon, and consistent loading, empty, error, and waiting states.
+- Refined session and chat headers, project selection, and mobile touch targets; saved projects sharing a directory remain distinguishable.
+- Added a running-session filter across the complete paged catalog, compatible with search.
+- Kept Stop available while drafting a follow-up and clarified queue, guidance, and permission settings.
+
 ### `v0.4.0`
 
 Core updates since `v0.3.0`:

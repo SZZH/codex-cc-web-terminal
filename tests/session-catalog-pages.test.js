@@ -244,6 +244,115 @@ test("activity uses latest identity once, retains cross-group membership order a
   assert.equal(next.catalogPage.nextCursor, null);
 });
 
+test("running activity filters the full snapshot before paging and freezes every matching row", async () => {
+  const payload = fixture(161);
+  for (let index = 0; index <= 120; index += 3) payload.sessions[index].activityState = "running";
+  payload.projectGroups = [group("project:a", payload.sessions.slice(0, 80), { collapsed: true }), group("project:b", payload.sessions.slice(80))];
+  const expected = ids(payload.sessions.filter((row) => row.activityState === "running").reverse());
+  const controller = pagesFor(payload);
+  const ordinary = await controller.read({ view: "activity" });
+  assert.equal(ordinary.sessions.some((row) => row.activityState === "running"), false);
+  const first = await controller.read({ view: "activity", running: "1" });
+  assert.equal(first.runningOnly, true);
+  assert.equal(first.catalogPage.total, 41);
+  assert.equal(first.catalogPage.activitiesTotal, 41);
+  assert.equal(first.catalogPage.runningTotal, 41);
+  assert.equal(first.catalogPage.sessionsTotal, 161);
+  assert.equal(first.sessions.length, 20);
+  const collected = [...ids(first.sessions)];
+  let cursor = first.catalogPage.nextCursor;
+  payload.sessions[0].activityState = "idle";
+  payload.sessions[160].activityState = "running";
+  while (cursor) {
+    const page = await controller.read({ view: "activity", running: "1", cursor });
+    assert.equal(page.revision, first.revision);
+    assert.ok(page.sessions.every((row) => row.activityState === "running"));
+    collected.push(...ids(page.sessions));
+    cursor = page.catalogPage.nextCursor;
+  }
+  assert.deepEqual(collected, expected);
+  assert.equal(new Set(collected).size, 41);
+});
+
+test("running activity intersects normalized full-preview search and keeps identity deduplication", async () => {
+  const payload = fixture(61);
+  for (const index of [0, 21, 42]) Object.assign(payload.sessions[index], { activityState: "running", inputPreview: "特征词 ＡＢＣ" });
+  payload.sessions[60].inputPreview = "特征词 ABC";
+  const alias = { ...payload.sessions[42], id: "latest-alias", updatedAt: "2030-01-01T00:00:00Z" };
+  payload.projectGroups.push(group("alias-project", [alias, payload.sessions[21]]));
+  const controller = pagesFor(payload);
+  const page = await controller.read({ view: "activity", running: "1", q: "  特征词\tABC  " });
+  assert.equal(page.query, "特征词 abc");
+  assert.deepEqual(ids(page.sessions), [alias.id, payload.sessions[21].id, payload.sessions[0].id]);
+  assert.equal(page.catalogPage.total, 3);
+  assert.equal(page.catalogPage.activitiesTotal, 3);
+  assert.equal(page.catalogPage.runningTotal, 3);
+  assert.equal(page.catalogPage.nextCursor, null);
+  const empty = await controller.read({ view: "activity", running: "1", q: "Preview 59" });
+  assert.deepEqual(empty.sessions, []);
+  assert.equal(empty.runningOnly, true);
+  assert.equal(empty.catalogPage.runningTotal, 0);
+  assert.equal(empty.catalogPage.activitiesTotal, 0);
+});
+
+test("activity cursors bind the running filter while explicit zero matches the default context", async () => {
+  const payload = fixture(70);
+  for (let index = 0; index < 50; index += 1) payload.sessions[index].activityState = "running";
+  const controller = pagesFor(payload);
+  const ordinary = await controller.read({ view: "activity" });
+  const filtered = await controller.read({ view: "activity", running: "1" });
+  for (const options of [
+    { running: "1", cursor: ordinary.catalogPage.nextCursor },
+    { cursor: filtered.catalogPage.nextCursor },
+    { running: "0", cursor: filtered.catalogPage.nextCursor }
+  ]) await assertCode(controller.read({ view: "activity", ...options }), 400, "CATALOG_INVALID_REQUEST");
+  const defaultNext = await controller.read({ view: "activity", cursor: ordinary.catalogPage.nextCursor });
+  const explicitNext = await controller.read({ view: "activity", running: "0", cursor: ordinary.catalogPage.nextCursor });
+  assert.deepEqual(explicitNext, defaultNext);
+  assert.equal(Object.hasOwn(explicitNext, "runningOnly"), false);
+  const [body, signature] = filtered.catalogPage.nextCursor.split(".");
+  const forgedBody = { ...JSON.parse(Buffer.from(body, "base64url").toString()), runningOnly: false };
+  const forgedCursor = `${Buffer.from(JSON.stringify(forgedBody)).toString("base64url")}.${signature}`;
+  await assertCode(controller.read({ view: "activity", cursor: forgedCursor }), 400, "CATALOG_INVALID_REQUEST");
+});
+
+test("running loaded refresh preserves its window and remaining filtered pages after activity changes", async () => {
+  const payload = fixture(120);
+  for (let index = 0; index < 100; index += 2) payload.sessions[index].activityState = "running";
+  const controller = pagesFor(payload);
+  const first = await controller.read({ view: "activity", running: "1", loaded: '{"activity":31}' });
+  assert.equal(first.sessions.length, 31);
+  payload.sessions[98].activityState = "idle";
+  payload.sessions[119].activityState = "running";
+  const refreshed = await controller.read({ view: "activity", running: "1", loaded: '{"activity":31}' });
+  assert.notEqual(refreshed.revision, first.revision);
+  assert.equal(refreshed.sessions.length, 31);
+  assert.equal(refreshed.sessions[0].id, payload.sessions[119].id);
+  assert.equal(refreshed.catalogPage.runningTotal, 50);
+  const next = await controller.read({ view: "activity", running: "1", cursor: refreshed.catalogPage.nextCursor });
+  assert.equal(next.sessions.length, 19);
+  assert.equal(next.catalogPage.nextCursor, null);
+  assert.deepEqual(ids([...refreshed.sessions, ...next.sessions]), ids(payload.sessions.filter((row) => row.activityState === "running").reverse()));
+});
+
+test("running parameters reject ambiguous or unsupported values before loading and zero preserves groups", async () => {
+  let reads = 0;
+  const controller = createSessionCatalogPages({ loadSnapshot: async () => { reads += 1; return fixture(); } });
+  for (const query of ["view=activity&running=", "view=activity&running=true", "view=activity&running=2",
+    "view=activity&running=01", "view=activity&running=1.0", "view=activity&running=%201",
+    "view=activity&running=1&running=1", "view=activity&running=0&running=1", "view=groups&running=1", "running=1"]) {
+    await assertCode(controller.read(new URLSearchParams(query)), 400, "CATALOG_INVALID_REQUEST");
+  }
+  assert.equal(reads, 0);
+  const ordinary = await controller.read({});
+  assert.deepEqual(await controller.read({ running: "0" }), ordinary);
+  const degraded = await pagesFor({ sessions: [], projectGroups: [], sidebarStatus: { degraded: true } })
+    .read({ view: "activity", running: "1" });
+  assert.equal(degraded.runningOnly, true);
+  assert.equal(degraded.sidebarStatus.degraded, true);
+  assert.equal(degraded.catalogPage.degraded, true);
+});
+
 test("unchanged source reuses revision for validators and degraded snapshots remain explicit", async () => {
   const payload = fixture();
   const controller = pagesFor(payload);

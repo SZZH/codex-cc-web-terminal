@@ -1,5 +1,6 @@
 <script setup>
 import { computed, reactive, useId, watch } from "vue";
+import PixelCompanion from "../PixelCompanion.js";
 
 const props = defineProps({ question: { type: Object, required: true }, canRespond: { type: Boolean, default: false } });
 const emit = defineEmits(["answer"]);
@@ -33,7 +34,7 @@ function submit(question, index) {
     <p v-for="entry in question.questions" :key="entry.id">{{ entry.title }}</p>
   </div>
   <section v-else class="thread-question" aria-label="问题">
-    <header class="thread-question-header"><strong>问题</strong><span>{{ status }}</span></header>
+    <header class="thread-question-header"><PixelCompanion v-if="pending" mood="waiting" :size="28" /><strong>问题</strong><span>{{ status }}</span></header>
     <form v-for="(entry, index) in question.questions" :key="`${question.callId}-${entry.id}`" class="thread-question-entry"
       @submit.prevent="submit(entry, index)">
       <fieldset>

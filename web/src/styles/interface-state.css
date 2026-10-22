@@ -1,0 +1,38 @@
+.pixel-companion { display: block; flex: 0 0 auto; overflow: visible; }
+.pixel-loading .pixel-body, .pixel-reading .pixel-body { animation: pixel-step 1.4s steps(2, end) infinite; }
+.pixel-loading .pixel-foot-left, .pixel-reading .pixel-foot-left { animation: pixel-foot .7s steps(1, end) infinite; }
+.pixel-loading .pixel-foot-right, .pixel-reading .pixel-foot-right { animation: pixel-foot .7s steps(1, end) -.35s infinite; }
+.pixel-thinking .pixel-eyes { transform-origin: 16px 14px; animation: pixel-blink 3.2s steps(1, end) infinite; }
+.pixel-reading .pixel-paper { animation: pixel-page 1.4s steps(2, end) infinite; }
+@keyframes pixel-step { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-2px); } }
+@keyframes pixel-foot { 50% { transform: translateY(-1px); } }
+@keyframes pixel-blink { 0%, 90%, 100% { transform: scaleY(1); } 94% { transform: scaleY(.3); } }
+@keyframes pixel-page { 50% { transform: translateY(-2px); } }
+.interface-state { padding: 28px 16px; color: var(--text); }
+.state-loading .state-intro > .pixel-companion { opacity: 0; animation: state-appear 140ms ease-out 180ms forwards; }
+.state-intro { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; }
+.state-copy { min-width: 0; }
+.state-title { margin: 0; color: #65564a; font-size: 14px; line-height: 1.6; font-weight: 500; overflow-wrap: anywhere; }
+.state-detail { margin: 5px 0 0; color: #8b7f73; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.state-action { display: block; min-height: 44px; margin: 12px auto 0; padding: 8px 16px; border: 1px solid #d9d0c7; border-radius: 10px; color: #514338; background: #fffcf8; font-size: 13px; }
+.state-action:disabled { opacity: .5; cursor: default; }
+.state-action:focus-visible { outline: 2px solid #8b7f73; outline-offset: 3px; }
+.state-error .state-title { color: #984237; }
+.state-list, .state-messages { padding: 20px 4px; }
+.state-list .state-intro, .state-messages .state-intro { flex-direction: row; justify-content: center; text-align: left; }
+.state-skeletons { display: grid; gap: 10px; margin-top: 20px; opacity: 0; animation: state-appear 140ms ease-out 180ms forwards; }
+.state-skeleton { display: grid; gap: 10px; padding: 18px; border: 1px solid #e7e1db; border-radius: 14px; background: #fffdfb; }
+.state-skeleton span { display: block; width: 58%; height: 8px; border-radius: 3px; background: #ede6de; }
+.state-skeleton span + span { width: 30%; height: 6px; background: #f2ece6; }
+.state-skeleton:nth-child(2) span { width: 43%; }
+.state-skeleton:nth-child(3) span { width: 68%; }
+.state-messages .state-skeleton { width: 83%; min-height: 76px; }
+.state-messages .state-skeleton:nth-child(2) { width: 58%; justify-self: end; background: #eee6de; }
+.state-inline { padding: 4px 0; }
+.state-inline .state-intro { flex-direction: row; justify-content: flex-start; gap: 8px; text-align: left; }
+.state-inline .state-title { font-size: 12px; }
+@keyframes state-appear { to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .pixel-companion, .pixel-companion * { animation: none !important; opacity: 1 !important; }
+  .state-skeletons { animation: none; opacity: 1; }
+}

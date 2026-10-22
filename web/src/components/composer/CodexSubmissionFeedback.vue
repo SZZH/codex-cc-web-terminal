@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from "vue";
+import PixelCompanion from "../PixelCompanion.js";
 import { codexRequestError, codexRequestLabel } from "../../lib/codex-chat-presentation.js";
 import { isCodexRequestDismissedMissing } from "../../lib/codex-chat-store.js";
 
@@ -26,7 +27,7 @@ const missing = computed(() => props.request?.error?.code === "receipt_not_found
   <div v-if="pending || request" class="codex-submission-feedback" :class="{ 'is-failure': request && !unknown }"
     role="status" aria-live="polite" aria-atomic="true" aria-label="消息提交状态" :aria-busy="pending || busy">
     <div class="codex-submission-heading">
-      <span class="codex-submission-label">{{ label }}</span>
+      <span class="codex-submission-label"><PixelCompanion :size="24" :mood="pending || busy ? 'loading' : unknown ? 'waiting' : 'error'" />{{ label }}</span>
       <button v-if="request && !unknown && request.executionRoute !== 'desktopQuestion'" type="button" :disabled="busy" :aria-busy="busy"
         aria-label="恢复这条消息到输入框" @click="emit('restore', request.id)">恢复到输入框</button>
       <button v-else-if="unknown && !dismissed" type="button" :disabled="busy" :aria-busy="busy"
@@ -41,7 +42,7 @@ const missing = computed(() => props.request?.error?.code === "receipt_not_found
 <style scoped>
 .codex-submission-feedback { display: grid; gap: 4px; min-width: 0; margin: 0 24px 8px; color: #79634f; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .codex-submission-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 2px 12px; min-width: 0; min-height: 32px; }
-.codex-submission-label { flex: 1 1 auto; min-width: 0; font-weight: 600; }
+.codex-submission-label { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; font-weight: 600; }
 .codex-submission-detail { min-width: 0; max-height: 90px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; white-space: pre-wrap; }
 .is-failure .codex-submission-label, .is-failure .codex-submission-detail { color: #a23535; }
 button { flex: 0 1 auto; min-width: 96px; min-height: 32px; max-width: 100%; border: 0; padding: 6px 4px; background: transparent; color: #79634f; font: inherit; line-height: 1.5; text-align: left; text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere; cursor: pointer; }

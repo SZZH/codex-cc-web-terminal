@@ -1,6 +1,8 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import ChatComposer from "./composer/ChatComposer.vue";
+import ChatHeader from "./ChatHeader.vue";
+import PixelCompanion from "./PixelCompanion.js";
 import ThreadTurnTimeline from "./thread-item/ThreadTurnTimeline.vue";
 import { createMessageStreamScroll } from "../lib/message-stream-scroll.js";
 import { measureAppViewport } from "../lib/app-viewport.js";
@@ -223,15 +225,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="mobile-shell chat-shell" :style="chatShellStyle">
-    <header class="mobile-header compact">
-      <button class="nav-button" aria-label="返回会话列表" @click="emit('back')">
-        <span aria-hidden="true">‹</span>
-      </button>
-      <div class="header-copy">
-        <h1>{{ title }}</h1>
-      </div>
-      <span class="header-spacer" aria-hidden="true"></span>
-    </header>
+    <ChatHeader :title="title" :cwd="workspaceCwd" @back="emit('back')" />
 
     <main class="chat-screen">
       <section ref="messageListEl" class="message-stream" data-app-scroll :style="messageStreamStyle" tabindex="0" aria-label="聊天记录"
@@ -259,7 +253,7 @@ onBeforeUnmount(() => {
       </section>
 
       <div ref="composerHostEl" class="chat-composer-host" data-app-scroll>
-        <p v-if="statusText" ref="statusEl" class="chat-status" role="status" aria-live="polite">{{ statusText }}</p>
+        <p v-if="statusText" ref="statusEl" class="chat-status" role="status" aria-live="polite"><PixelCompanion v-if="runningTask" mood="thinking" :size="24" />{{ statusText }}</p>
         <slot name="composer-top" />
         <ChatComposer
           ref="composerRef"
@@ -307,76 +301,6 @@ onBeforeUnmount(() => {
     linear-gradient(180deg, rgba(248, 244, 239, 0.98) 0%, rgba(243, 237, 231, 0.95) 100%),
     #f4eee8;
   color: #342d28;
-}
-
-.mobile-header {
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 32px;
-  align-items: center;
-  gap: 10px;
-  padding: calc(env(safe-area-inset-top) + 10px) 14px 10px;
-  background: rgba(247, 242, 237, 0.82);
-  border-bottom: 1px solid rgba(214, 201, 190, 0.52);
-  backdrop-filter: blur(18px);
-}
-
-.header-copy {
-  min-width: 0;
-  text-align: center;
-}
-
-.header-copy h1 {
-  margin: 0;
-  font-size: 16px;
-  line-height: 1.25;
-  font-weight: 600;
-  color: #3d342d;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.thread-id {
-  margin: 2px 0 0;
-  font-size: 11px;
-  line-height: 1.2;
-  color: #7a6d62;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.thread-id.warn {
-  color: #b5483d;
-  font-weight: 600;
-}
-
-.nav-button {
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border: 0;
-  border-radius: 999px;
-  background: rgba(229, 220, 212, 0.78);
-  color: #56483d;
-  font-size: 20px;
-  font-weight: 600;
-  line-height: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.nav-button span {
-  transform: translateX(-1px);
-}
-
-.header-spacer {
-  width: 32px;
-  height: 32px;
 }
 
 .chat-screen {
@@ -869,6 +793,9 @@ onBeforeUnmount(() => {
 }
 
 .chat-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin: 0;
   padding: 0 20px 8px;
   font-size: 12px;

@@ -53,6 +53,7 @@ function mount(t, View, props = {}) {
 
 const elements = (node, predicate) => [...(predicate(node) ? [node] : []),
   ...(node.children || []).flatMap((child) => elements(child, predicate))];
+const nodeText = (node) => node.type === "comment" ? "" : [node.text || "", ...(node.children || []).map(nodeText)].join("");
 
 test("mounted pending view shows loading immediately and replaces it when its code arrives", async (t) => {
   const pending = deferred();
@@ -60,10 +61,11 @@ test("mounted pending view shows loading immediately and replaces it when its co
   const mounted = mount(t, View);
   const statuses = () => elements(mounted.root, (node) => node.props?.role === "status");
   assert.equal(statuses().length, 1);
-  assert.equal(statuses()[0].text, "正在加载页面…");
+  assert.equal(nodeText(statuses()[0]), "正在加载页面…");
   assert.equal(statuses()[0].props["aria-busy"], true);
   await flush();
   assert.equal(statuses().length, 1);
+  assert.equal(statuses()[0].props["aria-busy"], true);
   pending.resolve({ render: () => h("main", "会话列表") }); await flush();
   assert.equal(statuses().length, 0);
   assert.equal(elements(mounted.root, (node) => node.type === "main" && node.text === "会话列表").length, 1);
@@ -77,9 +79,12 @@ test("a pending view failure replaces loading with the existing recovery action"
   pending.reject(error); await flush();
   assert.equal(elements(mounted.root, (node) => node.props?.role === "status").length, 0);
   assert.equal(elements(mounted.root, (node) => node.props?.role === "alert").length, 1);
-  assert.equal(elements(mounted.root, (node) => node.type === "button" && node.text === "重新加载").length, 1);
+  const reload = elements(mounted.root, (node) => node.type === "button" && node.text === "重新加载");
+  assert.equal(reload.length, 1);
   assert.deepEqual(mounted.errors, [error]);
   assert.equal(environment.reloads, 0);
+  reload[0].props.onClick();
+  assert.equal(environment.reloads, 1);
 });
 
 for (const result of ["success", "failure"]) {

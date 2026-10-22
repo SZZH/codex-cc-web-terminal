@@ -175,4 +175,5 @@ onBeforeUnmount(() => {
     transform: translateY(0);
   }
 }
+@media (prefers-reduced-motion: reduce) { .popover-drawer { animation: none; } }
 </style>
