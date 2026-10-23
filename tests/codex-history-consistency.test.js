@@ -110,3 +110,62 @@ test("a stale activity upsert cannot reopen the same completed lifecycle", () =>
   assert.equal(current.completedAt, 200);
   assert.equal(current.durationMs, 100);
 });
+
+test("already visible live messages survive initial hydration, a lagging snapshot and catch-up in order", async () => {
+  const { createCodexHistoryItems } = await import("../web/src/lib/codex-history-items.js");
+  const store = createCodexChatStore("thread");
+  store.upsertTurn({ id: "turn", status: "inProgress" });
+  store.upsertItem("turn", { ...message("live"), status: "inProgress", position: 1, text: "first" });
+  let resolve;
+  const history = createCodexHistoryItems({ store, base: "/history", isDisposed: () => false,
+    onItems() {}, call: () => new Promise((done) => { resolve = done; }) });
+  assert.deepEqual(visible(store), ["live"]);
+  const pending = history.loadItems("turn", { latest: true });
+  assert.deepEqual(visible(store), ["live"], "starting history must not clear live content");
+  resolve({ items: [{ ...message("old"), position: 0 }], latestItemId: "old", hasMore: false });
+  await pending;
+  assert.deepEqual(visible(store), ["old", "live"], "a lagging disjoint snapshot precedes live content");
+  store.upsertItem("turn", { ...message("live"), status: "inProgress", text: "first continued" });
+  assert.deepEqual(visible(store), ["old", "live"]);
+  store.applyLatestItemsPage("turn", { items: [message("old"), message("live")], hasMore: false }, store.beginRead(), { reset: true });
+  assert.deepEqual(visible(store), ["old", "live"], "catch-up neither duplicates nor moves messages");
+});
+
+test("bounded running summaries preserve loaded content while advancing lifecycle status", () => {
+  const store = createCodexChatStore("thread");
+  store.upsertTurn({ id: "turn", status: "inProgress" });
+  const text = "complete content ".repeat(1000);
+  store.upsertItem("turn", { id: "answer", type: "agentMessage", status: "inProgress", text,
+    presentation: { text }, detailsLoaded: true, hasDetails: false });
+  for (const status of ["inProgress", "completed"]) {
+    store.applyTurnsPage({ turns: [{ id: "turn", items: [{ id: "answer", type: "agentMessage", status,
+      text: "complete", presentation: { text: "complete" }, hasDetails: true, truncated: true }] }] });
+    const item = store.state.turns.turn.items.answer;
+    assert.equal(item.text, text);
+    assert.equal(item.presentation.text, text);
+    assert.equal(item.status, status);
+    assert.equal(item.detailsLoaded, true);
+    assert.equal(item.hasDetails, true, "completion still requires final detail reconciliation");
+  }
+});
+
+
+test("newer bounded content can advance a running detail snapshot and requests fresh detail", () => {
+  const store = createCodexChatStore("thread");
+  store.upsertTurn({ id: "turn", status: "inProgress" });
+  store.upsertItem("turn", { id: "answer", type: "agentMessage", status: "inProgress",
+    text: "first", presentation: { text: "first" }, detailsLoaded: true });
+  store.applyTurnsPage({ turns: [{ id: "turn", items: [{ id: "answer", type: "agentMessage",
+    text: "first continued", presentation: { text: "first continued" }, hasDetails: true }] }] });
+  assert.equal(store.state.turns.turn.items.answer.text, "first continued");
+  assert.equal(store.state.turns.turn.items.answer.detailsLoaded, false);
+});
+
+
+test("a newer disjoint history page remains after a live user message", () => {
+  const store = createCodexChatStore("thread");
+  store.upsertItem("turn", { ...message("user", "userMessage"), position: 0 });
+  store.applyLatestItemsPage("turn", { items: [{ ...message("newer"), position: 40 }], hasMore: true },
+    store.beginRead(), { reset: true });
+  assert.deepEqual(visible(store), ["user", "newer"]);
+});

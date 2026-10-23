@@ -111,8 +111,10 @@ export function presentCodexChatSnapshot(state, presentItem = presentCodexChatIt
   const questionHistory = createQuestionHistory(state);
   const turns = state.turnOrder.map((id) => state.turns[id]).filter(Boolean).map((turn) => {
     const projectActivity = createCodexSubagentActivityProjector(Object.values(turn.items));
-    return { ...turn, status: displayStatus(turn.status), items: (turn.itemsLatestRequested && !turn.itemsLatestLoaded ? []
-      : Array.isArray(turn.itemsWindowIds) ? turn.itemsWindowIds : turn.itemOrder).map((id) => {
+    const visibleIds = turn.itemsLatestRequested && !turn.itemsLatestLoaded
+      ? turn.itemOrder.filter((id) => turn.liveItemIds?.includes(id))
+      : Array.isArray(turn.itemsWindowIds) ? turn.itemsWindowIds : turn.itemOrder;
+    return { ...turn, status: displayStatus(turn.status), items: visibleIds.map((id) => {
         const source = turn.items[id];
         const item = presentItem(source, projectActivity(source));
         return item?.question ? { ...item, question: questionHistory(item.question, turn.status) } : item;

@@ -136,7 +136,7 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
     touch(metadataCurrent ? "thread" : "thread:capabilities");
     if (capabilitiesCurrent) revisions.set("thread:capabilities", state.revision);
   }
-  function upsertItem(turnId, item, read) {
+  function upsertItem(turnId, item, read, { live = true } = {}) {
     if (!turnId || !item?.id) return;
     if (!state.turns[turnId]) upsertTurn({ id: turnId }, read);
     const turn = state.turns[turnId];
@@ -147,6 +147,16 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
     // A summary must not erase an explicitly loaded full detail or completed text.
     if (previous && ((previous.detailsLoaded && (isCodexTerminal(previous.status) || isCodexTerminal(turn.status))) ||
       (isCodexTerminal(previous.status) && !previous.hasDetails)) && item.hasDetails && !item.detailsLoaded) return;
+    // Running details have the same fidelity guarantee as completed details.
+    // Keep lifecycle metadata fresh without replacing full content with a bounded summary.
+    if (previous?.detailsLoaded && item.hasDetails && !item.detailsLoaded) {
+      const oldText = previous.presentation?.text ?? previous.text ?? previous.aggregatedOutput;
+      const newText = item.presentation?.text ?? item.text ?? item.aggregatedOutput;
+      item = typeof oldText === "string" && typeof newText === "string" && !oldText.startsWith(newText)
+        ? { ...item, detailsLoaded: false }
+        : { ...previous, hasDetails: true, status: item.status ?? previous.status,
+          position: item.position ?? previous.position };
+    }
     turn.items[item.id] = { ...previous, ...copy(item) };
     const activity = mergeCodexSubagentActivity(previous?.presentation?.activity, item.presentation?.activity);
     if (activity) turn.items[item.id].presentation = { ...turn.items[item.id].presentation, activity };
@@ -157,7 +167,11 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
     if (!read) {
       const birthRevision = itemBirthRevisions.get(`${turnId}:${item.id}`);
       if (birthRevision != null) liveItemBirthRevisions.set(`${turnId}:${item.id}`, birthRevision);
-      if (turn.itemsLatestLoaded && birthRevision > windowReadRevisions.get(turnId)) includeWindowItems(turn, [item.id]);
+      if (live && (!previous || turn.liveItemIds?.includes(item.id) ||
+        (turn.itemsLatestLoaded && birthRevision > windowReadRevisions.get(turnId)))) {
+        turn.liveItemIds = [...new Set([...(turn.liveItemIds || []), item.id])];
+        if (turn.itemsLatestLoaded) includeWindowItems(turn, [item.id]);
+      }
     }
     touch(`item:${turnId}:${item.id}`);
   }
@@ -180,7 +194,7 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
       if (!state.turnOrder.includes(turn.id)) state.turnOrder.push(turn.id);
       touch(`turn:${turn.id}`);
     }
-    for (const item of items || []) upsertItem(turn.id, item, read);
+    for (const item of items || []) upsertItem(turn.id, item, read, { live: false });
     if (items?.length) applyHistoryItemOrder(turn.id, items.map((item) => item.id), {
       headId: items[0].type === "userMessage" ? items[0].id : undefined
     }, originalOrder);
@@ -297,7 +311,8 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
         turn.itemsEarlierHasMore = Boolean(page.hasMore);
         touch(earlierKey);
       }
-      const liveIds = originalOrder.filter((id) => (liveItemBirthRevisions.get(`${turnId}:${id}`) || 0) > read.revision);
+      const liveIds = originalOrder.filter((id) => turn.liveItemIds?.includes(id) ||
+        (liveItemBirthRevisions.get(`${turnId}:${id}`) || 0) > read.revision);
       includeWindowItems(turn, [...ids, ...liveIds], { reset: !windowLoaded });
       if (!windowLoaded) windowReadRevisions.set(turnId, read.revision);
       if (ids.length) latestItemHeads.set(turnId, ids[0]);

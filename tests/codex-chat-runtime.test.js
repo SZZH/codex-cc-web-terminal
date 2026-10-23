@@ -5223,3 +5223,28 @@ test('r40 review stop-only capability does not enable queued steering', async()=
  try{await clock.advance(3000);assert.equal(harness.chat.props.canInterrupt,false);const before=metadataReads;online=true;await clock.advance(30000);assert.ok(metadataReads>before,'active desktop should recheck a missing stop capability');assert.equal(harness.chat.props.canInterrupt,true);
  }finally{harness.close();}
 });
+
+test("a bounded completion rereads final detail without shrinking the running full text", async () => {
+  let completed = false;
+  const initialText = "long response ".repeat(1500);
+  const summary = () => ({ id: "answer", type: "agentMessage", status: completed ? "completed" : "inProgress",
+    hasDetails: true, truncated: true, presentation: { text: initialText.slice(0, 100) } });
+  const { runtime, store, calls } = fixture((url) => {
+    if (url.includes("/turns?")) return { turns: [{ id: "turn", status: "inProgress", items: [summary()] }] };
+    if (url.includes("/items?")) return { items: [summary()], hasMore: false };
+    if (url.endsWith("/items/answer")) return { item: { ...summary(), hasDetails: false, truncated: false,
+      presentation: { text: initialText + (completed ? "FINAL SUFFIX" : "") } } };
+    return reads(url);
+  });
+  try {
+    await runtime.open(); await flush();
+    assert.equal(store.state.turns.turn.items.answer.presentation.text, initialText);
+    const before = calls.filter((call) => call.url.endsWith("/items/answer")).length;
+    completed = true;
+    store.applyTurnsPage({ turns: [{ id: "turn", items: [summary()] }] });
+    assert.equal(store.state.turns.turn.items.answer.presentation.text, initialText);
+    await runtime.setDetailVisibility([{ turnId: "turn", itemId: "answer" }]);
+    assert.equal(calls.filter((call) => call.url.endsWith("/items/answer")).length, before + 1);
+    assert.equal(store.state.turns.turn.items.answer.presentation.text, initialText + "FINAL SUFFIX");
+  } finally { runtime.dispose(); }
+});
