@@ -183,7 +183,10 @@ netstat -ano | findstr :5173
 
 ### `v0.4.2`
 
-- Fixed old receipts or live messages appearing before the latest history loads when opening a chat; messages now appear together after the initial history window is ready, with loading and retry states preserved.
+- Fixed premature display of old receipts and sparse summaries when opening a chat, while preserving loading and retry states.
+- Increased backward history pages to 90 items and up to three earlier turns per batch, with at most two concurrent content requests and targeted retries for failed reads.
+- Kept visible live messages during history loading, prevented bounded summaries from shortening loaded text, and reconciled final details after completion.
+- Removed complete browser context wrappers for local file pages from displayed user messages while preserving the original records.
 
 ### `v0.4.1`
 
