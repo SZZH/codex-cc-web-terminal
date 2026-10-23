@@ -6,6 +6,7 @@ import { createCodexHistoryWindow } from "../web/src/lib/codex-history-window.js
 import { presentCodexChatSnapshot } from "../web/src/lib/codex-chat-presentation.js";
 
 const item = (id) => ({ id, type: "agentMessage", text: id });
+const flush = () => new Promise((resolve) => setImmediate(resolve));
 function fixture(respond) {
   const store = createCodexChatStore("thread");
   const calls = [], errors = [];
@@ -16,6 +17,68 @@ function fixture(respond) {
     errors: { begin: () => ({}), succeed() {}, fail(_token, error) { errors.push(error.message); } }, isDisposed: () => disposed });
   return { store, ...history, ...window, calls, errors, dispose: () => { disposed = true; } };
 }
+
+test("older batches load three turns with at most two item reads and preserve chronological order", async () => {
+  const waiting = new Map();
+  const f = fixture((url) => {
+    if (url.pathname.endsWith('/turns')) {
+      assert.equal(url.searchParams.get('limit'), '3');
+      return { turns: ['old', 'middle', 'recent'].map((id) => ({ id, items: [] })), hasMore: false };
+    }
+    const id = url.pathname.split('/').at(-2);
+    return new Promise((resolve) => waiting.set(id, resolve));
+  });
+  f.store.state.hasMore = true;
+  const read = f.loadOlder();
+  assert.equal(f.loadOlder(), read);
+  await flush();
+  assert.deepEqual([...waiting.keys()], ['recent', 'middle']);
+  waiting.get('recent')({ items: [item('r')], hasMore: false });
+  await flush();
+  assert.equal(waiting.has('old'), false);
+  waiting.get('middle')({ items: [item('m')], hasMore: false });
+  await flush();
+  waiting.get('old')({ items: [item('o')], hasMore: false });
+  assert.equal(await read, true);
+  assert.deepEqual(f.store.state.turnOrder, ['old', 'middle', 'recent']);
+  assert.equal(f.hasOlderHistory(), false);
+});
+
+test("a failed middle turn and its remaining item pages stay reachable after a partial batch", async () => {
+  let retry = false;
+  const f = fixture((url) => {
+    if (url.pathname.endsWith('/turns')) return { turns: ['old', 'middle', 'recent'].map((id) => ({ id, items: [] })), hasMore: false };
+    const id = url.pathname.split('/').at(-2);
+    if (id === 'middle' && !retry) throw new Error('middle unavailable');
+    if (url.searchParams.get('cursor') === 'middle-prefix') return { items: [item('m0')], hasMore: false };
+    return { items: [item(id)], hasMore: id === 'middle', nextCursor: id === 'middle' ? 'middle-prefix' : null };
+  });
+  f.store.state.hasMore = true;
+  assert.equal(await f.loadOlder(), false);
+  assert.equal(f.hasOlderHistory(), true);
+  retry = true;
+  assert.equal(await f.loadOlder(), true);
+  assert.equal(f.hasOlderHistory(), true, 'middle prefix must remain reachable even when the oldest turn is complete');
+  assert.equal(await f.loadOlder(), true);
+  assert.equal(f.hasOlderHistory(), false);
+  assert.deepEqual(f.store.state.turns.middle.itemsWindowIds, ['m0', 'middle']);
+  assert.equal(f.calls.filter((url) => url.pathname.endsWith('/turns')).length, 1);
+  assert.equal(f.calls.filter((url) => url.pathname.includes('/recent/items')).length, 1, 'successful siblings are not fetched again');
+});
+
+test("disposing during an older batch prevents its queued turn read and late publication", async () => {
+  const pending = [];
+  const f = fixture((url) => url.pathname.endsWith('/turns')
+    ? { turns: ['old', 'middle', 'recent'].map((id) => ({ id, items: [] })), hasMore: false }
+    : new Promise((resolve) => pending.push(resolve)));
+  f.store.state.hasMore = true;
+  const read = f.loadOlder(); await flush();
+  f.dispose();
+  pending.forEach((resolve) => resolve({ items: [item('late')], hasMore: false }));
+  assert.equal(await read, false);
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.store.state.turns.recent.items.late, undefined);
+});
 
 test("the initial history view never displays old summary items while waiting for its latest page", async () => {
   let resolve;

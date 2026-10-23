@@ -24,6 +24,15 @@ test("metadata reads never resume or hydrate all turns", async () => {
   assert.deepEqual(calls, [{ method: "thread/read", params: { threadId: "thread", includeTurns: false } }]);
 });
 
+test("explicit larger item windows remain capped while default reads stay small", async () => {
+  const { reader, calls } = fixture();
+  await reader.listItems("thread", "turn");
+  await reader.listItems("thread", "turn", { limit: 90, sortDirection: "desc" });
+  await reader.listItems("thread", "turn", { limit: 10000, sortDirection: "desc" });
+  assert.deepEqual(calls.filter((call) => call.method === "thread/items/list").map((call) => call.params.limit), [20, 90, 90]);
+  await assert.rejects(reader.listItems("thread", "turn", { limit: -1 }), /Invalid history page limit/);
+});
+
 test("an unloaded external interrupted projection without completion becomes unknown, while true interrupted history remains terminal", async () => {
   const { reader, calls } = fixture(() => ({ data: [
     { ...turn("uncertain", [], "interrupted"), completedAt: null },

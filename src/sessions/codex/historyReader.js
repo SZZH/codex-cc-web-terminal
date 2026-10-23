@@ -5,7 +5,7 @@ import { throwIfReadAborted, waitForHistoryRead } from "./readCancellation.js";
 import { CodexMetadataReads } from "./metadataReads.js";
 
 const MAX_TURNS = 20;
-const MAX_ITEMS = 30;
+const MAX_ITEMS = 90;
 const MAX_PRIMARY_ITEMS = 24;
 const MAX_PROCESS_ITEMS = 12;
 const MAX_ACTIVITY_ITEMS = 24;

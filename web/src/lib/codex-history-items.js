@@ -15,7 +15,8 @@ export function createCodexHistoryItems({ store, call, base, isDisposed, onItems
     const anchor = latest ? reset ? "" : turn.itemsLatestTail
       : turn?.itemsPageLoaded ? turn.itemsPageTail : "";
     const query = new URLSearchParams(cursor ? { cursor } : anchor ? { after: anchor } : { cursor: "" });
-    query.set("limit", "30");
+    // Backward reads are user initiated; keep initial and live reads lightweight.
+    query.set("limit", earlier ? "90" : "30");
     if (reset || earlier) query.set("sortDirection", "desc");
     const operation = call(`${base}/turns/${encodeURIComponent(turnId)}/items?${query}`)
       .then((page) => {

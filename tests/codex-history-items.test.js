@@ -123,7 +123,7 @@ for (const failure of ["unavailable", "repeated cursor", "missing cursor"]) {
       repaired = true;
       assert.equal(await runtime.loadOlder(), true);
       assert.deepEqual(queries.map((query) => [query.get("cursor"), query.get("sortDirection"), query.get("limit")]),
-        [["earlier-page", "desc", "30"], ["earlier-page", "desc", "30"]]);
+        [["earlier-page", "desc", "90"], ["earlier-page", "desc", "90"]]);
       assert.deepEqual(store.state.turns.turn.itemsWindowIds, ["first", "tail"]);
       assert.equal(store.state.turns.turn.itemsEarlierHasMore, false);
       assert.equal(store.state.turns.turn.itemsEarlierCursor, null);
@@ -274,7 +274,7 @@ for (const [turnCount, itemCount] of [[1, 50], [10, 500]]) {
       rpcCalls.push({ method, params });
       if (method === "thread/read") return { thread };
       if (method === "thread/turns/list") {
-        assert.equal(params.limit, 1);
+        assert.equal(params.limit, params.cursor ? 3 : 1);
         assert.equal(params.sortDirection, "desc");
         const end = params.cursor ? Number(params.cursor.slice(6)) : turns.length;
         const start = Math.max(0, end - params.limit);
@@ -340,18 +340,19 @@ for (const [turnCount, itemCount] of [[1, 50], [10, 500]]) {
         !request.url.searchParams.has("cursor")), "expansion may reconcile current live output but cannot fetch an older prefix");
       assert.equal(store.state.turns[newest.id].itemsEarlierCursor, earlierCursor);
       assert.equal(presentCodexChatSnapshot(store.state).turns[0].items.length, 30);
-      const expectedPages = turnCount * Math.ceil(itemCount / 30);
+      const earlierPagesPerTurn = Math.ceil(Math.max(0, itemCount - 30) / 90);
+      const expectedPages = turnCount * (1 + earlierPagesPerTurn);
       let olderLoads = 0;
       while (runtime.hasOlderHistory() && olderLoads < expectedPages + turnCount) {
-        const first = store.state.turns[store.state.turnOrder[0]];
-        const loadingEarlierItems = first.itemsEarlierHasMore;
+        const first = [...store.state.turnOrder].reverse().map((id) => store.state.turns[id]).find((turn) => turn.itemsEarlierHasMore);
+        const loadingEarlierItems = Boolean(first);
         const beforeItems = requests.filter((request) => request.isPage).length;
         const beforeTurns = requests.filter((request) => request.url.pathname.endsWith("/turns")).length;
-        const beforeCursor = first.itemsEarlierCursor;
+        const beforeCursor = first?.itemsEarlierCursor;
         assert.equal(await runtime.loadOlder(), true);
         olderLoads += 1;
         const addedItems = requests.filter((request) => request.isPage).slice(beforeItems);
-        assert.equal(addedItems.length, 1, "one upward load reads exactly one item window");
+        assert.ok(addedItems.length >= 1 && addedItems.length <= 3, "one upward load reads at most three turn windows");
         assert.equal(addedItems[0].url.searchParams.get("sortDirection"), "desc");
         if (loadingEarlierItems) {
           assert.equal(requests.filter((request) => request.url.pathname.endsWith("/turns")).length, beforeTurns,
@@ -364,15 +365,15 @@ for (const [turnCount, itemCount] of [[1, 50], [10, 500]]) {
         }
       }
       assert.equal(runtime.hasOlderHistory(), false, "every older item remains reachable without an infinite pagination loop");
-      assert.equal(olderLoads, expectedPages - 1);
+      assert.equal(olderLoads, turnCount * earlierPagesPerTurn + Math.ceil((turnCount - 1) / 3));
       const elapsedMs = performance.now() - started;
       const pages = requests.filter((request) => request.isPage);
       assert.equal(pages.length, expectedPages + expansionPages.length);
-      assert.ok(pages.every((request) => request.url.searchParams.get("limit") === "30"));
+      assert.ok(pages.every(({url}) => url.searchParams.get("limit") === (url.searchParams.get("sortDirection") === "desc" && url.searchParams.get("cursor") ? "90" : "30")));
       assert.equal(yields, 0, "upward pagination never drains another page in the background");
-      assert.equal(maximum, 1);
+      assert.ok(maximum <= 2, "historical turn hydration stays bounded to two concurrent item reads");
       assert.equal(rpcCalls.filter((call) => call.method === "thread/items/list").length, pages.length);
-      assert.ok(rpcCalls.filter((call) => call.method === "thread/items/list").every((call) => call.params.limit === 30));
+      assert.ok(rpcCalls.filter((call) => call.method === "thread/items/list").every((call) => [30, 90].includes(call.params.limit)));
       const snapshot = presentCodexChatSnapshot(store.state);
       const view = buildThreadViewModel(snapshot);
       for (const source of turns) {
