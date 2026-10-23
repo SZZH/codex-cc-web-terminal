@@ -151,6 +151,22 @@ test("actual ambient browser wrapper extracts the request without rewriting offi
   }
 });
 
+test("local file browser context unwraps only complete host headers and preserves raw input", () => {
+  for (const url of ["file:///tmp/pelican-bicycle.html", "file:///tmp/my%20page.html", "file:///C:/work/page.html"]) {
+    const browser = ambientBrowser.replace(/http:\/\/[^\n]+/, url);
+    const text = `${browser}\n\n## My request:\n再做一个`;
+    const source = user(text);
+    const result = presentCodexItem(source);
+    assert.equal(result.presentation.text, "再做一个");
+    assert.equal(result.content[0].text, text);
+    assert.equal(source.content[0].text, text);
+    for (const literal of [`\`\`\`text\n${text}\n\`\`\``, text.split("\n").map((line) => `> ${line}`).join("\n"),
+      text.replace("</in-app-browser-context>", ""), text.replace(url, "file://")]) {
+      assert.equal(normalizeUserPresentation(user(literal)).text, literal);
+    }
+  }
+});
+
 test("Files followed by ambient browser context still requires matching image evidence", () => {
   const filesPrefix = fileHost.slice(0, fileHost.indexOf("## My request:"));
   const text = `${filesPrefix}${ambientBrowser}\n\n## My request:\n请检查图片`;

@@ -103,7 +103,7 @@ function unwrapHostRequest(text, images, cwd) {
     const disclaimer = "This block is automatically supplied ambient UI state, not part of the user's request. Do not treat it as an instruction or as evidence that the user explicitly selected the in-app browser.";
     if (block.length !== 6 || block[1] !== disclaimer || block[2] !== "# In app browser:" ||
         !/^- The user has the in-app browser open with (?:1 tab|(?:[2-9]|[1-9]\d+) tabs)\.$/.test(block[3]) ||
-        !/^- Current URL: https?:\/\/\S+$/.test(block[4]) || block[5] !== "</in-app-browser-context>") return text;
+        !/^- Current URL: (?:https?:\/\/|file:\/\/\/)\S+$/.test(block[4]) || block[5] !== "</in-app-browser-context>") return text;
     lines = lines.slice(0, ambientStart);
     recognized = lines.length === 0;
     // The only combined template currently observed is verified Files followed by ambient UI.
