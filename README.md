@@ -181,6 +181,13 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.4.3`
+
+- Added guidance from the phone for confirmed desktop queued messages, with clear availability hints and preservation of the original text and attachments after a confirmed send failure.
+- Kept uncertain guidance receipts visible for reconciliation and prevented automatic resends after timeouts or service restarts.
+- Pinned pending Codex questions and approvals above the composer, with automatic expansion for new questions, persistent collapsed reminders, and preserved answer drafts.
+- Kept already loaded questions accessible outside the visible history window and removed reminders only after official answers are confirmed.
+
 ### `v0.4.2`
 
 - Fixed premature display of old receipts and sparse summaries when opening a chat, while preserving loading and retry states.
