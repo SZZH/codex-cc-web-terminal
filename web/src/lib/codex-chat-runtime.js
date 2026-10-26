@@ -119,7 +119,7 @@ export function createCodexChatRuntime({ store, request, createSocket,
       !state.requestOrder.some((id) => {
         const receipt = state.requests[id];
         return receipt.turnId === turnId && ["accepted", "running"].includes(receipt.state) &&
-          !["desktopQueue", "desktopQuestion", "desktopSettings"].includes(receipt.executionRoute);
+          !["desktopQueue", "desktopQuestion", "desktopSettings", "desktopSteer"].includes(receipt.executionRoute);
       }));
   }
   function needsFullHistoryRecovery() { return needsHistoryRecovery("turns") || needsHistoryRecovery("metadata") && !needsControlCapability(); }
@@ -383,7 +383,7 @@ export function createCodexChatRuntime({ store, request, createSocket,
     if (promotions.has(id)) return promotions.get(id);
     const receipt = state.requests[id];
     const expectedTurnId = activeCodexTurnId(state);
-    if (receipt?.state !== "received" || receipt.mode === "steer" || !expectedTurnId) return Promise.resolve(null);
+    if (!(receipt?.state === "received" || receipt?.state === "queued" && receipt.executionRoute === "desktopQueue") || receipt.mode === "steer" || !expectedTurnId) return Promise.resolve(null);
     if (unresolved().some((request) => request.state === "unknown" && !isDismissedMissing(request))) return Promise.resolve(null);
     const errorToken = errors.begin("promote", id);
     store.upsertRequest({ ...receipt, steerAfterItemId: state.turns[expectedTurnId]?.itemOrder.at(-1) || "", steerQueuedAt: Date.now() });

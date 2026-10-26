@@ -281,6 +281,23 @@ test("v2 queue promotion preserves conflict status and does not fall back to sub
   assert.equal(s.calls.some((call) => call.kind === "submit"), false);
 });
 
+test("v2 queue promotion awaits a desktop receipt and preserves asynchronous failures", async (t) => {
+  const s = await setup(t);
+  const url = `${s.baseUrl}/api/v2/codex/threads/thread-123/requests/request-queued/steer`;
+  const options = { method: "POST", headers: s.headers, body: JSON.stringify({ expectedTurnId: "active-turn" }) };
+  const receipt = { id: "request-queued", state: "accepted", executionRoute: "desktopSteer", turnId: "actual-turn" };
+  s.runtime.codexThreads.promoteQueuedRequest = async () => { await new Promise(setImmediate); return receipt; };
+  const response = await fetch(url, options);
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { request: receipt });
+  s.runtime.codexThreads.promoteQueuedRequest = async () => {
+    throw Object.assign(new Error("Queue action pending"), { status: 409, code: "queue_action_pending" });
+  };
+  const conflict = await fetch(url, options);
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).code, "queue_action_pending");
+});
+
 test("desktop queue withdrawal requires authentication and trusted origin", async (t) => {
   const s = await setup(t);
   const url = `${s.baseUrl}/api/v2/codex/threads/thread-123/requests/request-queued/cancel`;

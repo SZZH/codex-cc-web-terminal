@@ -59,19 +59,25 @@ test("one queue row survives submitting, dispatching and confirmed waiting witho
   } finally { harness.close(); }
 });
 
-test("guide and delete coexist; desktop-owned queue explains its limit without sending or deleting", async () => {
-  const harness = mount([message("queued")], { canGuide: false, runningTask: true });
+test("guide and delete coexist; desktop guidance waits for capability and then enables on the phone", async () => {
+  const queued = message("queued");
+  queued.request.executionRoute = "desktopQueue";
+  const harness = mount([queued], { canGuide: false, runningTask: true });
   try {
     const guide = button(harness.root, "引导排队");
     assert.equal(guide.props.disabled, true);
-    assert.match(guide.props.title, /Codex 桌面端/);
+    assert.match(guide.props.title, /正在连接当前任务/);
     assert.ok(button(harness.root, "撤回排队"));
     guide.props.onClick();
     assert.deepEqual(harness.events, []);
-    harness.render([message("received")], { canGuide: true, runningTask: true }); await nextTick();
+    harness.render([queued], { canGuide: false, canGuideDesktop: true, runningTask: true }); await nextTick();
     assert.equal(button(harness.root, "引导排队").props.disabled, false);
     button(harness.root, "引导排队").props.onClick();
     assert.deepEqual(harness.events, [["guide", "queue"]]);
+    harness.render([message("received")], { canGuide: true, runningTask: true }); await nextTick();
+    assert.equal(button(harness.root, "引导排队").props.disabled, false);
+    button(harness.root, "引导排队").props.onClick();
+    assert.deepEqual(harness.events, [["guide", "queue"], ["guide", "queue"]]);
   } finally { harness.close(); }
 });
 

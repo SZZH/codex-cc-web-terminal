@@ -4282,7 +4282,7 @@ test("desktop queued messages offer withdrawal above the composer using the orig
     assert.equal(elements(harness.root, (node) => node.text === "等待执行").length, 0, "the compact queue has no extra heading");
     const guide = elements(harness.root, (node) => node.props?.["aria-label"]?.startsWith("引导排队消息"))[0];
     assert.equal(guide.props.disabled, true);
-    assert.match(guide.props.title, /Codex 桌面端/);
+    assert.match(nodeText(composer), /当前没有正在执行的回复/);
     elements(harness.root, (node) => node.props?.["aria-label"] === "撤回排队消息：next from phone")[0].props.onClick();
     await flush();
     assert.equal(harness.calls.filter((call) => call.url.endsWith("/requests/desktop-queued/cancel") && call.method === "POST").length, 1);
@@ -5211,7 +5211,7 @@ test('r40 review stop-only capability does not enable queued steering', async()=
  if(url.endsWith('/requests')&&!options.method)return{requests:[{id:'waiting-request',state:'received',mode:'queue',initialPlacement:'composer',input:{text:'queued for desktop',attachments:[]}}]};
  }});
  try{assert.equal(harness.chat.props.canInterrupt,true);assert.equal(harness.chat.props.canSteer,false);
- const guide=elements(harness.root,node=>node.props?.['aria-label']==='引导排队消息：queued for desktop')[0];assert.ok(guide);assert.equal(guide.props.disabled,true);
+ const guide=elements(harness.root,node=>node.props?.['aria-label']==='引导排队消息：queued for desktop')[0];assert.equal(guide.props.disabled,true);assert.match(nodeText(harness.root),/正在连接当前任务/);
  }finally{harness.close();}
 });
  test('r40 review stopped desktop discovery recovers during active polling', async()=>{
@@ -5247,4 +5247,47 @@ test("a bounded completion rereads final detail without shrinking the running fu
     assert.equal(calls.filter((call) => call.url.endsWith("/items/answer")).length, before + 1);
     assert.equal(store.state.turns.turn.items.answer.presentation.text, initialText + "FINAL SUFFIX");
   } finally { runtime.dispose(); }
+});
+
+
+test("queued settings explain next-turn execution instead of advertising unavailable guidance", async () => {
+  const harness = await mountThreadView({ request: (url, options) => {
+    if (url.endsWith("/requests") && !options.method) return { requests: [{ id: "settings-waiting", state: "received",
+      mode: "queue", executionRoute: "settingsQueue", initialPlacement: "composer", options: { model: "next-model" },
+      input: { text: "use new settings", attachments: [] } }] };
+  } });
+  try {
+    assert.match(nodeText(harness.root), /包含新设置，等待下一轮执行/);
+    assert.equal(elements(harness.root, (node) => node.props?.["aria-label"] === "引导排队消息：use new settings").length, 0);
+    assert.equal(elements(harness.root, (node) => node.props?.["aria-label"] === "撤回排队消息：use new settings").length, 1);
+    assert.equal(harness.calls.filter((call) => call.url.endsWith("/steer")).length, 0);
+  } finally { harness.close(); }
+});
+
+
+test("phone guidance promotes a desktop queue receipt without enabling web-owned controls", async () => {
+  const pending = deferred();
+  const original = { id: "mobile-queued", mode: "queue", state: "queued", executionRoute: "desktopQueue",
+    input: { text: "guide from phone", attachments: [] } };
+  const harness = await mountThreadView({ request: (url, options) => {
+    if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQueuedSteer: true, desktopInterrupt: true } } };
+    if (url.includes("/turns?")) return { turns: [{ id: "desktop-active", status: "inProgress", items: [] }] };
+    if (url.endsWith("/requests") && !options.method) return { requests: [original] };
+    if (url.endsWith("/requests/mobile-queued/steer")) return pending.promise;
+  } });
+  try {
+    harness.chat.emit("update:draft", "keep draft"); await flush();
+    const guide = elements(harness.root, (node) => node.props?.["aria-label"] === "引导排队消息：guide from phone")[0];
+    assert.equal(guide.props.disabled, false);
+    guide.props.onClick(); guide.props.onClick(); await flush();
+    assert.equal(harness.calls.filter((call) => call.url.endsWith("/requests/mobile-queued/steer")).length, 1);
+    const call = harness.calls.find((call) => call.url.endsWith("/requests/mobile-queued/steer"));
+    assert.deepEqual(JSON.parse(call.body), { expectedTurnId: "desktop-active" });
+    pending.resolve({ request: { ...original, state: "accepted", mode: "steer", executionRoute: "desktopSteer", turnId: "desktop-active" } });
+    await flush();
+    assert.equal(harness.chat.props.draft, "keep draft");
+    assert.equal(harness.chat.props.canSteer, false, "desktop acceptance must not grant web ownership");
+    assert.equal(harness.store.state.requests["mobile-queued"].state, "accepted");
+    assert.equal(elements(harness.root, (node) => node.props?.["aria-label"] === "引导排队消息：guide from phone").length, 0);
+  } finally { pending.resolve({ request: original }); harness.close(); }
 });

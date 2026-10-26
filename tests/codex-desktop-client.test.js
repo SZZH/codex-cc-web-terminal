@@ -598,3 +598,28 @@ test("discovery is bounded and shutdown prevents reconnecting", unix, async (t) 
   await assert.rejects(f.client.discover("thread"), { code: "CODEX_DESKTOP_UNAVAILABLE" });
   assert.equal(f.connections(), 1);
 });
+
+test("ordinary desktop guidance preserves text, images and original identity", unix, async (t) => {
+  const f = await fixture(t);
+  const owner = await f.client.discover("thread");
+  let guarded = 0;
+  const result = await f.client.steerMessage("thread", { owner, clientUserMessageId: "queued-original",
+    input: [{ type: "text", text: "guide this" }, { type: "localImage", path: "/fixture/image.png" }],
+    beforeSend: async () => { guarded++; return true; } });
+  assert.equal(result.turnId, "active-turn");
+  assert.equal(guarded, 1);
+  const sent = f.requests.find((request) => request.method === "thread-follower-steer-turn");
+  assert.equal(sent.params.clientUserMessageId, "queued-original");
+  assert.equal(sent.params.restoreMessage.context.turnTrigger, "composer");
+  assert.deepEqual(sent.params.input, [{ type: "text", text: "guide this", text_elements: [] },
+    { type: "localImage", path: "/fixture/image.png" }]);
+  assert.equal(sent.params.restoreMessage.context.imageAttachments[0].src, "/fixture/image.png");
+});
+
+test("ordinary desktop guidance rechecks ownership and target before any mutation", unix, async (t) => {
+  const f = await fixture(t);
+  const owner = await f.client.discover("thread");
+  await assert.rejects(f.client.steerMessage("thread", { owner, clientUserMessageId: "queued-original",
+    input: [{ type: "text", text: "keep me" }], beforeSend: async () => false }), { uncertain: false });
+  assert.equal(f.requests.filter((request) => request.method === "thread-follower-steer-turn").length, 0);
+});

@@ -4,7 +4,7 @@ const TURN_LIMIT = 5;
 const ITEM_LIMIT = 30;
 const MAX_THREADS = 128;
 const MAX_BOUNDARIES = 128;
-const eligible = (request) => request.state === "unknown" && request.executionRoute === "desktopQuestion" && !request.turnId;
+const eligible = (request) => request.state === "unknown" && ["desktopQuestion", "desktopSteer"].includes(request.executionRoute) && !request.turnId;
 
 function cycle(boundaries) {
   return { turnCursor: null, turns: [], itemCursor: null, exhausted: false,

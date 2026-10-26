@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import { CodexRequestStore, REQUEST_TERMINAL_STATES } from "./requestStore.js";
 import { CodexSettingsDispatcher, hasSubmissionSettings } from "./settingsDispatcher.js";
 import { CodexTurnController } from "./turnController.js";
+import { DesktopQueuePromotion } from "./desktopQueuePromotion.js";
 import { CodexQueuedWriter } from "./queuedWriter.js";
 import { DesktopQueueSync } from "./desktopQueueSync.js";
 import { CodexDesktopClient } from "./desktopClient.js";
 import { DesktopQuestionResponder } from "./desktopQuestionResponder.js";
 import { DesktopQuestionRecovery } from "./desktopQuestionRecovery.js";
-import { DesktopQueueObserver, matchesDesktopQueueTurn, observedDesktopQueueTurn } from "./desktopQueueObserver.js";
+import { DesktopQueueObserver, matchesDesktopQueueTurn, observedDesktopQueueTurn, requestTerminalTurn } from "./desktopQueueObserver.js";
 import { CodexHistoryReader } from "./historyReader.js";
 import { presentCodexItem } from "./itemPresentation.js";
 import { CodexThreadStateStore } from "../state/CodexThreadStateStore.js";
@@ -31,6 +32,7 @@ export class CodexThreadService {
     this.reader = reader || new CodexHistoryReader({ bridge, config, sessionManager });
     this.requests = requests || new CodexRequestStore({ dataDir: config.dataDir });
     this.queuedWriter = new CodexQueuedWriter({ bridge });
+    this.queuePromotion = new DesktopQueuePromotion(this);
     this.desktopQueueObserver = new DesktopQueueObserver({ reader: this.reader, publish: (threadId, type, payload) => this.publish(threadId, type, payload) });
     this.epoch = randomUUID();
     this.streams = new Map();
@@ -49,7 +51,7 @@ export class CodexThreadService {
       reconcileItems: (...args) => this.reconcileItems(...args), isClosed: () => this.closed });
     this.interactions = new CodexInteractionService({ bridge,
       ownsThread: (threadId) => !this.closed && (this.loaded.has(threadId) || this.active.has(threadId)
-        && !["desktopQueue", "desktopSettings"].includes(this.requests.get(threadId, this.active.get(threadId).requestId)?.executionRoute)),
+        && !["desktopQueue", "desktopSettings", "desktopSteer"].includes(this.requests.get(threadId, this.active.get(threadId).requestId)?.executionRoute)),
       publish: (threadId, type, payload) => { this.publish(threadId, type, payload); this.releaseStream(threadId); } });
     const pendingThreadIds = this.requests.pendingThreadIds?.() || [];
     this.trackedRequests = new Set(pendingThreadIds);
@@ -126,7 +128,7 @@ export class CodexThreadService {
     const request = this.requests.update(threadId, id, patch);
     this.trackPending(request);
     this.publish(threadId, "request.updated", { request });
-    if (["unknown", "queued"].includes(request.state) || ["desktopQueue", "desktopQuestion"].includes(request.executionRoute)
+    if (["unknown", "queued"].includes(request.state) || ["desktopQueue", "desktopQuestion", "desktopSteer"].includes(request.executionRoute)
       && ["accepted", "running"].includes(request.state)) this.scheduleRecovery(threadId);
     this.ensurePolling(threadId);
     return request;
@@ -153,7 +155,7 @@ export class CodexThreadService {
   ensurePolling(threadId) {
     const stream = this.streams.get(threadId);
     if (this.closed || !stream?.subscribers.size) return;
-    const desktopPending = this.pendingReceipts(threadId).some((request) => request.executionRoute === "desktopQueue" &&
+    const desktopPending = this.pendingReceipts(threadId).some((request) => ["desktopQueue", "desktopSteer"].includes(request.executionRoute) &&
       !REQUEST_TERMINAL_STATES.has(request.state));
     const intervalMs = desktopPending ? this.desktopPollMs : this.pollMs;
     if (stream.timer && stream.intervalMs === intervalMs) return;
@@ -168,6 +170,7 @@ export class CodexThreadService {
       this.desktopClient.discover(threadId, options).catch(() => null)]);
     return { ...this.createdThreads.get(threadId), ...thread,
       capabilities: { ...thread.capabilities, desktopQuestionAnswers: Boolean(owner?.clientId && owner.supportsUntrustedAppInput),
+        desktopQueuedSteer: Boolean(owner?.clientId && typeof this.desktopClient.steerMessage === "function"),
         desktopInterrupt: Boolean(owner?.clientId) } };
   }
 
@@ -179,7 +182,7 @@ export class CodexThreadService {
     }
     const requests = this.requests.list(threadId);
     const confirmed = active?.turnId && requests.some((request) => request.id === active.requestId &&
-      !["desktopQueue", "desktopSettings"].includes(request.executionRoute) && ["accepted", "running"].includes(request.state));
+      !["desktopQueue", "desktopSettings", "desktopSteer"].includes(request.executionRoute) && ["accepted", "running"].includes(request.state));
     const uncertain = requests.some((request) => ["dispatching", "queued", "accepted", "running", "unknown"].includes(request.state));
     return { activityState: !this.closed && confirmed ? "running" : !this.closed && this.loaded.has(threadId) && !uncertain ? "idle" : "unknown",
       lastActivityAt: latestActivityTimestamp(requests.map((request) => request.createdAt),
@@ -244,6 +247,9 @@ export class CodexThreadService {
     if (!targetTurnId) throw failure("立即引导需要明确的当前回复编号。");
     const request = this.requests.get(threadId, requestId);
     if (!request) throw failure("Request not found", 404);
+    if (request.executionRoute === "desktopSteer" || request.executionRoute === "desktopQueue" && request.state === "queued") {
+      return this.queuePromotion.promote(threadId, requestId, targetTurnId);
+    }
     if (request.mode === "steer") {
       if (request.expectedTurnId !== targetTurnId) throw failure("这条消息已用于引导另一轮回复。", 409, "steer_target_conflict");
       return request;
@@ -256,7 +262,7 @@ export class CodexThreadService {
     }
     const active = this.active.get(threadId);
     if (!active?.turnId || active.turnId !== targetTurnId || !this.loaded.has(threadId)
-      || ["desktopQueue", "desktopSettings"].includes(this.requests.get(threadId, active.requestId)?.executionRoute)) {
+      || ["desktopQueue", "desktopSettings", "desktopSteer"].includes(this.requests.get(threadId, active.requestId)?.executionRoute)) {
       throw failure("目标回复已结束或当前不由网页持有，消息仍保留在队列中。", 409, "turn_not_active");
     }
     resolveImageAttachments(this.config, request.input.attachments);
@@ -268,7 +274,11 @@ export class CodexThreadService {
     return promoted;
   }
 
-  async cancelQueuedRequest(threadId, requestId) {
+  cancelQueuedRequest(threadId, requestId) {
+    return this.queuePromotion.run(threadId, requestId, "cancel", () => this.cancelQueuedRequestOnce(threadId, requestId));
+  }
+
+  async cancelQueuedRequestOnce(threadId, requestId) {
     const request = this.requests.get(threadId, requestId);
     if (!request) throw failure("Request not found", 404);
     if (request.state === "cancelled") return request;
@@ -277,7 +287,7 @@ export class CodexThreadService {
       this.finish(threadId, requestId);
       return cancelled;
     }
-    if (!["desktopQueue", "desktopSettings"].includes(request.executionRoute) || request.state !== "queued" || !request.upstreamQueueId) {
+    if (!["desktopQueue", "desktopSettings", "desktopSteer"].includes(request.executionRoute) || request.state !== "queued" || !request.upstreamQueueId) {
       throw failure("这条消息已经开始执行或尚未确认入队，不能撤回。", 409, "request_not_queued");
     }
     const queued = await this.queuedWriter.find(threadId, requestId);
@@ -491,7 +501,7 @@ export class CodexThreadService {
       const matched = known.length ? known : active?.turnId === turn.id ? [this.requests.get(threadId, active.requestId)] : [];
       if (terminal(turn.status)) {
         this.terminalTurns.set(`${threadId}:${turn.id}`, { id: turn.id, status: turn.status, error: turn.error,
-          startedAt: turn.startedAt, completedAt: turn.completedAt });
+          startedAt: turn.startedAt, completedAt: turn.completedAt, statusSource: "notification" });
         while (this.terminalTurns.size > 128) this.terminalTurns.delete(this.terminalTurns.keys().next().value);
       }
       for (const request of matched) if (request) this.updateRequest(threadId, request.id, { turnId: turn.id, state: terminal(turn.status) ? turnState(turn.status) : "running", error: turn.error || null });
@@ -507,8 +517,8 @@ export class CodexThreadService {
       if (params.item.type === "userMessage" && clientId) {
         const request = this.requests.get(threadId, clientId);
         if (request) {
-          if (active?.requestId === request.id && !["desktopQueue", "desktopSettings"].includes(request.executionRoute)) active.turnId = turnId;
-          const finished = this.terminalTurns.get(`${threadId}:${turnId}`);
+          if (active?.requestId === request.id && !["desktopQueue", "desktopSettings", "desktopSteer"].includes(request.executionRoute)) active.turnId = turnId;
+          const finished = requestTerminalTurn(this.terminalTurns.get(`${threadId}:${turnId}`), request);
           this.updateRequest(threadId, request.id, { turnId, userItemId: item.id, state: finished ? turnState(finished.status) : "running", error: finished?.error || null });
           if (finished) this.finish(threadId, request.id);
         }
@@ -528,7 +538,7 @@ export class CodexThreadService {
     stream.polling = true;
     try {
       const pending = this.pendingReceipts(threadId);
-      const desktopPending = pending.filter((request) => request.executionRoute === "desktopQueue" &&
+      const desktopPending = pending.filter((request) => ["desktopQueue", "desktopSteer"].includes(request.executionRoute) &&
         !REQUEST_TERMINAL_STATES.has(request.state));
       const page = await this.reader.listTurns(threadId, { limit: 2 });
       if (this.closed || this.streams.get(threadId) !== stream || !stream.subscribers.size) return;
@@ -577,8 +587,12 @@ export class CodexThreadService {
     }
     requests = [...matched.values()];
     turns = turns.map((turn) => matchesDesktopQueueTurn(turn, requests) ? observedDesktopQueueTurn(turn) : turn);
-    for (const turn of turns) if (terminal(turn.status)) {
-      this.terminalTurns.set(`${threadId}:${turn.id}`, { id: turn.id, status: turn.status, error: turn.error });
+    for (const turn of turns) {
+      const key = `${threadId}:${turn.id}`, cached = this.terminalTurns.get(key);
+      if (cached?.statusSource === "notification") continue;
+      if (terminal(turn.status)) this.terminalTurns.set(key, { id: turn.id, status: turn.status,
+        error: turn.error, completedAt: turn.completedAt, statusSource: "history" });
+      else if (cached && observedDesktopQueueTurn(cached).status === "unknown") this.terminalTurns.delete(key);
     }
     while (this.terminalTurns.size > 128) this.terminalTurns.delete(this.terminalTurns.keys().next().value);
     const pending = requests.filter((request) => request.state === "removed" || !REQUEST_TERMINAL_STATES.has(request.state));
@@ -587,7 +601,7 @@ export class CodexThreadService {
       if (!turn) continue;
       const user = turn.items?.find((item) => item.type === "userMessage" && item.clientId === request.id);
       if (turn.status === "unknown") {
-        if (request.executionRoute === "desktopQueue" && (user || request.turnId === turn.id)) {
+        if (["desktopQueue", "desktopSteer"].includes(request.executionRoute) && (user || request.turnId === turn.id)) {
           const state = ["accepted", "running"].includes(request.state) ? "unknown" :
             ["received", "dispatching", "queued", "removed"].includes(request.state) && user ? "accepted" : request.state;
           if (state !== request.state || request.turnId !== turn.id || user && request.userItemId !== user.id) {
@@ -608,12 +622,14 @@ export class CodexThreadService {
 
   reconcileItems(threadId, turnId, items) {
     const requests = this.requests.list(threadId);
-    const finished = this.terminalTurns.get(`${threadId}:${turnId}`) || requests.find((request) => request.turnId === turnId && terminal(request.state));
+    const cached = this.terminalTurns.get(`${threadId}:${turnId}`);
     for (const item of items) {
       if (item.type !== "userMessage" || !/^[a-zA-Z0-9_-]{8,128}$/.test(item.clientId || "")) continue;
       const request = requests.find((entry) => entry.id === item.clientId) || this.requests.get(threadId, item.clientId);
       if (!request || request.state !== "removed" && REQUEST_TERMINAL_STATES.has(request.state)) continue;
-      const state = finished ? turnState(finished.status || finished.state) : request.executionRoute === "desktopQueue"
+      const finished = requestTerminalTurn(cached, request) ||
+        requests.find((entry) => entry.turnId === turnId && terminal(entry.state));
+      const state = finished ? turnState(finished.status || finished.state) : ["desktopQueue", "desktopSteer"].includes(request.executionRoute)
         ? ["received", "dispatching", "queued", "removed"].includes(request.state) ? "accepted" : request.state : "running";
       if (request.state === state && request.turnId === turnId && request.userItemId === item.id) continue;
       this.updateRequest(threadId, request.id, { turnId, userItemId: item.id,
@@ -625,7 +641,7 @@ export class CodexThreadService {
   recoveryRequests(threadId) {
     return this.requests.list(threadId).filter((request) => ["unknown", "queued"].includes(request.state) &&
       !(request.state === "queued" && request.executionRoute === "settingsQueue")
-      || !this.active.has(threadId) && ["dispatching", "accepted", "running"].includes(request.state));
+      || (!this.active.has(threadId) || request.executionRoute === "desktopSteer") && ["dispatching", "accepted", "running"].includes(request.state));
   }
 
   scheduleRecovery(threadId) {
@@ -638,9 +654,9 @@ export class CodexThreadService {
         if (this.closed) return;
         this.reconcileRequests(threadId, page.turns || []);
         await this.desktopQuestionRecovery.recover(threadId, this.recoveryRequests(threadId)
-          .filter((request) => request.executionRoute === "desktopQuestion" && request.state === "unknown" && !request.turnId));
+          .filter((request) => ["desktopQuestion", "desktopSteer"].includes(request.executionRoute) && request.state === "unknown" && !request.turnId));
         if (this.closed) return;
-        if (this.recoveryRequests(threadId).some((request) => request.executionRoute === "desktopQueue" && !request.turnId)) {
+        if (this.recoveryRequests(threadId).some((request) => ["desktopQueue", "desktopSteer"].includes(request.executionRoute) && !request.turnId)) {
           const latestTurnId = page.turns?.at(-1)?.id || "";
           if (this.queueRecoveryExhausted.get(threadId) !== latestTurnId) {
             const cursor = this.queueRecoveryCursors.get(threadId) || page.olderCursor;
@@ -663,7 +679,7 @@ export class CodexThreadService {
         // Walk one bounded older page per retry until its official status is found.
         const missingStatus = this.recoveryRequests(threadId).some((request) => {
           const target = request.turnId || request.expectedTurnId;
-          if (request.executionRoute === "desktopQueue" && !target) return false;
+          if (["desktopQueue", "desktopSteer"].includes(request.executionRoute) && !target) return false;
           return !target || !this.terminalTurns.has(`${threadId}:${target}`)
             && !(page.turns || []).some((turn) => turn.id === target);
         });
@@ -676,7 +692,7 @@ export class CodexThreadService {
           else this.recoveryTurnCursors.delete(threadId);
         } else if (!missingStatus) this.recoveryTurnCursors.delete(threadId);
         const targets = new Set(this.recoveryRequests(threadId)
-          .filter((request) => request.executionRoute !== "desktopQuestion" || request.turnId)
+          .filter((request) => !["desktopQuestion", "desktopSteer"].includes(request.executionRoute) || request.turnId)
           .map((request) => request.turnId || request.expectedTurnId).filter(Boolean));
         for (const turnId of targets) {
           if (!this.reader.listItems || this.closed) break;

@@ -129,6 +129,10 @@ export class CodexDesktopClient {
     return this.#answer(threadId, { owner, clientUserMessageId, input }, false);
   }
 
+  async steerMessage(threadId, { owner, clientUserMessageId, input, beforeSend } = {}) {
+    return this.#answer(threadId, { owner, clientUserMessageId, input, beforeSend, ordinaryMessage: true }, false);
+  }
+
   async startQuestion(threadId, { owner, clientUserMessageId, input } = {}) {
     return this.#answer(threadId, { owner, clientUserMessageId, input }, true);
   }
@@ -207,8 +211,10 @@ export class CodexDesktopClient {
     return { turnId };
   }
 
-  async #answer(threadId, { owner, clientUserMessageId, input }, start) {
-    const text = questionText(input);
+  async #answer(threadId, { owner, clientUserMessageId, input, ordinaryMessage = false, beforeSend }, start) {
+    const nativeInput = ordinaryMessage ? messageInput(input)
+      : [{ type: "text", text: questionText(input), text_elements: [] }];
+    const text = nativeInput.filter((entry) => entry.type === "text").map((entry) => entry.text).join("\n");
     if (typeof clientUserMessageId !== "string" || !clientUserMessageId) {
       throw failure("CODEX_DESKTOP_INVALID_REPLY", "A stable reply identity is required.");
     }
@@ -218,12 +224,16 @@ export class CodexDesktopClient {
     if (!owner?.clientId || current.clientId !== owner.clientId) {
       throw failure("CODEX_DESKTOP_OWNER_CHANGED", "The desktop conversation owner changed. Refresh before answering.");
     }
+    if (beforeSend && !await beforeSend()) {
+      throw failure("CODEX_DESKTOP_TURN_CHANGED", "当前回复已变化，未发送引导。");
+    }
     const restoreMessage = {
       id: clientUserMessageId, text, createdAt: Date.now(),
-      context: { prompt: text, addedFiles: [], fileAttachments: [], imageAttachments: [],
-        ideContext: null, workspaceRoots: [], turnTrigger: "send_user_message_async_question" },
+      context: { prompt: text, addedFiles: [], fileAttachments: [],
+        imageAttachments: nativeInput.filter((entry) => entry.type === "localImage")
+          .map((entry, index) => ({ id: `${clientUserMessageId}:${index}`, src: entry.path })),
+        ideContext: null, workspaceRoots: [], turnTrigger: ordinaryMessage ? "composer" : "send_user_message_async_question" },
     };
-    const nativeInput = [{ type: "text", text, text_elements: [] }];
     const params = start ? {
       conversationId: threadId,
       turnStart: {

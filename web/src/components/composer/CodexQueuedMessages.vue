@@ -3,16 +3,20 @@ import { reactive } from "vue";
 import CodexSubmissionFeedback from "./CodexSubmissionFeedback.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 
-const props = defineProps({ messages: { type: Array, default: () => [] }, canGuide: Boolean, guideDisabled: Boolean, runningTask: Boolean,
+const props = defineProps({ messages: { type: Array, default: () => [] }, canGuide: Boolean, canGuideDesktop: Boolean, guideDisabled: Boolean, runningTask: Boolean,
   actions: { type: Object, default: () => ({}) } });
 const emit = defineEmits(["guide", "cancel", "restore", "check"]);
 const expanded = reactive(new Set());
 const togglePreview = (id) => expanded.has(id) ? expanded.delete(id) : expanded.add(id);
 const needsAttention = (message) => ["unknown", "failed", "rejected"].includes(message.state);
 const isSubmitting = (message) => ["sending", "dispatching"].includes(message.state);
-const guideReason = (message) => Object.keys(message.request?.options || {}).length ? "这条消息将使用新设置开始下一轮回复" : message.state === "queued" ? "请在 Codex 桌面端引导这条排队消息"
-  : !props.canGuide ? props.runningTask ? "请在 Codex 桌面端引导当前任务" : "当前没有正在执行的回复"
-  : props.guideDisabled ? "正在核对消息状态，稍后可引导" : "";
+const desktopQueued = (message) => message.state === "queued" && message.request?.executionRoute === "desktopQueue";
+const canGuideMessage = (message) => desktopQueued(message) ? props.canGuideDesktop : props.canGuide;
+const unavailableGuideReason = (message) => Object.keys(message.request?.options || {}).length
+  ? "包含新设置，等待下一轮执行" : "";
+const guideReason = (message) => unavailableGuideReason(message) || (props.guideDisabled
+  ? "正在核对消息状态，稍后可引导" : !props.runningTask ? "当前没有正在执行的回复"
+    : !canGuideMessage(message) ? "正在连接当前任务，稍后可引导" : "");
 const guide = (message) => {
   if (!guideReason(message) && !props.actions[`steer:${message.id}`]) emit("guide", message.id);
 };
@@ -31,7 +35,7 @@ const guide = (message) => {
             <span class="queue-text">{{ message.text || `${message.images.length} 张图片` }}</span>
           </button>
           <span v-if="isSubmitting(message)" class="queue-pending" role="status">提交中</span>
-          <button v-if="['received', 'queued'].includes(message.state)" type="button" class="queue-action"
+          <button v-if="['received', 'queued'].includes(message.state) && !unavailableGuideReason(message)" type="button" class="queue-action"
             :title="guideReason(message) || '将这条消息引导到当前回复'"
             :aria-label="`引导排队消息：${message.text || '图片'}`" :aria-description="guideReason(message) || undefined"
             :disabled="Boolean(guideReason(message)) || Boolean(actions[`steer:${message.id}`])"
@@ -46,6 +50,8 @@ const guide = (message) => {
             <LucideIcon name="trash-2" />
           </button>
         </div>
+        <p v-if="['received', 'queued'].includes(message.state) && guideReason(message)"
+          class="queue-guide-reason">{{ guideReason(message) }}</p>
         <div v-if="expanded.has(message.id)" class="queue-detail">
           <div v-if="message.images.length" class="queue-images">
             <img v-for="(image, index) in message.images" :key="image.url" :src="image.url"
@@ -71,6 +77,7 @@ const guide = (message) => {
 .queue-preview { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 4px 0; border: 0; background: transparent; color: #42392f; font: inherit; text-align: left; cursor: pointer; }
 .queue-text { min-width: 0; color: #42392f; font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .queue-thumbnail { flex: 0 0 auto; width: 28px; height: 28px; object-fit: cover; border: 1px solid var(--line, #e7e1db); border-radius: 4px; }
+.queue-guide-reason { margin: 0 0 8px 24px; color: #76675a; font-size: 12px; line-height: 1.5; }
 .queue-detail { padding: 2px 0 10px 20px; }
 .queue-detail p { margin: 0; color: #51473e; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .queue-images { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 5px; }

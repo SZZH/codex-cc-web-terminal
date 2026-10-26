@@ -145,7 +145,11 @@ export class CodexRequestStore {
         if (!name.endsWith(".json")) continue;
         const record = JSON.parse(fs.readFileSync(path.join(this.root, entry.name, name), "utf8"));
         this.nextOrder = Math.max(this.nextOrder, Number(record.order) || 0);
-        if (["dispatching", "accepted", "running"].includes(record.state)) {
+        if (["dispatching", "unknown"].includes(record.state) && record.executionRoute === "desktopSteer" &&
+          record.promotionPhase === "claimed" && !record.turnId && !record.userItemId) {
+          this.write({ ...record, state: "rejected", updatedAt: this.now(),
+            error: { code: "steer_rejected", message: "服务重启前已取出排队消息，但尚未发送引导。原文已保留，可恢复到输入框。" } });
+        } else if (["dispatching", "accepted", "running"].includes(record.state)) {
           this.write({ ...record, state: "unknown", updatedAt: this.now(),
             error: { code: "confirmation_required", message: "服务已重启，正在核对上一条消息是否已执行。不会自动重发。" } });
         } else this.indexRecord(record);

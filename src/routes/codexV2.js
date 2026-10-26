@@ -78,7 +78,7 @@ export async function handleCodexV2Route(ctx, runtime) {
       payload = { request: service.submit(threadId, runtime.parseJson(await runtime.readBody(ctx.req))) };
       status = 202;
     } else if (parts.length === 4 && resource === "requests" && nested === "steer" && ctx.method === "POST") {
-      payload = { request: service.promoteQueuedRequest(threadId, resourceId, runtime.parseJson(await runtime.readBody(ctx.req))) };
+      payload = { request: await service.promoteQueuedRequest(threadId, resourceId, runtime.parseJson(await runtime.readBody(ctx.req))) };
       status = 202;
     } else if (parts.length === 4 && resource === "requests" && nested === "cancel" && ctx.method === "POST") {
       payload = { request: await service.cancelQueuedRequest(threadId, resourceId) };

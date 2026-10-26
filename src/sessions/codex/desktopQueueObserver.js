@@ -2,13 +2,19 @@ import { createHash } from "node:crypto";
 import { REQUEST_TERMINAL_STATES } from "./requestStore.js";
 
 export function matchesDesktopQueueTurn(turn, requests) {
-  return requests.some((request) => request.executionRoute === "desktopQueue" &&
+  return requests.some((request) => ["desktopQueue", "desktopSteer"].includes(request.executionRoute) &&
     (request.turnId === turn.id || turn.items?.some((item) => item.type === "userMessage" && item.clientId === request.id)));
 }
 
 export function observedDesktopQueueTurn(turn) {
   if (!["interrupted", "aborted", "cancelled"].includes(turn.status) || turn.completedAt) return turn;
   return { ...turn, status: "unknown", statusConfirmed: false, statusSource: "unconfirmed-history" };
+}
+
+export function requestTerminalTurn(turn, request) {
+  if (!turn || turn.statusSource === "notification" ||
+    !["desktopQueue", "desktopSteer"].includes(request?.executionRoute)) return turn;
+  return observedDesktopQueueTurn(turn).status === "unknown" ? undefined : turn;
 }
 
 export class DesktopQueueObserver {
@@ -32,7 +38,7 @@ export class DesktopQueueObserver {
   }
 
   async observe(threadId, turns, requests, isCurrent = () => true) {
-    const pending = requests.filter((request) => request.executionRoute === "desktopQueue" &&
+    const pending = requests.filter((request) => ["desktopQueue", "desktopSteer"].includes(request.executionRoute) &&
       !REQUEST_TERMINAL_STATES.has(request.state));
     for (const candidate of turns) {
       if (!isCurrent()) return;

@@ -14,7 +14,7 @@ export class CodexTurnController {
     }
     const service = this.service;
     const owned = service.active.get(threadId);
-    const isOwned = owned?.turnId && !["desktopQueue", "desktopQuestion", "desktopSettings"]
+    const isOwned = owned?.turnId && !["desktopQueue", "desktopQuestion", "desktopSettings", "desktopSteer"]
       .includes(service.requests.get(threadId, owned.requestId)?.executionRoute);
     // Older clients may omit the ID only for a known web-owned turn.
     const expectedTurnId = body.expectedTurnId ?? (isOwned ? owned.turnId : null);

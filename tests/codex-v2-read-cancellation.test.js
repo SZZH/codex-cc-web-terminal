@@ -264,7 +264,7 @@ test("detail presentation and image boundaries reject abort before returning out
 
 test("thread service forwards read options without binding created state to HTTP ownership", async () => {
   const thread = { id: "synthetic", cwd: "", historyMode: "paginated", status: { type: "idle" }, turns: [],
-    capabilities: { desktopQuestionAnswers: false, desktopInterrupt: false } };
+    capabilities: { desktopQuestionAnswers: false, desktopInterrupt: false, desktopQueuedSteer: false } };
   const controller = new AbortController();
   const options = { signal: controller.signal };
   const calls = [];

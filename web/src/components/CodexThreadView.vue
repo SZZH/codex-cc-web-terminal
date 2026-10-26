@@ -110,7 +110,7 @@ function createContext(threadId) {
     return Boolean(turnId && ["inProgress", "running"].includes(store.state.turns[turnId]?.status) &&
       store.state.requestOrder.some((id) => {
         const receipt = store.state.requests[id];
-        return !["desktopQueue", "desktopQuestion", "desktopSettings"].includes(receipt?.executionRoute) && ["accepted", "running"].includes(receipt?.state) && receipt.turnId === turnId;
+        return !["desktopQueue", "desktopQuestion", "desktopSettings", "desktopSteer"].includes(receipt?.executionRoute) && ["accepted", "running"].includes(receipt?.state) && receipt.turnId === turnId;
       }));
   });
   context.runtime = createCodexChatRuntime({ store, request, createSocket: (url) => new WebSocket(url),
@@ -391,7 +391,7 @@ function showRequestFooter(request, turnId) {
             {{ active.actions.reload ? '正在重试…' : '重试连接' }}
           </button>
         </div>
-        <CodexQueuedMessages :messages="queuedMessages" :can-guide="active.running.value" :running-task="runningTask" :guide-disabled="unconfirmed" :actions="active.actions"
+        <CodexQueuedMessages :messages="queuedMessages" :can-guide="active.running.value" :can-guide-desktop="runningTask && state.thread?.capabilities?.desktopQueuedSteer === true" :running-task="runningTask" :guide-disabled="unconfirmed" :actions="active.actions"
           @guide="(id) => perform(`steer:${id}`, (runtime) => runtime.promoteQueuedRequest(id))"
           @cancel="(id) => perform(`cancel:${id}`, (runtime) => runtime.cancelQueuedRequest(id))"
           @restore="restoreRequest" @check="checkSubmission" />
