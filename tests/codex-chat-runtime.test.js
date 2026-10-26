@@ -2108,7 +2108,7 @@ async function mountThreadView(api = {}) {
   const mockChat = sourceUrl(`import { defineComponent, h } from ${JSON.stringify(import.meta.resolve("vue"))};
     import Timeline from ${JSON.stringify(timeline)};
     export default defineComponent({ props: { draft: String, canSend: Boolean, canInterrupt: Boolean, allowFollowups: Boolean,
-      canSteer: Boolean, canAnswerQuestions: Boolean, runningTask: Boolean, followUpMode: String, interrupting: Boolean, processExpanded: Object, loading: Boolean, historyLoading: Boolean, hasOlder: Boolean, loadingOlder: Boolean, onReachTop: Function,
+      canSteer: Boolean, canAnswerQuestions: Boolean, attentionExpanded: Boolean, runningTask: Boolean, followUpMode: String, interrupting: Boolean, processExpanded: Object, loading: Boolean, historyLoading: Boolean, hasOlder: Boolean, loadingOlder: Boolean, onReachTop: Function,
       composerOptions: Object, models: Array, gitState: Object, threadSnapshot: Object, threadViewModel: Object, statusText: String },
       setup(props, { emit, slots }) { globalThis.__codexChatTestChat = { props, emit }; return () => h('chat-view', [
         h('history-start', slots['history-start']?.({ loadOlder: props.onReachTop })), h(Timeline, { snapshot: props.threadSnapshot, threadViewModel: props.threadViewModel, processExpanded: props.processExpanded,
@@ -4743,13 +4743,16 @@ test("floating question stays outside scrolling history, preserves a folded draf
     assert.ok(dock());
     assert.equal(dock().parent.type, "attention");
     assert.match(nodeText(dock()), /1 个问题等你回答/);
+    assert.equal(harness.chat.props.attentionExpanded, true);
     const radio = elements(dock(), (node) => node.type === "input" && node.props.value === "Keep going")[0];
     radio.props.onChange(); await flush();
     const toggle = elements(dock(), (node) => node.props?.["aria-label"] === "收起提问")[0];
     toggle.props.onClick(); await flush();
     assert.equal(toggle.props["aria-expanded"], false);
-    assert.match(nodeText(dock()), /点击展开/);
+    assert.equal(toggle.props["aria-label"], "展开提问");
+    assert.equal(harness.chat.props.attentionExpanded, false);
     toggle.props.onClick(); await flush();
+    assert.equal(harness.chat.props.attentionExpanded, true);
     assert.equal(radio.props.checked, true, "collapsing preserves the answer draft");
     const form = elements(dock(), (node) => node.type === "form")[0];
     form.props.onSubmit({ preventDefault() {} }); form.props.onSubmit({ preventDefault() {} }); await flush();
