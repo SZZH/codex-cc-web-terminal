@@ -32,6 +32,7 @@ const props = defineProps({
   runningTask: Boolean,
   followUpMode: { type: String, default: "steer" },
   canAnswerQuestions: Boolean,
+  attentionExpanded: Boolean,
   interrupting: Boolean,
   processExpanded: { type: Object, default: () => ({}) },
   loading: Boolean,
@@ -228,7 +229,7 @@ onBeforeUnmount(() => {
   <section class="mobile-shell chat-shell" :style="chatShellStyle">
     <ChatHeader :title="title" :cwd="workspaceCwd" @back="emit('back')" />
 
-    <main class="chat-screen">
+    <main class="chat-screen" :class="{ 'attention-expanded': attentionExpanded }">
       <section ref="messageListEl" class="message-stream" data-app-scroll :style="messageStreamStyle" tabindex="0" aria-label="聊天记录"
         @scroll="handleStreamScroll" @wheel.passive="handleStreamWheel" @touchstart.passive="handleStreamTouchStart"
         @touchmove.passive="handleStreamTouchMove" @touchend="handleStreamTouchEnd" @touchcancel="handleStreamTouchEnd"
@@ -336,6 +337,12 @@ onBeforeUnmount(() => {
   overflow-x: hidden;
 }
 .chat-composer-host :deep(.chat-composer-wrap) { position: relative; }
+
+@media (max-width: 640px) {
+  /* Keep the mounted composer and drafts while the answer form uses the space. */
+  .attention-expanded .chat-composer-host { display: none; }
+  .attention-expanded .message-stream { flex-basis: 0; padding-top: 0; }
+}
 
 .message-bottom-anchor {
   display: block;

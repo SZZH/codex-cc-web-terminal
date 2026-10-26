@@ -8,6 +8,7 @@ import { normalizeThreadItem } from "../web/src/lib/thread-item-renderers.js";
 import { presentCodexChatItem } from "../web/src/lib/codex-chat-presentation.js";
 import { buildQuestionAnswer } from "../web/src/lib/codex-question-history.js";
 import { QUESTION_DOCK } from "../web/src/lib/codex-question-dock.js";
+import { createCodexInteractionState } from "../web/src/lib/codex-interactions/state.js";
 
 const native = (patch = {}) => ({ id: "call_question", type: "agentMessage", delivery: "async", phase: "final_answer",
   text: "Choose a path?\n1. First\n2. Second", questions: [{ title: "Choose a path?", options: ["First", "Second"] }], ...patch });
@@ -79,7 +80,7 @@ const text = (node) => [node.text || "", ...(node.children || []).map(text)].joi
 async function mount(t, values, name = "ThreadQuestionCard", providers = []) {
   const component = (await import(componentUrl(new URL(`../web/src/components/thread-item/${name}.vue`, import.meta.url)))).default;
   const renderer = createRenderer({
-    createElement: (type) => ({ type, props: {}, children: [] }), createText: (text) => ({ text }), createComment: (text) => ({ text }),
+    createElement: (type) => ({ type, props: {}, children: [], style: {} }), createText: (text) => ({ text }), createComment: (text) => ({ text }),
     setText: (node, text) => { node.text = text; }, setElementText: (node, text) => { node.text = text; node.children = []; },
     parentNode: (node) => node?.parent || null,
     nextSibling: (node) => node?.parent?.children[node.parent.children.indexOf(node) + 1] || null,
@@ -90,8 +91,10 @@ async function mount(t, values, name = "ThreadQuestionCard", providers = []) {
   const root = { children: [] }, props = reactive(values);
   const app = renderer.createApp({ render: () => h(component, props) });
   for (const [key, value] of providers) app.provide(key, value);
-  app.mount(root); await nextTick(); t.after(() => app.unmount());
-  return { root, props, elements: (predicate) => elements(root, predicate) };
+  let closed = false;
+  const close = () => { if (!closed) { closed = true; app.unmount(); } };
+  app.mount(root); await nextTick(); t.after(close);
+  return { root, props, close, elements: (predicate) => elements(root, predicate) };
 }
 
 test("timeline question opens the single floating answer form instead of creating a second draft", async (t) => {
@@ -115,6 +118,52 @@ test("floating answers remove completed entries while preserving the remaining n
   ui.elements((node) => node.type === "textarea")[0].props.onInput({ target: { value: "Second answer" } }); await nextTick();
   ui.elements((node) => node.type === "form")[0].props.onSubmit({ preventDefault() {} });
   assert.equal(answers[0].index, 1);
+});
+
+test("compact floating cards retain the question and response status without repeating the dock heading", async (t) => {
+  const ui = await mount(t, { floating: true, canRespond: true, question: dto({ status: "pending" }) });
+  assert.equal(ui.elements((node) => node.type === "header").length, 0);
+  assert.equal(ui.elements((node) => node.type === "legend")[0].text, "Choose a path?");
+  assert.match(text(ui.root), /First.*Second.*提交回答/);
+  assert.doesNotMatch(text(ui.root), /等待回答/);
+  for (const response of [
+    { pendingResponses: { "0": "unknown" } },
+    { pendingResponse: true, responseState: "unknown" }
+  ]) {
+    ui.props.question = dto({ status: "pending", ...response }); await nextTick();
+    assert.match(text(ui.root), /Choose a path/);
+    assert.match(text(ui.root), /回答待确认/);
+    assert.equal(ui.elements((node) => node.type === "button").length, 0, "unconfirmed responses cannot be submitted again");
+  }
+});
+
+test("question dock reports its visible expansion, preserves drafts and releases space after all answers", async (t) => {
+  const expanded = [], store = createCodexInteractionState("thread", { reactive });
+  const first = dto({ status: "pending" });
+  const ui = await mount(t, { questions: [], canRespond: true, interactionState: store.state,
+    onExpanded: (value) => expanded.push(value) }, "../composer/CodexQuestionDock");
+  const toggle = () => ui.elements((node) => node.props?.["aria-controls"])[0];
+  assert.deepEqual(expanded, [false]);
+  ui.props.questions = [first]; await nextTick();
+  assert.equal(expanded.at(-1), true);
+  ui.elements((node) => node.type === "input").at(-1).props.onChange(); await nextTick();
+  ui.elements((node) => node.type === "textarea")[0].props.onInput({ target: { value: "Keep this draft" } }); await nextTick();
+  toggle().props.onClick(); await nextTick();
+  assert.equal(expanded.at(-1), false);
+  const second = dto({ callId: "call_second", status: "pending", questions: [{ id: "0", title: "Second question", options: [] }] });
+  ui.props.questions = [first, second]; await nextTick();
+  assert.equal(expanded.at(-1), true, "a newly waiting question reopens the dock");
+  assert.equal(toggle().props["aria-expanded"], true);
+  assert.equal(ui.elements((node) => node.type === "textarea")[0].props.value, "Keep this draft");
+  ui.props.questions = [first, second].map((question) => ({ ...question, status: "answered", answers: { "0": "Done" } }));
+  await nextTick();
+  assert.equal(expanded.at(-1), false, "answered questions restore the ordinary chat area");
+  assert.equal(ui.elements((node) => node.props?.["aria-label"] === "Codex 悬浮提问").length, 0);
+  ui.props.questions = [dto({ callId: "call_third", status: "pending" })]; await nextTick();
+  assert.equal(expanded.at(-1), true);
+  ui.close();
+  assert.equal(expanded.at(-1), false, "leaving the thread releases attention layout state");
+  store.dispose();
 });
 
 test("unknown and closed historical questions remain records without misleading pending actions", async (t) => {

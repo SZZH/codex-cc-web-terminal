@@ -48,10 +48,10 @@ test("native question fields expose freeform, secret and Other without sending o
 });
 
 const row = (method, params, patch = {}) => ({ id: "one", threadId: "thread", turnId: "turn", itemId: "item", method, params, status: "pending", version: 1, ...patch });
-async function panel(interaction) {
+async function panel(interaction, props = {}) {
   const store = createCodexInteractionState("thread", { reactive }), responses = [];
   store.applySnapshot({ interactions: [interaction], epoch: "registry", revision: 1 });
-  const ui = await mount("CodexInteractionPanel", { state: store.state,
+  const ui = await mount("CodexInteractionPanel", { ...props, state: store.state,
     onDraft: ({ id, patch }) => store.setDraft(id, patch), onRespond: (value) => responses.push(value) });
   return { ...ui, store, responses, button(label) { return ui.elements((node) => node.type === "button" && text(node).includes(label))[0]; },
     submit() { ui.elements((node) => node.type === "form")[0].props.onSubmit({ preventDefault() {} }); } };
@@ -76,6 +76,44 @@ test("real question panel submits every question ID and skips without exposing s
     assert.equal(ui.store.state.drafts.one, undefined);
     assert.equal(ui.elements((node) => node.type === "input" && node.props.type === "password").length, 0);
     assert.equal(ui.button("提交回答"), undefined);
+    assert.equal(ui.elements((node) => node.type === "section").length, 0);
+  } finally { ui.store.dispose(); ui.close(); }
+});
+
+test("embedded questions keep one visible prompt, full option descriptions and the original answer submission", async () => {
+  const question = row("item/tool/requestUserInput", { questions: [{ id: "choice", question: "选择本次发布范围", isOther: true,
+    options: [{ label: "仅修复", description: "只包含已经验证的修复，保留其他工作供下次发布。" }] }] });
+  const ui = await panel(question, { embedded: true });
+  try {
+    assert.equal(ui.elements((node) => node.type === "header").length, 0);
+    const legend = ui.elements((node) => node.type === "legend")[0];
+    assert.equal(legend.text, "选择本次发布范围");
+    assert.ok(!legend.props.class?.includes("sr-only"), "the prompt must stay visible when its duplicate heading is removed");
+    assert.match(text(ui.root), /只包含已经验证的修复，保留其他工作供下次发布。/);
+    assert.equal(ui.button("提交回答").props.disabled, true);
+    ui.elements((node) => node.type === "input" && node.props.type === "radio")[0].props.onChange(); await nextTick();
+    assert.equal(ui.button("提交回答").props.disabled, false);
+    ui.submit();
+    assert.deepEqual(ui.responses, [{ id: "one", response: { answers: { choice: { answers: ["仅修复"] } } } }]);
+  } finally { ui.store.dispose(); ui.close(); }
+});
+
+test("embedded questions retain submitting, unconfirmed and expired states after compacting their heading", async () => {
+  const question = row("item/tool/requestUserInput", { questions: [{ id: "answer", question: "继续执行吗" }] });
+  const ui = await panel(question, { embedded: true });
+  try {
+    ui.store.state.actions.one = { status: "submitting" }; await nextTick();
+    assert.match(text(ui.root), /正在提交/);
+    assert.equal(ui.button("提交回答"), undefined);
+    ui.submit(); assert.equal(ui.responses.length, 0);
+    ui.store.state.actions.one = { status: "unknown" }; await nextTick();
+    assert.match(text(ui.root), /继续执行吗.*响应待核对/);
+    assert.ok(ui.button("核对响应状态"));
+    assert.equal(ui.elements((node) => node.type === "textarea").length, 0);
+    ui.store.applyUpdate({ interaction: { ...question, status: "unavailable", version: 2 }, epoch: "registry", revision: 2 }); await nextTick();
+    assert.match(text(ui.root), /请求已失效.*原请求已失效，无法继续处理/);
+    assert.equal(ui.elements((node) => node.type === "form").length, 0);
+    ui.elements((node) => node.props?.["aria-label"] === "关闭失效交互")[0].props.onClick(); await nextTick();
     assert.equal(ui.elements((node) => node.type === "section").length, 0);
   } finally { ui.store.dispose(); ui.close(); }
 });

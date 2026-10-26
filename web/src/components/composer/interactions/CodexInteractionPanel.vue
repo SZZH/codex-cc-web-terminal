@@ -11,7 +11,7 @@ import { USER_INPUT, COMMAND_APPROVAL, FILE_APPROVAL, PERMISSIONS_APPROVAL, MCP_
 import { describeMcpForm, initialMcpValues, buildMcpFormResponse } from "../../../lib/codex-interactions/form.js";
 import { interactionTitle, interactionChoiceLabel } from "../../../lib/codex-interactions/presentation.js";
 
-const props = defineProps({ state: { type: Object, required: true } });
+const props = defineProps({ state: { type: Object, required: true }, embedded: Boolean });
 const emit = defineEmits(["respond", "draft", "check", "refresh", "dismiss"]);
 const activeId = ref(""), validationError = ref(""), dismissed = ref([]);
 const rows = computed(() => {
@@ -39,6 +39,7 @@ const status = computed(() => props.state.actions[activeId.value]?.status === "u
   : props.state.actions[activeId.value]?.status === "submitting" ? "正在提交"
     : ({ submitting: "正在提交", submitted: "已提交，等待确认", unknown: "响应待核对" })[interaction.value?.status]);
 const canCheck = computed(() => props.state.actions[activeId.value]?.status === "unknown" || ["submitting", "submitted", "unknown"].includes(interaction.value?.status));
+const compactQuestion = computed(() => props.embedded && interaction.value?.method === USER_INPUT && !status.value && !canCheck.value && !terminal.value && !props.state.error);
 const error = computed(() => {
   const message = validationError.value || props.state.responseErrors[activeId.value] || (capabilityError.value ? "" : interaction.value?.error?.message) || "";
   return canCheck.value && /响应状态|响应未确认|正在核对原交互/.test(message) ? "" : message;
@@ -67,9 +68,9 @@ function dismiss() { dismissed.value.push(activeId.value); emit("dismiss", activ
 
 <template>
   <section v-if="rows.length || state.error" class="codex-interaction-panel" aria-label="Codex 交互待办">
-    <header class="interaction-header">
-      <PixelCompanion :size="28" :mood="busy ? 'loading' : terminal || state.error ? 'error' : 'waiting'" />
-      <h2>{{ terminal ? '请求已失效' : title }}</h2><span v-if="status" class="interaction-status" role="status" aria-live="polite">{{ status }}</span>
+    <header v-if="!compactQuestion || rows.length > 1" class="interaction-header">
+      <PixelCompanion v-if="!embedded" :size="28" :mood="busy ? 'loading' : terminal || state.error ? 'error' : 'waiting'" />
+      <h2 v-if="!compactQuestion">{{ terminal ? '请求已失效' : title }}</h2><span v-if="status" class="interaction-status" role="status" aria-live="polite">{{ status }}</span>
       <button v-if="terminal" type="button" class="interaction-close" aria-label="关闭失效交互" title="关闭失效交互" @click="dismiss">×</button>
       <select v-if="rows.length > 1" :value="activeId" aria-label="选择交互待办" @change="activeId = $event.target.value">
         <option v-for="row in rows" :key="row.id" :value="row.id">{{ interactionChoiceLabel(row) }}</option>
@@ -79,7 +80,7 @@ function dismiss() { dismissed.value.push(activeId.value); emit("dismiss", activ
     <p v-if="terminal" class="interaction-note interaction-unavailable" role="status">原请求已失效，无法继续处理。</p>
     <form v-if="interaction && !terminal" class="interaction-form" @submit.prevent="submit">
       <div v-if="interaction.method !== USER_INPUT || !canCheck" class="interaction-body" tabindex="0" :aria-label="title">
-        <QuestionFields v-if="interaction.method === USER_INPUT && !canCheck" :key="interaction.id" :questions="params.questions || []" :hide-question="params.questions?.length === 1"
+        <QuestionFields v-if="interaction.method === USER_INPUT && !canCheck" :key="interaction.id" :questions="params.questions || []" :hide-question="!embedded && params.questions?.length === 1"
           :values="draft.answers || {}" :disabled="disabled" @change="(id, value) => updateDraft({ answers: { ...draft.answers, [id]: value } })" />
         <template v-else-if="[COMMAND_APPROVAL, FILE_APPROVAL, PERMISSIONS_APPROVAL].includes(interaction.method)">
           <ApprovalDetails :interaction="interaction" />

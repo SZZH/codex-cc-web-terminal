@@ -40,8 +40,8 @@ function submit(question, index) {
     <p v-for="entry in question.questions" :key="entry.id">{{ entry.title }}</p>
     <button type="button" class="thread-question-submit" @click="dock.open(question.callId)">在悬浮区查看问题</button>
   </section>
-  <section v-else class="thread-question" aria-label="问题">
-    <header class="thread-question-header"><PixelCompanion v-if="pending" mood="waiting" :size="28" /><strong>问题</strong><span>{{ status }}</span></header>
+  <section v-else class="thread-question" :class="{ 'thread-question-floating': floating }" aria-label="问题">
+    <header v-if="!floating" class="thread-question-header"><PixelCompanion v-if="pending" mood="waiting" :size="28" /><strong>问题</strong><span>{{ status }}</span></header>
     <template v-for="(entry, index) in question.questions" :key="`${question.callId}-${entry.id}`">
     <form v-if="!floating || !hasAnswer(entry.id)" class="thread-question-entry"
       @submit.prevent="submit(entry, index)">
@@ -59,10 +59,10 @@ function submit(question, index) {
           </label>
           <textarea v-if="!entry.options.length || custom[entry.id]" :aria-label="entry.title" rows="2" maxlength="10000"
             placeholder="输入回答…" :value="drafts[entry.id] || ''" @input="choose(entry.id, $event.target.value, true)" />
-          <button type="submit" class="thread-question-submit" :disabled="!String(drafts[entry.id] || '').trim()">提交回答</button>
+          <div class="thread-question-actions"><button type="submit" class="thread-question-submit" :disabled="!String(drafts[entry.id] || '').trim()">提交回答</button></div>
         </template>
         <template v-else>
-          <p v-if="!hasAnswer(entry.id) && responseState(entry.id)" class="thread-question-note" role="status">{{ responseLabel(responseState(entry.id)) }}</p>
+          <p v-if="!hasAnswer(entry.id) && (responseState(entry.id) || question.pendingResponse)" class="thread-question-note" role="status">{{ responseLabel(responseState(entry.id) || question.responseState) }}</p>
           <ul v-else-if="!hasAnswer(entry.id) && entry.options.length" class="thread-question-options"><li v-for="(option, optionIndex) in entry.options" :key="optionIndex">{{ option }}</li></ul>
         </template>
       </fieldset>
@@ -92,6 +92,9 @@ legend { padding: 0; margin-bottom: 8px; white-space: pre-wrap; overflow-wrap: a
 textarea { display: block; box-sizing: border-box; width: 100%; min-width: 0; min-height: 72px; max-height: 180px; resize: vertical; border: 1px solid var(--line-strong, #d9d0c7); border-radius: 6px; padding: 9px 10px; background: #fffcf8; color: inherit; font: inherit; line-height: 1.5; }
 .thread-question-submit { min-height: 44px; margin-top: 10px; border: 1px solid #79634f; border-radius: 6px; background: #79634f; color: #fffcf8; padding: 8px 14px; font: inherit; cursor: pointer; }
 .thread-question-submit:disabled { opacity: .5; cursor: default; }
+.thread-question-floating .thread-question-actions { position: sticky; bottom: -8px; padding: 4px 0; background: #fffcf8; }
+.thread-question-floating .thread-question-submit { margin-top: 0; }
+.thread-question-floating .thread-question-option { padding-block: 6px; }
 .thread-question-note { margin: 12px 0 0; color: #7f7165; font-size: 12px; }
 :focus-visible { outline: 2px solid #79634f; outline-offset: 3px; }
 @media (max-width: 480px) { textarea { font-size: 16px; } }

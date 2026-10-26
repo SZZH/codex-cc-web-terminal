@@ -181,6 +181,11 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.4.5`
+
+- Gave mobile questions priority over the ordinary composer while expanded, with a compact header, fewer repeated labels, and a single scroll area. Returning to chat restores the composer and preserves drafts and queued messages.
+- Kept answer actions visible for long questions and preserved submission, unconfirmed, and expired states in the compact view.
+
 ### `v0.4.4`
 
 - Unblocked queued messages when an older request lacks a final receipt but official history confirms that a later turn has started, without resending the old input or claiming it succeeded.

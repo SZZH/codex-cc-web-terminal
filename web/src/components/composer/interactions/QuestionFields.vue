@@ -34,15 +34,16 @@ function chooseOther(question) { other[question.id] = true; emit("change", quest
 
 <style scoped>
 .interaction-questions { display: grid; gap: 16px; min-width: 0; }
-.interaction-question { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 8px; }
+.interaction-question { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 2px; }
 legend { display: grid; gap: 4px; padding: 0; margin-bottom: 8px; color: #433831; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-.question-option { display: flex; align-items: flex-start; gap: 9px; min-height: 36px; padding: 5px 0; cursor: pointer; }
+.question-option { display: flex; align-items: flex-start; gap: 9px; min-height: 44px; padding: 5px 0; cursor: pointer; }
 .question-option input { flex: 0 0 auto; margin: 3px 0; accent-color: #79634f; }
 .question-option span { min-width: 0; overflow-wrap: anywhere; }
 strong { display: block; font-size: 13px; font-weight: 500; } small { display: block; color: #7f7165; font-size: 12px; line-height: 1.5; }
 textarea, input[type="password"] { box-sizing: border-box; width: 100%; min-width: 0; border: 1px solid #d9cec4; border-radius: 6px; background: #fffcf8; color: #433831; font: inherit; padding: 9px; line-height: 1.5; }
 textarea { resize: vertical; min-height: 70px; max-height: 160px; }
+@media (max-width: 640px) { textarea, input[type="password"] { font-size: 16px; } }
 .question-skip { justify-self: start; min-height: 32px; padding: 4px 0; background: transparent; border: 0; color: #79634f; font: inherit; text-decoration: underline; cursor: pointer; }
 :focus-visible { outline: 2px solid #79634f; outline-offset: 2px; }
 </style>

@@ -30,7 +30,7 @@ const snapshot = computed(() => state.value ? active.value.presentSnapshot(state
 const pendingQuestions = computed(() => pendingDesktopQuestions(state.value).map((question) => ({ ...question,
   canRespond: question.canRespond !== false && Boolean(state.value.thread?.capabilities?.desktopQuestionAnswers ||
     active.value?.running.value && question.turnId === activeCodexTurnId(state.value)) })));
-const questionDock = ref(null);
+const questionDock = ref(null), questionDockExpanded = ref(false);
 provide(QUESTION_DOCK, { has: (callId) => pendingQuestions.value.some((question) => question.callId === callId),
   open: (callId) => questionDock.value?.open(callId) });
 const queuedMessages = computed(() => state.value ? presentCodexQueue(state.value) : []);
@@ -374,7 +374,7 @@ function showRequestFooter(request, turnId) {
       :permission-mode-options="CODEX_PERMISSION_MODE_OPTIONS"
       :can-send="canSend" :can-interrupt="canInterrupt" :loading="loading" :status-text="statusText"
       :running-task="runningTask" :follow-up-mode="pendingSettings ? 'queue' : active.followUpMode.value"
-      :can-answer-questions="canAnswerQuestions" @question-answer="answerQuestion"
+      :can-answer-questions="canAnswerQuestions" :attention-expanded="questionDockExpanded" @question-answer="answerQuestion"
       :history-loading="initialHistoryLoading"
       :has-older="active.runtime.hasOlderHistory()" :loading-older="Boolean(active.actions.older)" :on-reach-top="active.readOlder"
       allow-followups :can-steer="active.running.value && !unconfirmed && !pendingSettings" :interrupting="state.interrupting"
@@ -387,7 +387,7 @@ function showRequestFooter(request, turnId) {
       @refresh-git="active.composer.refreshWorkspaceGit()">
       <template #attention>
         <CodexQuestionDock :key="threadId" ref="questionDock" :questions="pendingQuestions" :can-respond="canAnswerQuestions"
-          :interaction-state="state.interactionState" @answer="answerQuestion"
+          :interaction-state="state.interactionState" @answer="answerQuestion" @expanded="questionDockExpanded = $event"
           @draft="({ id, patch }) => active.store.interactions.setDraft(id, patch)"
           @respond="({ id, response }) => active.runtime.interactions.respond(id, response)"
           @check="active.runtime.interactions.check($event)" @refresh="active.runtime.interactions.refresh()" />
