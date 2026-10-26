@@ -9,7 +9,7 @@ const KINDS = { userMessage: "UserMessage", agentMessage: "AgentMessage", reason
   imageView: "ImageView", imageGeneration: "ImageGeneration", plan: "Plan" };
 const REQUEST_LABELS = { sending: "发送中", received: "等待执行", dispatching: "发送中",
   queued: "等待执行", accepted: "正在生成", running: "正在生成", completed: "已完成", cancelled: "已撤回", failed: "发送失败",
-  interrupted: "已中断", rejected: "请求被拒绝", unknown: "正在确认发送状态" };
+  interrupted: "已中断", rejected: "请求被拒绝", unknown: "正在确认发送状态", superseded: "执行已结束，结果未确认" };
 const UNCONFIRMED_STATES = new Set(["sending", "received", "dispatching", "queued", "accepted", "running", "unknown"]);
 export const codexRequestLabel = (request) => {
   const label = request?.initialPlacement === "timeline" && ["received", "queued"].includes(request.state)
@@ -139,7 +139,7 @@ export function presentCodexChatSnapshot(state, presentItem = presentCodexChatIt
       !knownClients.has(id) && !knownItems.has(request.userItemId)) continue;
     // A settled receipt outside the loaded history window must not reinsert old input.
     const submittedHere = state.submittedRequestIds?.includes(id);
-    if (!submittedHere && request.state === "completed" && request.turnId &&
+    if (!submittedHere && ["completed", "superseded"].includes(request.state) && request.turnId &&
       (state.turns[request.turnId]?.itemsLatestRequested || state.turns[request.turnId]?.itemsLatestLoaded) &&
       !knownItems.has(request.userItemId) && !knownClients.has(id)) continue;
     const requestTurn = state.turns[request.turnId];
@@ -159,7 +159,7 @@ export function presentCodexChatSnapshot(state, presentItem = presentCodexChatIt
       }
       continue;
     }
-    if (request.state === "completed" && request.turnId && !state.turns[request.turnId]) continue;
+    if (["completed", "superseded"].includes(request.state) && request.turnId && !state.turns[request.turnId]) continue;
     const replyText = questionReplyText(request.input?.text || "");
     const questionReplies = parseQuestionReplies(request.input?.text || "");
     const item = { id: `request:${id}`, kind: "UserMessage", text: replyText, request: { ...request },

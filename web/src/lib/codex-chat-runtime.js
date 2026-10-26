@@ -95,7 +95,8 @@ export function createCodexChatRuntime({ store, request, createSocket,
   }
   function needsTurnStatusRead() {
     const status = state.turns[state.turnOrder.at(-1)]?.status;
-    return status === "unknown" || state.connection !== "connected" && ["inProgress", "running"].includes(status);
+    // A connected socket does not prove the turn completion event was delivered.
+    return ["unknown", "inProgress", "running"].includes(status);
   }
   function needsQuestionCapability() {
     if (state.thread?.capabilities?.desktopQuestionAnswers === true) return false;
@@ -115,6 +116,8 @@ export function createCodexChatRuntime({ store, request, createSocket,
   function needsControlCapability() {
     if (needsQuestionCapability()) return true;
     const turnId = activeCodexTurnId(state);
+    if (turnId && state.thread?.capabilities?.desktopQueuedSteer !== true && unresolved().some((receipt) =>
+      receipt.state === "queued" && receipt.executionRoute === "desktopQueue")) return true;
     return Boolean(turnId && state.thread?.capabilities?.desktopInterrupt !== true &&
       !state.requestOrder.some((id) => {
         const receipt = state.requests[id];

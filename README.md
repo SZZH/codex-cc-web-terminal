@@ -181,6 +181,12 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.4.4`
+
+- Unblocked queued messages when an older request lacks a final receipt but official history confirms that a later turn has started, without resending the old input or claiming it succeeded.
+- Prevented settled receipts outside the loaded history window from keeping Stop visible after a task finishes, including after refresh or restart.
+- Added latest-turn reconciliation while WebSocket remains connected and independent retries for unavailable desktop guidance capabilities.
+
 ### `v0.4.3`
 
 - Added guidance from the phone for confirmed desktop queued messages, with clear availability hints and preservation of the original text and attachments after a confirmed send failure.

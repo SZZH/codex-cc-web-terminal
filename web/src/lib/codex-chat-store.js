@@ -3,13 +3,13 @@ import { includeWindowItems, mergeItemOrder, mergeOrder } from "./codex-chat-ite
 import { prepareInitialHistory } from "./codex-initial-history.js";
 import { mergeCodexSubagentActivity } from "./codex-subagent-activity.js";
 
-const TERMINAL = new Set(["completed", "failed", "interrupted", "rejected", "aborted", "cancelled", "removed"]);
+const TERMINAL = new Set(["completed", "failed", "interrupted", "rejected", "aborted", "cancelled", "removed", "superseded"]);
 export const isCodexTerminal = (value) => TERMINAL.has(String(value || "").toLowerCase());
 export const isCodexRequestUnresolved = (request) => !isCodexTerminal(request?.state);
 export const isCodexRequestDismissedMissing = (receipt) => receipt?.state === "unknown" &&
   receipt.confirmationDismissed === true && receipt.error?.code === "receipt_not_found";
 export const hasCodexRequestExecution = (request) => request?.executionConfirmed === true || Boolean(request?.turnId &&
-  ["accepted", "running", "completed", "failed", "interrupted", "aborted"].includes(request.state));
+  ["accepted", "running", "completed", "failed", "interrupted", "aborted", "superseded"].includes(request.state));
 export function activeCodexTurnId(state) {
   const latestTurnId = state.turnOrder.at(-1);
   if (["inProgress", "running"].includes(state.turns[latestTurnId]?.status)) return latestTurnId;

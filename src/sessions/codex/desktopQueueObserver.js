@@ -37,26 +37,28 @@ export class DesktopQueueObserver {
     this.publish(threadId, type, payload);
   }
 
-  async observe(threadId, turns, requests, isCurrent = () => true) {
+  async observe(threadId, turns, requests, isCurrent = () => true, canPublish = () => true) {
     const pending = requests.filter((request) => ["desktopQueue", "desktopSteer"].includes(request.executionRoute) &&
       !REQUEST_TERMINAL_STATES.has(request.state));
     for (const candidate of turns) {
       if (!isCurrent()) return;
-      if (!matchesDesktopQueueTurn(candidate, pending)) continue;
       const turn = observedDesktopQueueTurn(candidate);
+      const stillObservable = () => matchesDesktopQueueTurn(turn, pending.filter((request) => canPublish(request, turn)));
+      if (!stillObservable()) continue;
       const { items: summaryItems = [], ...metadata } = turn;
       this.emitChanged(threadId, `${turn.id}:turn`, "turn.upsert", { turn: metadata });
-      if (!isCurrent()) return;
+      if (!isCurrent() || !stillObservable()) return;
       const recent = typeof this.reader.listItems === "function"
         ? (await this.reader.listItems(threadId, turn.id, { limit: 30, sortDirection: "desc" })).items || [] : [];
       if (!isCurrent()) return;
+      if (!stillObservable()) continue;
       const recentIds = new Set(recent.map((item) => item.id));
       for (const item of summaryItems) if (item.type === "userMessage" && !recentIds.has(item.id)) {
-        if (!isCurrent()) return;
+        if (!isCurrent() || !stillObservable()) return;
         this.emitChanged(threadId, `${turn.id}:item:${item.id}`, "item.upsert", { turnId: turn.id, item });
       }
       for (const item of recent) {
-        if (!isCurrent()) return;
+        if (!isCurrent() || !stillObservable()) return;
         this.emitChanged(threadId, `${turn.id}:item:${item.id}`, "item.upsert", { turnId: turn.id, item });
       }
     }

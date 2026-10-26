@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
-export const REQUEST_TERMINAL_STATES = new Set(["completed", "failed", "interrupted", "rejected", "cancelled", "removed"]);
+export const REQUEST_TERMINAL_STATES = new Set(["completed", "failed", "interrupted", "rejected", "cancelled", "removed", "superseded"]);
 const STATES = new Set(["received", "dispatching", "queued", "accepted", "running", "unknown", ...REQUEST_TERMINAL_STATES]);
 const ID_PATTERN = /^[a-zA-Z0-9_-]{8,128}$/;
 const MAX_RECENT_REQUESTS = 200;

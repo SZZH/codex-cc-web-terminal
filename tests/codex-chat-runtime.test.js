@@ -5366,3 +5366,61 @@ test("phone guidance promotes a desktop queue receipt without enabling web-owned
     assert.equal(elements(harness.root, (node) => node.props?.["aria-label"] === "引导排队消息：guide from phone").length, 0);
   } finally { pending.resolve({ request: original }); harness.close(); }
 });
+
+test("a completed latest turn and settled older receipt keep Stop hidden across refreshes", async () => {
+  const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
+    if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopInterrupt: true, desktopQueuedSteer: true } } };
+    if (url.includes("/turns?")) return { turns: [{ id: "latest", status: "completed", items: [] }] };
+    if (url.endsWith("/requests")) return { requests: [
+      { id: "old-request", state: "superseded", executionRoute: "settingsQueue", turnId: "unloaded-old", supersededByTurnId: "latest", input: { text: "old input" } },
+      { id: "next-request", state: "received", mode: "queue", input: { text: "queued input" } }
+    ] };
+  } });
+  try {
+    for (let index = 0; index < 2; index++) {
+      await harness.runtime.refreshLatest(); await harness.runtime.pollRequests(); await flush();
+      assert.equal(harness.chat.props.runningTask, false);
+      assert.equal(harness.chat.props.canInterrupt, false);
+      assert.equal(harness.store.state.turns["unloaded-old"], undefined);
+      assert.match(nodeText(harness.root), /当前没有正在执行的回复/);
+      assert.doesNotMatch(nodeText(harness.root), /正在连接当前任务/);
+    }
+    assert.equal(harness.calls.some((call) => call.method === "POST"), false);
+  } finally { harness.close(); }
+});
+
+test("connected WebSocket with unchanged receipts still reconciles a missed completion over HTTP", async () => {
+  let status = "inProgress";
+  const { runtime, store, calls, sockets } = fixture((url) => url.includes("/turns?")
+    ? { turns: [{ id: "active", status, items: [] }] } : reads(url));
+  try {
+    await runtime.open(); sockets[0].onopen(); await flush();
+    await runtime.pollRequests();
+    assert.equal(store.state.connection, "connected");
+    status = "completed";
+    const before = calls.filter((call) => call.url.includes("/turns?")).length;
+    await runtime.pollRequests();
+    assert.equal(store.state.turns.active.status, "completed");
+    assert.equal(calls.filter((call) => call.url.includes("/turns?")).length, before + 1);
+    assert.equal(calls.some((call) => call.method === "POST"), false);
+  } finally { runtime.dispose(); }
+});
+
+test("queued desktop guidance capability recovers independently of an available Stop capability", async () => {
+  const clock = runtimeClock(); let available = false, metadataReads = 0;
+  const harness = await mountThreadView({ runtime: { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer }, request: (url) => {
+    if (url.endsWith("/threads/thread")) { metadataReads++; return { thread: { id: "thread", capabilities: { desktopInterrupt: true, desktopQueuedSteer: available } } }; }
+    if (url.includes("/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [] }] };
+    if (url.endsWith("/requests")) return { requests: [{ id: "queued-request", state: "queued", mode: "queue", executionRoute: "desktopQueue", input: { text: "queued input" } }] };
+  } });
+  const guide = () => elements(harness.root, (node) => node.props?.["aria-label"] === "引导排队消息：queued input")[0];
+  try {
+    assert.equal(harness.chat.props.canInterrupt, true);
+    assert.equal(guide().props.disabled, true);
+    const before = metadataReads; available = true;
+    await clock.advance(30000);
+    assert.ok(metadataReads > before);
+    assert.equal(guide().props.disabled, false);
+    assert.equal(harness.calls.some((call) => call.method === "POST"), false);
+  } finally { harness.close(); }
+});

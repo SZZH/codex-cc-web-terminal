@@ -3,6 +3,7 @@ import { CodexRequestStore, REQUEST_TERMINAL_STATES } from "./requestStore.js";
 import { CodexSettingsDispatcher, hasSubmissionSettings } from "./settingsDispatcher.js";
 import { CodexTurnController } from "./turnController.js";
 import { DesktopQueuePromotion } from "./desktopQueuePromotion.js";
+import { CodexSupersededRequests } from "./supersededRequests.js";
 import { CodexQueuedWriter } from "./queuedWriter.js";
 import { DesktopQueueSync } from "./desktopQueueSync.js";
 import { CodexDesktopClient } from "./desktopClient.js";
@@ -33,6 +34,7 @@ export class CodexThreadService {
     this.requests = requests || new CodexRequestStore({ dataDir: config.dataDir });
     this.queuedWriter = new CodexQueuedWriter({ bridge });
     this.queuePromotion = new DesktopQueuePromotion(this);
+    this.supersededRequests = new CodexSupersededRequests();
     this.desktopQueueObserver = new DesktopQueueObserver({ reader: this.reader, publish: (threadId, type, payload) => this.publish(threadId, type, payload) });
     this.epoch = randomUUID();
     this.streams = new Map();
@@ -499,14 +501,17 @@ export class CodexThreadService {
       const turn = params.turn || { id: turnId, status: method === "turn/started" ? "inProgress" : "completed" };
       const known = this.requests.list(threadId).filter((request) => request.turnId === turn.id);
       const matched = known.length ? known : active?.turnId === turn.id ? [this.requests.get(threadId, active.requestId)] : [];
+      const wasSuperseded = known.some((request) => request.state === "superseded");
+      if (wasSuperseded && !terminal(turn.status)) return;
       if (terminal(turn.status)) {
         this.terminalTurns.set(`${threadId}:${turn.id}`, { id: turn.id, status: turn.status, error: turn.error,
           startedAt: turn.startedAt, completedAt: turn.completedAt, statusSource: "notification" });
         while (this.terminalTurns.size > 128) this.terminalTurns.delete(this.terminalTurns.keys().next().value);
       }
       for (const request of matched) if (request) this.updateRequest(threadId, request.id, { turnId: turn.id, state: terminal(turn.status) ? turnState(turn.status) : "running", error: turn.error || null });
-      const confirmedStatus = known.find((request) => REQUEST_TERMINAL_STATES.has(request.state))?.state || turn.status;
-      this.publish(threadId, "turn.upsert", { turn: this.presentTurn({ ...turn, status: confirmedStatus }, "", threadId) });
+      const confirmedStatus = terminal(turn.status) ? turn.status
+        : known.find((request) => REQUEST_TERMINAL_STATES.has(request.state))?.state || turn.status;
+      this.publish(threadId, wasSuperseded ? "turn.metadata" : "turn.upsert", { turn: this.presentTurn({ ...turn, status: confirmedStatus }, "", threadId) });
       if (terminal(turn.status)) for (const request of matched) if (request) this.finish(threadId, request.id);
       return;
     }
@@ -562,7 +567,13 @@ export class CodexThreadService {
       stream.signature = signature;
       this.reconcileRequests(threadId, page.turns || [], pending);
       await this.desktopQueueObserver.observe(threadId, page.turns || [], desktopPending,
-        () => !this.closed && this.streams.get(threadId) === stream && stream.subscribers.size > 0);
+        () => !this.closed && this.streams.get(threadId) === stream && stream.subscribers.size > 0,
+        (request, turn) => {
+          const current = this.requests.get(threadId, request.id);
+          return current && current.state !== "superseded" && !current.supersededByTurnId &&
+            (!current.turnId || current.turnId === turn.id) &&
+            (!REQUEST_TERMINAL_STATES.has(current.state) || terminal(turn.status));
+        });
       if (this.closed || this.streams.get(threadId) !== stream || !stream.subscribers.size) return;
       if (stream.lastError) {
         stream.lastError = "";
@@ -587,6 +598,17 @@ export class CodexThreadService {
     }
     requests = [...matched.values()];
     turns = turns.map((turn) => matchesDesktopQueueTurn(turn, requests) ? observedDesktopQueueTurn(turn) : turn);
+    const settled = new Map();
+    for (const evidence of this.supersededRequests.observe(threadId, turns, requests)) {
+      // Polling may have captured receipts before a real completion arrived.
+      const current = this.requests.get(threadId, evidence.requestId);
+      if (!["accepted", "running", "unknown"].includes(current?.state) || current.turnId !== evidence.turnId) continue;
+      settled.set(evidence.requestId, this.updateRequest(threadId, evidence.requestId,
+        { state: "superseded", supersededByTurnId: evidence.supersededByTurnId,
+          error: { code: "turn_superseded", message: "后续回复已开始，这条旧回复已退出执行。未收到最终结果，不会重复发送。" } }));
+      this.finish(threadId, evidence.requestId);
+    }
+    requests = requests.map((request) => settled.get(request.id) || request);
     for (const turn of turns) {
       const key = `${threadId}:${turn.id}`, cached = this.terminalTurns.get(key);
       if (cached?.statusSource === "notification") continue;
@@ -595,10 +617,12 @@ export class CodexThreadService {
       else if (cached && observedDesktopQueueTurn(cached).status === "unknown") this.terminalTurns.delete(key);
     }
     while (this.terminalTurns.size > 128) this.terminalTurns.delete(this.terminalTurns.keys().next().value);
-    const pending = requests.filter((request) => request.state === "removed" || !REQUEST_TERMINAL_STATES.has(request.state));
+    const pending = requests.filter((request) => ["removed", "superseded"].includes(request.state) || !REQUEST_TERMINAL_STATES.has(request.state));
     for (const request of pending) {
       const turn = turns.find((entry) => entry.id === request.turnId || entry.items?.some((item) => item.type === "userMessage" && item.clientId === request.id));
       if (!turn) continue;
+      if (request.state === "superseded" && (!terminal(turn.status) || turn.statusConfirmed === false ||
+        ["interrupted", "aborted"].includes(turn.status) && !turn.completedAt)) continue;
       const user = turn.items?.find((item) => item.type === "userMessage" && item.clientId === request.id);
       if (turn.status === "unknown") {
         if (["desktopQueue", "desktopSteer"].includes(request.executionRoute) && (user || request.turnId === turn.id)) {

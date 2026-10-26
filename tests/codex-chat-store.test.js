@@ -90,6 +90,29 @@ function memoryStorage() {
   return { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) };
 }
 
+test("a superseded receipt outside lazy history never revives controls after refresh", () => {
+  const storage = memoryStorage();
+  let store = createCodexChatStore("thread", { storage });
+  store.upsertTurn({ id: "latest", status: "completed" });
+  store.upsertRequest({ id: "old-request", state: "running", executionRoute: "settingsQueue", turnId: "unloaded-old",
+    input: { text: "old input", attachments: [] } });
+  assert.equal(activeCodexTurnId(store.state), "unloaded-old", "reproduce the legacy stale receipt");
+  store.upsertRequest({ id: "old-request", state: "superseded", supersededByTurnId: "latest" });
+  assert.equal(activeCodexTurnId(store.state), "");
+  assert.deepEqual(presentCodexQueue(store.state), []);
+  assert.equal(presentCodexChatSnapshot(store.state).turns.length, 1, "do not append old input outside the history window");
+  store.upsertTurn({ id: "unloaded-old", status: "unknown", items: [{ id: "last-reply", type: "agentMessage", text: "latest visible reply" }] });
+  store.state.turns["unloaded-old"].itemsLatestLoaded = true;
+  assert.deepEqual(presentCodexChatSnapshot(store.state).turns.find((turn) => turn.id === "unloaded-old").items.map((item) => item.id),
+    ["last-reply"], "a settled old input must also stay outside an already loaded item window");
+  store = createCodexChatStore("thread", { storage });
+  store.upsertTurn({ id: "latest", status: "completed" });
+  store.upsertRequest({ id: "old-request", state: "running", turnId: "unloaded-old" });
+  assert.equal(activeCodexTurnId(store.state), "", "late stale reads cannot undo settled execution");
+  store.upsertRequest({ id: "new-request", state: "accepted", turnId: "not-yet-loaded" });
+  assert.equal(activeCodexTurnId(store.state), "not-yet-loaded", "a truly new acceptance can precede its turn event");
+});
+
 test("server confirmation supersedes a locally timed request without comparing client and server clocks", () => {
   for (const localTime of ["2026-01-01T00:00:00Z", "2028-01-01T00:00:00Z"]) {
     const storage = memoryStorage();
