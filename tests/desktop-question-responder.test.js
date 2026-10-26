@@ -121,6 +121,44 @@ test("truncated answer previews are checked against complete native history", as
   assert.equal(f.sends.length, 0);
 });
 
+test("accepted desktop steering input and legacy single-object replies prevent duplicate answers", async (t) => {
+  const reply = { questionItemId: '["request_user_input_async","call_question",0]', question: "你今天更想喝什么？", answer: "水" };
+  for (const value of [reply, [reply], { ...reply, answer: "" }]) {
+    const text = `<send_user_message_question_reply>\n${JSON.stringify(value)}\n</send_user_message_question_reply>`;
+    for (const item of [
+      { type: "userMessage", content: [{ type: "text", text }] },
+      { type: "steeringUserMessage", status: "accepted", text: "", presentation: { text: "" }, input: [{ type: "text", text }] }
+    ]) {
+      const f = fixture(t, { reader: { listItems: async () => ({ items: [item], hasMore: false }) } });
+      await assert.rejects(f.respond(), { code: "question_already_answered" });
+      assert.equal(f.sends.length + f.starts.length, 0);
+    }
+  }
+});
+
+test("unaccepted steering replies and failed user items never close a question", async (t) => {
+  const text = '<send_user_message_question_reply>{"questionItemId":"[\\"request_user_input_async\\",\\"call_question\\",0]","question":"Choose","answer":"水"}</send_user_message_question_reply>';
+  const items = [undefined, "pending", "sending", "rejected", "failed", "cancelled"].map((status) => ({
+    type: "steeringUserMessage", status, text, input: [{ type: "text", text }]
+  })).concat(["failed", "rejected", "cancelled"].map((status) => ({ type: "userMessage", status, text })));
+  const f = fixture(t, { reader: { listItems: async () => ({ items, hasMore: false }) } });
+  await f.respond(); await tick();
+  assert.equal(f.sends.length, 1);
+});
+
+test("truncated accepted steering replies recover their original input before duplicate checks", async (t) => {
+  const text = `<send_user_message_question_reply>\n${JSON.stringify({ questionItemId: '["request_user_input_async","call_question",0]',
+    question: "你今天更想喝什么？", answer: '"'.repeat(9_000) })}\n</send_user_message_question_reply>`;
+  const raw = { id: "old-steering-answer", type: "steeringUserMessage", status: "accepted", input: [{ type: "text", text }] };
+  const preview = presentCodexItem(raw, { compact: true });
+  assert.equal(preview.truncated, true);
+  const f = fixture(t, { reader: { listItems: async () => ({ items: [preview], hasMore: false }) } });
+  const read = f.reader.rawItem;
+  f.reader.rawItem = async (threadId, turnId, itemId, options) => itemId === raw.id ? { item: raw } : read(threadId, turnId, itemId, options);
+  await assert.rejects(f.respond(), { code: "question_already_answered" });
+  assert.equal(f.sends.length, 0);
+});
+
 test("an accepted desktop question does not block subsequent ordinary messages from entering desktop queue", async (t) => {
   const f = fixture(t);
   f.reader.getThread = async (id) => ({ id, status: { type: "active" } });

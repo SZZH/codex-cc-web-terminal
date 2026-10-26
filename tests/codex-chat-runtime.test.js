@@ -4807,14 +4807,10 @@ test("floating native reminders distinguish a pending response and do not revive
   } finally { harness.close(); }
 });
 
-for (const initialCapability of [false, undefined]) test(`an idle unanswered question recovers ${initialCapability === false ? "false" : "missing"} capability through bounded metadata-only polling`, async () => {
+for (const initialCapability of [false, undefined]) test(`ended questions do not keep ${initialCapability === false ? "unavailable" : "missing"} capability polling alive`, async () => {
   const clock = runtimeClock(), question = desktopQuestionItem();
-  let available = initialCapability, metadataReads = 0;
   const { runtime, store, calls } = fixture((url) => {
-    if (url.endsWith("/threads/thread")) {
-      metadataReads += 1;
-      return { thread: { id: "thread", ...(available === undefined ? {} : { capabilities: { desktopQuestionAnswers: available } }) } };
-    }
+    if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: initialCapability } } };
     if (url.includes("/turns?")) return { turns: [{ id: "ended", status: "completed", items: [question], hasMoreItems: false }] };
     if (url.includes("/items?")) return { items: [question], hasMore: false };
     return reads(url);
@@ -4822,54 +4818,46 @@ for (const initialCapability of [false, undefined]) test(`an idle unanswered que
   try {
     store.setDraft({ text: "untouched draft" });
     await runtime.open(); await flush();
-    assert.equal(metadataReads, 1);
-    const historyReads = calls.filter((call) => /\/turns\?|\/items\?/.test(call.url)).length;
-    const requestReads = calls.filter((call) => call.url.endsWith("/requests")).length;
-    available = true;
-    await clock.advance(9999);
-    assert.equal(metadataReads, 1);
-    assert.notEqual(store.state.thread.capabilities?.desktopQuestionAnswers, true);
-    await clock.advance(1);
-    assert.equal(metadataReads, 2);
-    assert.equal(store.state.thread.capabilities.desktopQuestionAnswers, true);
-    assert.equal(calls.filter((call) => /\/turns\?|\/items\?/.test(call.url)).length, historyReads);
-    assert.equal(calls.filter((call) => call.url.endsWith("/requests")).length, requestReads);
-    assert.equal(store.state.draft.text, "untouched draft");
-    assert.equal(clock.pendingReads, 0);
+    const count = calls.length;
     await clock.advance(60000);
-    assert.equal(metadataReads, 2);
+    assert.equal(calls.length, count);
+    assert.equal(clock.pendingReads, 0);
+    assert.equal(store.state.draft.text, "untouched draft");
+    assert.equal(presentCodexChatSnapshot(store.state).turns[0].items[0].question.active, false);
     assert.equal(calls.some((call) => call.method === "POST"), false);
   } finally { runtime.dispose(); }
 });
 
-test("capability probe failures keep their error and retry without reloading question history", async () => {
+test("active question capability failures retry while lifecycle reads continue", async () => {
   const clock = runtimeClock(), question = desktopQuestionItem();
-  let metadataReads = 0;
+  let metadataReads = 0, failAt = Infinity;
   const { runtime, store, calls } = fixture((url) => {
     if (url.endsWith("/threads/thread")) {
       metadataReads += 1;
-      if (metadataReads === 2) throw new Error("desktop metadata unavailable");
-      return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: metadataReads > 2 } } };
+      if (metadataReads === failAt) throw new Error("desktop metadata unavailable");
+      return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: metadataReads > failAt, desktopInterrupt: true } } };
     }
-    if (url.includes("/turns?")) return { turns: [{ id: "ended", status: "completed", items: [question], hasMoreItems: false }] };
+    if (url.includes("/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [question], hasMoreItems: false }] };
     if (url.includes("/items?")) return { items: [question], hasMore: false };
     return reads(url);
-  }, { runtime: { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
+  }, { runtime: { pollMs: 10000, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   try {
-    await runtime.open(); await flush();
+    await runtime.open(); await runtime.pollRequests(); await flush();
+    failAt = metadataReads + 1;
     const historyReads = calls.filter((call) => /\/turns\?|\/items\?/.test(call.url)).length;
     await clock.advance(10000);
-    assert.equal(metadataReads, 2);
+    assert.equal(metadataReads, failAt);
     assert.equal(store.state.thread.capabilities.desktopQuestionAnswers, false);
     assert.equal(store.state.historyReadError, "desktop metadata unavailable");
     await clock.advance(9999);
-    assert.equal(metadataReads, 2);
+    assert.equal(metadataReads, failAt);
     await clock.advance(1);
-    assert.equal(metadataReads, 3);
+    assert.equal(metadataReads, failAt + 1);
     assert.equal(store.state.thread.capabilities.desktopQuestionAnswers, true);
     assert.equal(store.state.historyReadError, "");
-    assert.equal(calls.filter((call) => /\/turns\?|\/items\?/.test(call.url)).length, historyReads);
-    assert.equal(clock.pendingReads, 0);
+    assert.ok(calls.filter((call) => /\/turns\?|\/items\?/.test(call.url)).length > historyReads, "active lifecycle continues to synchronize");
+    await clock.advance(30000);
+    assert.equal(metadataReads, failAt + 1, "a recovered capability stops metadata probes");
   } finally { runtime.dispose(); }
 });
 
@@ -4879,10 +4867,10 @@ test("returning to the foreground immediately rechecks an unavailable question c
   let available = false, metadataReads = 0;
   const { runtime, store } = fixture((url) => {
     if (url.endsWith("/threads/thread")) { metadataReads += 1; return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: available } } }; }
-    if (url.includes("/turns?")) return { turns: [{ id: "ended", status: "completed", items: [question], hasMoreItems: false }] };
+    if (url.includes("/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [question], hasMoreItems: false }] };
     if (url.includes("/items?")) return { items: [question], hasMore: false };
     return reads(url);
-  }, { runtime: { visibility, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
+  }, { runtime: { visibility, pollMs: 10000, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   try {
     await runtime.open(); await runtime.pollRequests(); await flush();
     const before = metadataReads;
@@ -4903,10 +4891,10 @@ test("hidden question capability probes retain the thirty-second floor and ignor
       metadataReads += 1;
       return metadataReads > 1 ? pending.promise : { thread: { id: "thread", capabilities: { desktopQuestionAnswers: false } } };
     }
-    if (url.includes("/turns?")) return { turns: [{ id: "ended", status: "completed", items: [question], hasMoreItems: false }] };
+    if (url.includes("/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [question], hasMoreItems: false }] };
     if (url.includes("/items?")) return { items: [question], hasMore: false };
     return reads(url);
-  }, { runtime: { visibility: { hidden: true }, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
+  }, { runtime: { visibility: { hidden: true }, pollMs: 10000, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   await runtime.open(); sockets[0].onopen(); await flush();
   await clock.advance(29999);
   assert.equal(metadataReads, 1);
@@ -5022,7 +5010,7 @@ test("failed desktop question answers stay on the question path and cannot be re
   } finally { harness.close(); }
 });
 
-test("an unanswered desktop question remains actionable after its original turn completes", async () => {
+test("an ended desktop question stays in history but no longer accepts a stale answer action", async () => {
   const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url, options) => {
     if (url === "/api/v2/codex/threads/thread") return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: true } } };
     if (url.includes("/turns?")) return { turns: [{ id: "ended", status: "completed", items: [desktopQuestionItem()] }] };
@@ -5031,12 +5019,11 @@ test("an unanswered desktop question remains actionable after its original turn 
   try {
     const probe = questionProbe(harness);
     assert.equal(probe.props.item.question.status, "pending");
-    assert.equal(probe.props.canAnswerQuestions, true);
+    assert.equal(probe.props.item.question.active, false);
+    assert.equal(harness.chat.props.attentionExpanded, false);
     probe.props.onAnswer({ question: probe.props.item.question, index: 0, answer: "Keep going" }); await flush();
     const posts = harness.calls.filter((call) => call.method === "POST");
-    assert.equal(posts.length, 1);
-    assert.ok(posts[0].url.endsWith("/questions/call_mobile_question/respond"));
-    assert.equal(JSON.parse(posts[0].body).expectedTurnId, "ended");
+    assert.equal(posts.length, 0);
     assert.equal(harness.chat.props.canInterrupt, false);
   } finally { harness.close(); }
 });
@@ -5425,5 +5412,67 @@ test("queued desktop guidance capability recovers independently of an available 
     assert.ok(metadataReads > before);
     assert.equal(guide().props.disabled, false);
     assert.equal(harness.calls.some((call) => call.method === "POST"), false);
+  } finally { harness.close(); }
+});
+
+for (const source of ["socket", "http", "next-turn"]) test(`desktop question closes and restores chat input after ${source} lifecycle reconciliation`, async () => {
+  let status = "inProgress", latestId = "active";
+  const question = desktopQuestionItem();
+  const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
+    if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: true } } };
+    if (url.includes("/turns?")) return { turns: [{ id: latestId, status, items: latestId === "active" ? [question] : [] }], hasMore: false };
+    if (url.includes("/items?")) return { items: latestId === "active" ? [question] : [], hasMore: false };
+  } });
+  const dock = () => elements(harness.root, (node) => node.props?.["aria-label"] === "Codex 悬浮提问")[0];
+  try {
+    harness.chat.emit("update:draft", "keep ordinary draft"); await flush();
+    assert.ok(dock());
+    assert.equal(harness.chat.props.attentionExpanded, true);
+    const stale = { question: questionProbe(harness).props.item.question, index: 0, answer: "stale answer" };
+    harness.store.upsertRequest({ id: "uncertain-answer", state: "unknown", input: { text: buildQuestionAnswer(question.presentation.question, 0, "Earlier reply") } });
+    status = "completed";
+    if (source === "socket") {
+      const socket = harness.sockets[0];
+      harness.store.state.epoch = "question-test";
+      socket.onmessage({ data: JSON.stringify({ schemaVersion: 2, threadId: "thread", epoch: "question-test", seq: 1,
+        type: "turn.upsert", payload: { turn: { id: "active", status } } }) });
+    } else {
+      if (source === "next-turn") { latestId = "next"; status = "inProgress"; }
+      harness.store.state.connection = "connected";
+      await harness.runtime.pollRequests();
+    }
+    await flush();
+    assert.equal(dock(), undefined);
+    assert.equal(harness.chat.props.attentionExpanded, false);
+    assert.equal(harness.chat.props.draft, "keep ordinary draft");
+    assert.equal(harness.store.state.requests["uncertain-answer"].state, "unknown", "closing attention cannot manufacture delivery evidence");
+    const historical = questionProbe(harness).props.item.question;
+    assert.equal(historical.active, false);
+    assert.equal(historical.status, "pending");
+    assert.deepEqual(historical.answers, {});
+    harness.chat.emit("question-answer", stale); await flush();
+    assert.equal(harness.calls.some((call) => call.method === "POST"), false);
+    harness.store.upsertItem("active", question); await flush();
+    assert.equal(dock(), undefined, "a late question item cannot reopen a finished reminder");
+  } finally { harness.close(); }
+});
+
+for (const code of ["turn_completed", "thread_closed"]) test(`native question ${code} closes attention but connection loss remains visible`, async () => {
+  const row = { id: "native-question", threadId: "thread", turnId: "turn", itemId: "item", method: "item/tool/requestUserInput",
+    status: "pending", version: 1, params: { questions: [{ id: "one", question: "Continue?" }] } };
+  const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
+    if (url.endsWith("/interactions")) return { interactions: [row], epoch: "registry", revision: 1 };
+  } });
+  const dock = () => elements(harness.root, (node) => node.props?.["aria-label"] === "Codex 悬浮提问")[0];
+  try {
+    assert.ok(dock());
+    harness.store.interactions.applyUpdate({ interaction: { ...row, status: "unavailable", error: { code }, version: 2 }, epoch: "registry", revision: 2 });
+    await flush();
+    assert.equal(dock(), undefined);
+    assert.equal(harness.chat.props.attentionExpanded, false);
+    assert.equal(harness.store.state.interactionState.interactions[row.id].status, "unavailable");
+    harness.store.interactions.applySnapshot({ interactions: [{ ...row, id: "disconnected", status: "unavailable", error: { code: "disconnected" } }], epoch: "registry", revision: 3 });
+    await flush();
+    assert.ok(dock(), "loss of a connection is not proof the question was answered or ended");
   } finally { harness.close(); }
 });

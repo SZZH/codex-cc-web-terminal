@@ -1,9 +1,9 @@
 import { isRenderableImageUrl, normalizeImageUrl } from "./image-url.js";
 import { hasCodexRequestExecution, isCodexRequestDismissedMissing } from "./codex-chat-store.js";
-import { createQuestionHistory, parseQuestionReplies, questionReplyText } from "./codex-question-history.js";
+import { createQuestionHistory, parseQuestionReplies, questionReplyText, questionUserText } from "./codex-question-history.js";
 import { createCodexSubagentActivityProjector } from "./codex-subagent-activity.js";
 
-const KINDS = { userMessage: "UserMessage", agentMessage: "AgentMessage", reasoning: "Reasoning",
+const KINDS = { userMessage: "UserMessage", steeringUserMessage: "UserMessage", agentMessage: "AgentMessage", reasoning: "Reasoning",
   commandExecution: "CommandExecution", fileChange: "FileChange", mcpToolCall: "McpToolCall",
   dynamicToolCall: "DynamicToolCall", collabAgentToolCall: "CollabAgentToolCall", subAgentActivity: "SubAgentActivity", webSearch: "WebSearch",
   imageView: "ImageView", imageGeneration: "ImageGeneration", plan: "Plan" };
@@ -85,7 +85,7 @@ export function presentCodexChatItem(item, activity = item.presentation?.activit
   const presentation = item.presentation || {};
   const status = item.status ? displayStatus(item.status) : "";
   const content = Array.isArray(item.content) ? item.content : [];
-  const rawText = item.type === "reasoning"
+  const rawText = ["userMessage", "steeringUserMessage"].includes(item.type) ? questionUserText(item) : item.type === "reasoning"
     ? presentation.text || item.text || [reasoningText(item.summary), reasoningText(item.content)].filter(Boolean).join("\n")
     : presentation.text ?? item.text ?? content.filter((part) => ["text", "inputText", "input_text"].includes(part.type)).map((part) => part.text || "").join("\n\n");
   const text = ["userMessage", "steeringUserMessage"].includes(item.type) ? questionReplyText(rawText) : rawText;
@@ -117,7 +117,7 @@ export function presentCodexChatSnapshot(state, presentItem = presentCodexChatIt
     return { ...turn, status: displayStatus(turn.status), items: visibleIds.map((id) => {
         const source = turn.items[id];
         const item = presentItem(source, projectActivity(source));
-        return item?.question ? { ...item, question: questionHistory(item.question, turn.status) } : item;
+        return item?.question ? { ...item, question: questionHistory(item.question, turn.status, turn.id) } : item;
       }).filter(Boolean) };
   });
   const knownItems = new Map(turns.flatMap((turn) => turn.items.map((item) => [item.id, item])));

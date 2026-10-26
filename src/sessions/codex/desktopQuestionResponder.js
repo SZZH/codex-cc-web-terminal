@@ -17,11 +17,20 @@ function validate(callId, body) {
 }
 
 function hasAnswer(item, questionId) {
-  if (!["userMessage", "steeringUserMessage"].includes(item.type)) return false;
-  const text = item.presentation?.text ?? item.text ?? (item.content || []).filter((part) => ["text", "inputText", "input_text"].includes(part.type)).map((part) => part.text || "").join("\n\n");
+  if (!["userMessage", "steeringUserMessage"].includes(item.type) ||
+    item.type === "steeringUserMessage" && item.status !== "accepted" ||
+    ["failed", "rejected", "cancelled"].includes(item.status)) return false;
+  const parts = item.type === "steeringUserMessage" && Array.isArray(item.input) ? item.input : null;
+  const contentText = (content) => (Array.isArray(content) ? content : [])
+    .filter((part) => ["text", "inputText", "input_text"].includes(part?.type)).map((part) => part.text || "").join("\n\n");
+  const text = parts ? contentText(parts) : item.presentation?.text ?? item.text ?? contentText(item.content);
   const match = /^\s*<send_user_message_question_reply>\s*([\s\S]+?)\s*<\/send_user_message_question_reply>\s*$/.exec(text);
   if (!match) return false;
-  try { return JSON.parse(match[1]).some((entry) => entry.questionItemId === questionId && typeof entry.answer === "string"); }
+  try {
+    const parsed = JSON.parse(match[1]);
+    return (Array.isArray(parsed) ? parsed : [parsed])
+      .some((entry) => entry?.questionItemId === questionId && typeof entry.answer === "string");
+  }
   catch { return false; }
 }
 

@@ -11,8 +11,9 @@ export function parseQuestionReplies(value) {
   const text = value.trim();
   if (!text.startsWith(OPEN) || !text.endsWith(CLOSE)) return null;
   try {
-    const rows = JSON.parse(text.slice(OPEN.length, -CLOSE.length).trim());
-    if (!Array.isArray(rows) || !rows.length || rows.length > 32) return null;
+    const parsed = JSON.parse(text.slice(OPEN.length, -CLOSE.length).trim());
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    if (!rows.length || rows.length > 32) return null;
     return rows.map((row) => {
       if (!row || typeof row !== "object" || Array.isArray(row) ||
         Object.keys(row).some((name) => !["questionItemId", "question", "answer"].includes(name)) ||
@@ -41,25 +42,31 @@ export function questionReplyText(text) {
   return replies ? replies.map((reply) => reply.answer ? `回答：${reply.answer}` : "已跳过问题").join("\n\n") : text;
 }
 
-function userText(item) {
+export function questionUserText(item) {
+  // Desktop steering stores the original input separately from its projection.
+  const inputText = item.type === "steeringUserMessage" && Array.isArray(item.input) ? item.input
+    .filter((part) => ["text", "inputText", "input_text"].includes(part.type)).map((part) => part.text || "").join("\n\n") : "";
+  if (parseQuestionReplies(inputText)) return inputText;
+  // Ordinary input still uses the server's cleaned host-context projection.
   if (typeof item.presentation?.text === "string") return item.presentation.text;
   if (typeof item.text === "string") return item.text;
   return Array.isArray(item.content) ? item.content.filter((part) => ["text", "inputText", "input_text"].includes(part.type))
-    .map((part) => part.text || "").join("\n\n") : "";
+    .map((part) => part.text || "").join("\n\n") : inputText;
 }
 
 export function createQuestionHistory(state) {
   const answered = new Map(), pending = new Map();
   for (const turn of Object.values(state.turns)) for (const item of Object.values(turn.items)) {
     if (!["userMessage", "steeringUserMessage"].includes(item.type) || ["failed", "rejected", "cancelled"].includes(item.status)) continue;
-    for (const reply of parseQuestionReplies(userText(item)) || []) answered.set(key(reply.callId, reply.index), reply.answer);
+    if (item.type === "steeringUserMessage" && item.status !== "accepted") continue;
+    for (const reply of parseQuestionReplies(questionUserText(item)) || []) answered.set(key(reply.callId, reply.index), reply.answer);
   }
   for (const id of state.requestOrder) {
     const receipt = state.requests[id];
     if (!pendingStates.has(receipt?.state) || isCodexRequestDismissedMissing(receipt)) continue;
     for (const reply of parseQuestionReplies(receipt.input?.text) || []) pending.set(key(reply.callId, reply.index), receipt.state);
   }
-  return (question, turnStatus) => {
+  return (question, turnStatus, turnId) => {
     if (!question) return undefined;
     const answers = {}, pendingResponses = {};
     for (const entry of question.questions) {
@@ -69,7 +76,10 @@ export function createQuestionHistory(state) {
     }
     const remaining = question.questions.filter((entry) => !Object.hasOwn(answers, entry.id));
     const pendingResponse = remaining.length > 0 && remaining.every((entry) => Object.hasOwn(pendingResponses, entry.id));
-    return { ...question, answers, pendingResponses, pendingResponse,
+    // Attention belongs to the current running turn. Ending attention does not
+    // manufacture an answer or discard an uncertain response receipt.
+    const active = ["inProgress", "running"].includes(turnStatus) && (!turnId || turnId === state.turnOrder.at(-1));
+    return { ...question, active, answers, pendingResponses, pendingResponse,
       responseState: remaining.map((entry) => pendingResponses[entry.id]).find(Boolean) || "",
       status: remaining.length === 0 ? "answered" : "pending" };
   };

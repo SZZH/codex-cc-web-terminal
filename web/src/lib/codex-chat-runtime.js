@@ -9,7 +9,7 @@ import { createCodexItemHydration } from "./codex-item-hydration.js";
 import { createCodexRuntimeErrors } from "./codex-runtime-errors.js";
 import { createCodexInteractionRuntime } from "./codex-interactions/runtime.js";
 import { createCodexConnection } from "./codex-connection.js";
-import { createQuestionHistory } from "./codex-question-history.js";
+import { pendingDesktopQuestions } from "./codex-question-dock.js";
 
 export function createCodexChatRuntime({ store, request, createSocket,
   location = globalThis.location, newId = () => globalThis.crypto?.randomUUID?.() || `request-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -102,14 +102,8 @@ export function createCodexChatRuntime({ store, request, createSocket,
     if (state.thread?.capabilities?.desktopQuestionAnswers === true) return false;
     if (questionRevision !== state.presentationRevision) {
       questionRevision = state.presentationRevision;
-      const present = createQuestionHistory(state);
-      unansweredDesktopQuestion = Object.values(state.turns).some((turn) => Object.values(turn.items).some((item) => {
-        const question = item.presentation?.question;
-        if (question?.source !== "desktop" || question.delivery !== "async" || question.truncated || question.canRespond === false ||
-          !Array.isArray(question.questions) || !question.questions.length) return false;
-        const current = present(question);
-        return current.status === "pending" && !current.pendingResponse;
-      }));
+      unansweredDesktopQuestion = pendingDesktopQuestions(state).some((question) =>
+        !question.truncated && question.canRespond !== false && !question.pendingResponse);
     }
     return unansweredDesktopQuestion;
   }

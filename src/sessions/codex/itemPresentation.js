@@ -3,7 +3,7 @@ import { detectImageType, MAX_IMAGE_BYTES } from "../shared/imageAttachments.js"
 import { presentSubagentActivity } from "./subagentActivity.js";
 import { presentDesktopQuestion } from "./questionPresentation.js";
 
-const MESSAGE_TYPES = new Set(["userMessage", "agentMessage", "plan", "hookPrompt"]);
+const MESSAGE_TYPES = new Set(["userMessage", "steeringUserMessage", "agentMessage", "plan", "hookPrompt"]);
 const IMAGE_TYPES = new Set(["image", "inputimage", "outputimage", "localimage", "imageurl"]);
 const typeKey = (value) => String(value || "").replace(/[_-]/g, "").toLowerCase();
 const array = (value) => Array.isArray(value) ? value : [];
@@ -139,7 +139,8 @@ function unwrapHostRequest(text, images, cwd) {
 function userText(item) {
   if (typeof item === "string") return item;
   const payload = item.payload || {};
-  const content = Array.isArray(item.content) ? item.content : payload.content;
+  const content = item.type === "steeringUserMessage" && Array.isArray(item.input) ? item.input
+    : Array.isArray(item.content) ? item.content : payload.content;
   const textParts = array(content).filter((part) => ["text", "inputtext", "outputtext"].includes(typeKey(part?.type)));
   return textParts.length ? textParts.map((part) => String(part.text || "")).join("\n") : String(item.text ?? item.message ?? payload.text ?? payload.message ?? "");
 }
@@ -154,6 +155,7 @@ function displayFields(item, hasQuestion = false) {
   const shared = ["images", "local_images", "payload.images", "payload.local_images", "presentation.images"];
   const fields = {
     userMessage: ["content", "text", "message", "payload.content", "payload.text", "payload.message"],
+    steeringUserMessage: ["input", "content", "text", "message", "payload.content", "payload.text", "payload.message"],
     agentMessage: hasQuestion ? [] : ["text", "payload.text", "content"], plan: ["text"], hookPrompt: ["fragments"],
     reasoning: ["summary", "content"],
     subAgentActivity: ["kind", "agentThreadId", "agentPath", "agentName", "status", "error"],
@@ -293,7 +295,7 @@ export function presentCodexItem(input, { detail = false, compact = false, cwd =
   const item = boundedCopy(source, { detail, message: MESSAGE_TYPES.has(type), compact, imageReplacements, isDisplayed });
   const payload = item.payload || {};
   let presentation;
-  if (type === "userMessage") presentation = normalizeUserPresentation(item, { cwd });
+  if (["userMessage", "steeringUserMessage"].includes(type)) presentation = normalizeUserPresentation(item, { cwd });
   else {
     let text = String(item.text ?? payload.text ?? "");
     if (type === "reasoning") text = [textContent(item.summary), textContent(item.content)].filter(Boolean).join("\n");

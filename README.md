@@ -181,6 +181,11 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.4.6`
+
+- Synchronized question reminders with the current desktop turn: completed, stopped, and superseded questions leave the floating panel and remain as read-only history, restoring the mobile composer without clearing drafts.
+- Recognized accepted desktop steering answers and single-object reply envelopes, while preserving unconfirmed receipts and connection-loss notices.
+
 ### `v0.4.5`
 
 - Gave mobile questions priority over the ordinary composer while expanded, with a compact header, fewer repeated labels, and a single scroll area. Returning to chat restores the composer and preserves drafts and queued messages.

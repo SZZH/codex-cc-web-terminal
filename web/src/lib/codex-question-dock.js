@@ -2,8 +2,8 @@ import { createQuestionHistory } from "./codex-question-history.js";
 
 export const QUESTION_DOCK = Symbol("codex-question-dock");
 
-// Attention must survive timeline windowing. Reuse the same answer/receipt
-// projection as history; never infer an answer from a finished assistant turn.
+// Attention survives timeline windowing, but ends with its running turn.
+// History retains unanswered questions without keeping the reply panel open.
 export function pendingDesktopQuestions(state) {
   if (!state) return [];
   const history = createQuestionHistory(state), seen = new Set(), questions = [];
@@ -14,8 +14,8 @@ export function pendingDesktopQuestions(state) {
       const source = item.presentation?.question;
       if (source?.source !== "desktop" || source.delivery !== "async" || !source.callId || seen.has(source.callId)) continue;
       seen.add(source.callId);
-      const question = history(source, turn.status);
-      if (question.status === "pending") questions.push({ ...question, turnId, itemId: item.id });
+      const question = history(source, turn.status, turnId);
+      if (question.active && question.status === "pending") questions.push({ ...question, turnId, itemId: item.id });
     }
   }
   return questions;

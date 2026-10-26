@@ -9,10 +9,12 @@ const props = defineProps({ questions: { type: Array, default: () => [] }, canRe
   interactionState: { type: Object, required: true } });
 const emit = defineEmits(["answer", "draft", "respond", "check", "refresh", "expanded"]);
 const expanded = ref(true), toggle = ref(null), dismissed = reactive(new Set()), cards = new Map(), contentId = useId();
+const visibleInteraction = (row) => row && row.status !== "resolved" && !dismissed.has(row.id) &&
+  !(row.status === "unavailable" && ["turn_completed", "thread_closed"].includes(row.error?.code));
 const interactions = computed(() => props.interactionState.order.map((id) => props.interactionState.interactions[id])
-  .filter((row) => row && row.status !== "resolved" && !dismissed.has(row.id)));
+  .filter(visibleInteraction));
 const panelState = computed(() => ({ ...props.interactionState,
-  order: props.interactionState.order.filter((id) => !dismissed.has(id)) }));
+  order: interactions.value.map((row) => row.id) }));
 const needsResponse = (row) => row.status === "pending" && !props.interactionState.actions[row.id];
 const remaining = computed(() => props.questions.flatMap((question) => unansweredQuestionEntries(question)
   .map((entry) => ({ key: `${question.callId}:${entry.id}`, pending: question.pendingResponses?.[entry.id] }))));

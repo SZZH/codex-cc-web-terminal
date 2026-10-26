@@ -175,6 +175,13 @@ test("unknown and closed historical questions remain records without misleading 
   }
 });
 
+test("ended async question keeps its text without answering controls or a waiting label", async (t) => {
+  const ui = await mount(t, { question: dto({ status: "pending", active: false }), canRespond: true });
+  assert.match(text(ui.root), /Choose a path/);
+  assert.doesNotMatch(text(ui.root), /等待回答|已回答|回答暂不可用|提交回答/);
+  assert.equal(ui.elements((node) => ["input", "textarea", "button"].includes(node.type)).length, 0);
+});
+
 test("a known pending question requires an available response capability", async (t) => {
   const ui = await mount(t, { question: dto({ status: "pending" }) });
   assert.match(text(ui.root), /等待回答/);

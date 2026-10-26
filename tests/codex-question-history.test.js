@@ -17,7 +17,7 @@ function fixture(status = "inProgress") {
 }
 
 test("floating questions survive timeline windowing and keep original answer indexes", () => {
-  const { store } = fixture("completed");
+  const { store } = fixture();
   store.state.turns.turn.itemsWindowIds = [];
   assert.equal(presentCodexChatSnapshot(store.state).turns[0].items.length, 0);
   assert.equal(pendingDesktopQuestions(store.state).length, 1);
@@ -81,9 +81,11 @@ test("optimistic and confirmed answers retain the same quoted question without d
   assert.equal(items[0].questionReplies[0].answer, "Published");
 });
 
-test("native async questions remain pending after the source turn completes until an official reply arrives", () => {
+test("completed questions keep their unanswered history but leave the floating reminder", () => {
   const { store, read } = fixture("completed");
   assert.equal(read().status, "pending");
+  assert.equal(read().active, false);
+  assert.deepEqual(pendingDesktopQuestions(store.state), []);
   store.upsertTurn({ id: "later", status: "completed", items: [{ id: "ordinary", type: "userMessage", text: "Published" }] });
   assert.equal(read().status, "pending");
   assert.deepEqual(read().answers, {});
@@ -105,7 +107,7 @@ test("pending answer receipts are shown as queued until official reply evidence 
   assert.equal(read().status, "pending", "queue acknowledgement or request completion is not native answer evidence");
   store.upsertTurn({ id: "replies", items: [
     { id: "official-0", type: "userMessage", text: buildQuestionAnswer(question, 0, "Published") },
-    { id: "official-1", type: "steeringUserMessage", text: buildQuestionAnswer(question, 1, "Details") }
+    { id: "official-1", type: "steeringUserMessage", status: "accepted", text: buildQuestionAnswer(question, 1, "Details") }
   ] });
   assert.equal(read().status, "answered");
   assert.equal(read().pendingResponse, false);
@@ -134,7 +136,51 @@ test("explicitly releasing a missing receipt unlocks the question without erasin
   assert.equal(store.state.requests["missing-answer"].error.code, "receipt_not_found");
   store.upsertRequest({ id: "retried-answer", state: "sending", input: { text: buildQuestionAnswer(question, 0, "Published") } });
   assert.deepEqual(read().pendingResponses, { "0": "sending" });
-  store.upsertItem("turn", { id: "late-answer", type: "steeringUserMessage", text: buildQuestionAnswer(question, 0, "Published") });
+  store.upsertItem("turn", { id: "late-answer", type: "steeringUserMessage", status: "accepted", text: buildQuestionAnswer(question, 0, "Published") });
   assert.deepEqual(read().answers, { "0": "Published" });
   assert.deepEqual(read().pendingResponses, {});
+});
+
+test("only the latest running turn can request attention and late old items cannot reopen it", () => {
+  for (const status of ["completed", "failed", "interrupted", "aborted", "cancelled", "unknown"]) {
+    const { store, read } = fixture();
+    assert.equal(pendingDesktopQuestions(store.state).length, 1);
+    store.upsertTurn({ id: "turn", status });
+    assert.deepEqual(pendingDesktopQuestions(store.state), []);
+    assert.equal(read().active, false);
+    assert.deepEqual(read().answers, {});
+  }
+  const { store, read } = fixture();
+  store.upsertTurn({ id: "next-turn", status: "inProgress", items: [] });
+  assert.deepEqual(pendingDesktopQuestions(store.state), []);
+  store.upsertItem("turn", { id: question.callId, presentation: { question } });
+  assert.deepEqual(pendingDesktopQuestions(store.state), []);
+  assert.equal(read().active, false);
+});
+
+test("accepted desktop steering input and single-object replies settle questions while unaccepted input does not", () => {
+  const { store, read } = fixture();
+  const text = buildQuestionAnswer(question, 0, "Published").replace('\n[{', '\n{').replace('}]\n</', '}\n</');
+  assert.equal(parseQuestionReplies(text)?.length, 1);
+  for (const status of [undefined, "pending", "inProgress", "rejected", "failed", "cancelled"]) {
+    store.upsertItem("turn", { id: `unaccepted-${status}`, type: "steeringUserMessage", status, input: [{ type: "text", text }] });
+    assert.deepEqual(read().answers, {});
+  }
+  // Old projections may have an empty text; the native input remains authoritative.
+  store.upsertItem("turn", { id: "accepted", type: "steeringUserMessage", status: "accepted", presentation: { text: "" },
+    input: [{ type: "text", text }] });
+  assert.deepEqual(read().answers, { "0": "Published" });
+  assert.equal(pendingDesktopQuestions(store.state).length, 1, "the second question is still unanswered");
+  const item = presentCodexChatSnapshot(store.state).turns[0].items.find((item) => item.id === "accepted");
+  assert.equal(item.kind, "UserMessage");
+  assert.equal(item.questionReplies[0].answer, "Published");
+});
+
+test("ordinary steering keeps the server's cleaned text instead of exposing host context", () => {
+  const { store } = fixture();
+  store.upsertItem("turn", presentCodexItem({ id: "ordinary-steering", type: "steeringUserMessage", status: "accepted",
+    input: [{ type: "text", text: '# In app browser (IAB):\n- The user has the in-app browser (IAB) open.\n- Current URL: https://example.test\n## My request for Codex:\n继续执行' }] }));
+  const item = presentCodexChatSnapshot(store.state).turns[0].items.find((item) => item.id === "ordinary-steering");
+  assert.equal(item.text, "继续执行");
+  assert.equal(item.questionReplies, undefined);
 });

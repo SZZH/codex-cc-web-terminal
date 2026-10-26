@@ -121,6 +121,25 @@ test("presentation preserves typed identity, phase and original user input", () 
   assert.equal(agent.id, "a");
 });
 
+test("native steering input remains visible and complete enough for question reply recovery", () => {
+  const reply = { questionItemId: '["request_user_input_async","call_question",0]', question: "Choose", answer: "a".repeat(5_000) };
+  const text = `<send_user_message_question_reply>\n${JSON.stringify(reply)}\n</send_user_message_question_reply>`;
+  const source = { id: "steering-answer", type: "steeringUserMessage", status: "accepted", text: "",
+    presentation: { text: "" }, input: [{ type: "text", text }] };
+  const original = structuredClone(source);
+  const result = presentCodexItem(source);
+  assert.equal(result.presentation.text, text);
+  assert.equal(result.status, "accepted");
+  assert.equal(result.hasDetails, false);
+  assert.deepEqual(source, original);
+
+  const large = { ...source, input: [{ type: "text", text: text.repeat(4) }] };
+  const preview = presentCodexItem(large, { compact: true });
+  assert.equal(preview.hasDetails, true, "clipped steering input must trigger full native item recovery");
+  assert.ok(preview.truncatedFields.includes("input[0].text"));
+  assert.equal(presentCodexItem(large, { detail: true }).presentation.text, text.repeat(4));
+});
+
 test("native subagent presentation preserves official fields and exposes a separate compact lifecycle", () => {
   const source = { type: "subAgentActivity", id: "call-native", kind: "interacted", agentThreadId: "child-id", agentPath: "/root/reviewer" };
   const original = structuredClone(source);

@@ -10,7 +10,7 @@ const emit = defineEmits(["answer"]);
 const prefix = useId(), drafts = reactive({}), custom = reactive({});
 const pending = computed(() => props.question.status === "pending");
 const answered = computed(() => props.question.status === "answered");
-const editable = computed(() => pending.value && props.canRespond && !props.question.truncated && !props.question.pendingResponse);
+const editable = computed(() => pending.value && props.question.active !== false && props.canRespond && !props.question.truncated && !props.question.pendingResponse);
 const responseLabel = (state) => ({ sending: "正在提交回答", received: "正在提交回答", dispatching: "正在提交回答",
   queued: "回答已排队", unknown: "回答待确认", accepted: "等待确认", running: "等待确认", completed: "等待确认" })[state] || "回答待确认";
 const status = computed(() => pending.value && props.question.pendingResponse ? responseLabel(props.question.responseState) : ({ answered: "已回答", pending: "等待回答", queued: "回答已排队",
@@ -33,7 +33,7 @@ function submit(question, index) {
 </script>
 
 <template>
-  <div v-if="answered" class="thread-question-transcript">
+  <div v-if="answered || question.active === false" class="thread-question-transcript">
     <p v-for="entry in question.questions" :key="entry.id">{{ entry.title }}</p>
   </div>
   <section v-else-if="inDock" class="thread-question" aria-label="问题">
