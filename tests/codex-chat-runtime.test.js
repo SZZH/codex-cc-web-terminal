@@ -2115,7 +2115,7 @@ async function mountThreadView(api = {}) {
           canAnswerQuestions: props.canAnswerQuestions, onQuestionAnswer: (payload) => emit('question-answer', payload),
           onProcessToggle: (payload) => emit('process-toggle', payload), onTurnVisibility: (payload) => emit('turn-visibility', payload) }, {
           'turn-footer': slots['turn-footer'], 'item-footer': slots['item-footer'] }),
-        h('composer-top', slots['composer-top']?.())]); } });`);
+        h('attention', slots['attention']?.()), h('composer-top', slots['composer-top']?.())]); } });`);
   const file = new URL("../web/src/components/CodexThreadView.vue", import.meta.url);
   const { descriptor } = parse(fs.readFileSync(file, "utf8"), { filename: file.pathname });
   const compiled = compileScript(descriptor, { id: "codex-thread-runtime-test", inlineTemplate: true }).content;
@@ -4728,6 +4728,81 @@ function desktopQuestionItem(callId = "call_mobile_question", extra = {}) {
     callId, source: "desktop", delivery: "async", questions: [{ id: "0", title: "Choose a direction", options: ["Keep going", "Pause"] }], ...extra
   } } };
 }
+
+test("floating question stays outside scrolling history, preserves a folded draft and answers a windowed item", async () => {
+  const response = deferred();
+  const harness = await mountThreadView({ runtime: { maxPolls: 0, newId: () => "floating-answer" }, request: (url) => {
+    if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: true } } };
+    if (url.includes("/threads/thread/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [desktopQuestionItem()] }] };
+    if (url.endsWith("/questions/call_mobile_question/respond")) return response.promise;
+  } });
+  const dock = () => elements(harness.root, (node) => node.props?.["aria-label"] === "Codex 悬浮提问")[0];
+  try {
+    harness.chat.emit("update:draft", "ordinary draft");
+    harness.store.state.turns.active.itemsWindowIds = []; await flush();
+    assert.ok(dock());
+    assert.equal(dock().parent.type, "attention");
+    assert.match(nodeText(dock()), /1 个问题等你回答/);
+    const radio = elements(dock(), (node) => node.type === "input" && node.props.value === "Keep going")[0];
+    radio.props.onChange(); await flush();
+    const toggle = elements(dock(), (node) => node.props?.["aria-label"] === "收起提问")[0];
+    toggle.props.onClick(); await flush();
+    assert.equal(toggle.props["aria-expanded"], false);
+    assert.match(nodeText(dock()), /点击展开/);
+    toggle.props.onClick(); await flush();
+    assert.equal(radio.props.checked, true, "collapsing preserves the answer draft");
+    const form = elements(dock(), (node) => node.type === "form")[0];
+    form.props.onSubmit({ preventDefault() {} }); form.props.onSubmit({ preventDefault() {} }); await flush();
+    const posts = harness.calls.filter((call) => call.method === "POST" && call.url.endsWith("/respond"));
+    assert.equal(posts.length, 1);
+    assert.deepEqual(JSON.parse(posts[0].body), { clientRequestId: "floating-answer", expectedTurnId: "active", index: 0, answer: "Keep going" });
+    assert.equal(harness.chat.props.draft, "ordinary draft");
+    const receipt = harness.store.state.requests["floating-answer"];
+    response.resolve({ request: { ...receipt, state: "accepted", turnId: "active" } }); await flush();
+    assert.match(nodeText(dock()), /提问状态待核对/);
+    harness.store.upsertItem("active", { id: "official-answer", type: "userMessage", text: receipt.input.text }); await flush();
+    assert.equal(dock(), undefined, "official answers remove the reminder");
+  } finally { response.resolve({ request: {} }); harness.close(); }
+});
+
+test("a new pending question reopens the floating reminder and changing threads clears it", async () => {
+  const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
+    if (url.includes("/threads/thread/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [desktopQuestionItem()] }] };
+  } });
+  const dock = () => elements(harness.root, (node) => node.props?.["aria-label"] === "Codex 悬浮提问")[0];
+  try {
+    elements(dock(), (node) => node.props?.["aria-label"] === "收起提问")[0].props.onClick(); await flush();
+    harness.store.upsertItem("active", desktopQuestionItem("call_second")); await flush();
+    assert.match(nodeText(dock()), /2 个问题等你回答/);
+    assert.equal(elements(dock(), (node) => node.props?.["aria-label"] === "收起提问").length, 1);
+    harness.switchThread("other"); await flush();
+    assert.equal(dock(), undefined);
+  } finally { harness.close(); }
+});
+
+test("floating native reminders distinguish a pending response and do not revive dismissed stale requests", async () => {
+  const row = { id: "native-old", threadId: "thread", turnId: "turn", itemId: "item", method: "item/tool/requestUserInput",
+    status: "pending", version: 1, params: { questions: [{ id: "one", question: "Native question" }] } };
+  const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
+    if (url.endsWith("/interactions")) return { interactions: [row], epoch: "registry", revision: 1 };
+  } });
+  const dock = () => elements(harness.root, (node) => node.props?.["aria-label"] === "Codex 悬浮提问")[0];
+  try {
+    harness.store.state.interactionState.actions[row.id] = { status: "submitting" }; await flush();
+    assert.equal(elements(dock(), (node) => node.type === "strong")[0].text, "提问状态待核对");
+    harness.store.state.interactionState.actions[row.id] = { status: "unknown" }; await flush();
+    assert.equal(elements(dock(), (node) => node.type === "strong")[0].text, "提问状态待核对");
+    harness.store.interactions.applySnapshot({ interactions: [{ ...row, status: "unavailable", version: 2 }], epoch: "registry", revision: 2 });
+    await flush();
+    elements(dock(), (node) => node.props?.["aria-label"] === "关闭失效交互")[0].props.onClick(); await flush();
+    assert.equal(dock(), undefined);
+    harness.store.interactions.applySnapshot({ interactions: [{ ...row, status: "unavailable", version: 2 }, { ...row, id: "native-new" }], epoch: "registry", revision: 3 });
+    await flush();
+    assert.match(nodeText(dock()), /1 个问题等你回答/);
+    assert.equal(elements(dock(), (node) => node.type === "select").length, 0, "only the new interaction is selectable");
+    assert.doesNotMatch(nodeText(dock()), /请求已失效/);
+  } finally { harness.close(); }
+});
 
 for (const initialCapability of [false, undefined]) test(`an idle unanswered question recovers ${initialCapability === false ? "false" : "missing"} capability through bounded metadata-only polling`, async () => {
   const clock = runtimeClock(), question = desktopQuestionItem();

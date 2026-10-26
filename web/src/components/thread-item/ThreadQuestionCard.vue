@@ -1,8 +1,11 @@
 <script setup>
-import { computed, reactive, useId, watch } from "vue";
+import { computed, inject, reactive, useId, watch } from "vue";
 import PixelCompanion from "../PixelCompanion.js";
+import { QUESTION_DOCK } from "../../lib/codex-question-dock.js";
 
-const props = defineProps({ question: { type: Object, required: true }, canRespond: { type: Boolean, default: false } });
+const props = defineProps({ question: { type: Object, required: true }, canRespond: { type: Boolean, default: false }, floating: Boolean });
+const dock = inject(QUESTION_DOCK, null);
+const inDock = computed(() => !props.floating && dock?.has(props.question.callId));
 const emit = defineEmits(["answer"]);
 const prefix = useId(), drafts = reactive({}), custom = reactive({});
 const pending = computed(() => props.question.status === "pending");
@@ -33,9 +36,14 @@ function submit(question, index) {
   <div v-if="answered" class="thread-question-transcript">
     <p v-for="entry in question.questions" :key="entry.id">{{ entry.title }}</p>
   </div>
+  <section v-else-if="inDock" class="thread-question" aria-label="问题">
+    <p v-for="entry in question.questions" :key="entry.id">{{ entry.title }}</p>
+    <button type="button" class="thread-question-submit" @click="dock.open(question.callId)">在悬浮区查看问题</button>
+  </section>
   <section v-else class="thread-question" aria-label="问题">
     <header class="thread-question-header"><PixelCompanion v-if="pending" mood="waiting" :size="28" /><strong>问题</strong><span>{{ status }}</span></header>
-    <form v-for="(entry, index) in question.questions" :key="`${question.callId}-${entry.id}`" class="thread-question-entry"
+    <template v-for="(entry, index) in question.questions" :key="`${question.callId}-${entry.id}`">
+    <form v-if="!floating || !hasAnswer(entry.id)" class="thread-question-entry"
       @submit.prevent="submit(entry, index)">
       <fieldset>
         <legend>{{ entry.title }}</legend>
@@ -59,6 +67,7 @@ function submit(question, index) {
         </template>
       </fieldset>
     </form>
+    </template>
     <p v-if="question.truncated" class="thread-question-note">内容较长，部分已省略，请在桌面端查看完整问题。</p>
     <p v-else-if="pending && !canRespond && !question.pendingResponse" class="thread-question-note" role="status">回答暂不可用</p>
   </section>

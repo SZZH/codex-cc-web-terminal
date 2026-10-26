@@ -4,6 +4,7 @@ import { buildQuestionAnswer, parseQuestionReplies, questionReplyText } from "..
 import { createCodexChatStore } from "../web/src/lib/codex-chat-store.js";
 import { presentCodexChatSnapshot, presentCodexQueue } from "../web/src/lib/codex-chat-presentation.js";
 import { presentCodexItem } from "../src/sessions/codex/itemPresentation.js";
+import { pendingDesktopQuestions } from "../web/src/lib/codex-question-dock.js";
 
 const question = { source: "desktop", delivery: "async", callId: "call_question",
   questions: [{ id: "0", title: "Which stage?", options: ["Planning", "Published"] }, { id: "1", title: "Any details?", options: [] }] };
@@ -14,6 +15,22 @@ function fixture(status = "inProgress") {
   const read = () => presentCodexChatSnapshot(store.state).turns[0].items.find((item) => item.id === question.callId).question;
   return { store, read };
 }
+
+test("floating questions survive timeline windowing and keep original answer indexes", () => {
+  const { store } = fixture("completed");
+  store.state.turns.turn.itemsWindowIds = [];
+  assert.equal(presentCodexChatSnapshot(store.state).turns[0].items.length, 0);
+  assert.equal(pendingDesktopQuestions(store.state).length, 1);
+  const skipped = buildQuestionAnswer(question, 0, "skip").replace('"answer":"skip"', '"answer":""');
+  store.upsertItem("turn", { id: "answer", type: "userMessage", text: skipped });
+  const pending = pendingDesktopQuestions(store.state)[0];
+  assert.equal(pending.answers[0], "");
+  assert.deepEqual(pending.questions.map((entry) => entry.id), ["0", "1"]);
+  store.upsertRequest({ id: "answer-two", state: "accepted", input: { text: buildQuestionAnswer(question, 1, "Detail") } });
+  assert.equal(pendingDesktopQuestions(store.state)[0].pendingResponse, true);
+  store.upsertItem("turn", { id: "answer-2", type: "userMessage", text: buildQuestionAnswer(question, 1, "Detail") });
+  assert.deepEqual(pendingDesktopQuestions(store.state), []);
+});
 
 test("question answers use the native async question identity without losing user text", () => {
   const text = buildQuestionAnswer(question, 0, "Published\nMore detail");

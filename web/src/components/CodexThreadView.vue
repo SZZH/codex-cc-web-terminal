@@ -1,10 +1,10 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref, shallowRef, watch } from "vue";
+import { computed, onBeforeUnmount, provide, reactive, ref, shallowRef, watch } from "vue";
 import ChatView from "./ChatView.vue";
 import InterfaceState from "./InterfaceState.js";
 import CodexSubmissionFeedback from "./composer/CodexSubmissionFeedback.vue";
 import CodexQueuedMessages from "./composer/CodexQueuedMessages.vue";
-import CodexInteractionPanel from "./composer/interactions/CodexInteractionPanel.vue";
+import CodexQuestionDock from "./composer/CodexQuestionDock.vue";
 import { request, supportsInitialHistory, recheckInitialHistorySupport, patchThreadComposerState, requestThreadComposerState, requestWorkspaceGit,
   requestWorkspaceGitCheckout, requestWorkspaceGitBranchCreate } from "../lib/api.js";
 import { createCodexComposerPreferences } from "../lib/codex-composer-preferences.js";
@@ -17,6 +17,7 @@ import { createCodexChatRuntime } from "../lib/codex-chat-runtime.js";
 import { codexRequestLabel, codexRequestError, codexSubmissionFeedbackRequest, createCodexChatPresenter, presentCodexQueue } from "../lib/codex-chat-presentation.js";
 import { createThreadViewModelBuilder } from "../lib/thread-view-model.js";
 import { buildQuestionAnswer } from "../lib/codex-question-history.js";
+import { pendingDesktopQuestions, QUESTION_DOCK } from "../lib/codex-question-dock.js";
 
 const props = defineProps({ threadId: { type: String, required: true }, initialTitle: { type: String, default: "" }, initialCwd: { type: String, default: "" }, loadConfig: { type: Function, default: () => request("/api/config") } });
 const emit = defineEmits(["back", "status"]);
@@ -26,6 +27,12 @@ const composerOptions = computed(() => active.value?.options.value || createComp
 const models = computed(() => active.value?.models.value || []);
 const gitState = computed(() => active.value?.git.value || createWorkspaceGitState());
 const snapshot = computed(() => state.value ? active.value.presentSnapshot(state.value) : null);
+const pendingQuestions = computed(() => pendingDesktopQuestions(state.value).map((question) => ({ ...question,
+  canRespond: question.canRespond !== false && Boolean(state.value.thread?.capabilities?.desktopQuestionAnswers ||
+    active.value?.running.value && question.turnId === activeCodexTurnId(state.value)) })));
+const questionDock = ref(null);
+provide(QUESTION_DOCK, { has: (callId) => pendingQuestions.value.some((question) => question.callId === callId),
+  open: (callId) => questionDock.value?.open(callId) });
 const queuedMessages = computed(() => state.value ? presentCodexQueue(state.value) : []);
 const pendingSettings = computed(() => {
   const context = active.value;
@@ -260,13 +267,12 @@ async function submit({ mode: requestedMode } = {}) {
 }
 function liveQuestion(context, callId, index) {
   if (active.value !== context || context.disposed || typeof callId !== "string" || !callId || !Number.isInteger(index) || index < 0) return null;
-  for (const turn of snapshot.value?.turns || []) {
-    if (!context.store.state.thread?.capabilities?.desktopQuestionAnswers && turn.id !== activeCodexTurnId(context.store.state)) continue;
-    const question = turn.items.find((item) => item.question?.callId === callId)?.question;
+  for (const question of pendingQuestions.value) {
+    if (question.callId !== callId || !context.store.state.thread?.capabilities?.desktopQuestionAnswers && question.turnId !== activeCodexTurnId(context.store.state)) continue;
     if (question?.status === "pending" && question.delivery === "async" && question.source === "desktop" &&
       !question.pendingResponse && !question.truncated && question.canRespond !== false && question.questions?.[index] &&
       !question.pendingResponses?.[question.questions[index].id] &&
-      !Object.hasOwn(question.answers || {}, question.questions[index].id)) return { ...question, turnId: turn.id };
+      !Object.hasOwn(question.answers || {}, question.questions[index].id)) return question;
   }
   return null;
 }
@@ -379,11 +385,14 @@ function showRequestFooter(request, turnId) {
       @add-attachments="addAttachments" @remove-attachment="active.composer.removeAttachment($event)"
       @retry-attachment="active.composer.retryAttachment($event)"
       @refresh-git="active.composer.refreshWorkspaceGit()">
-      <template #composer-top>
-        <CodexInteractionPanel :state="state.interactionState"
+      <template #attention>
+        <CodexQuestionDock :key="threadId" ref="questionDock" :questions="pendingQuestions" :can-respond="canAnswerQuestions"
+          :interaction-state="state.interactionState" @answer="answerQuestion"
           @draft="({ id, patch }) => active.store.interactions.setDraft(id, patch)"
           @respond="({ id, response }) => active.runtime.interactions.respond(id, response)"
           @check="active.runtime.interactions.check($event)" @refresh="active.runtime.interactions.refresh()" />
+      </template>
+      <template #composer-top>
         <CodexSubmissionFeedback :request="submissionInQueue ? null : submissionRequest" :pending="submissionPending && !runningTask && !queuedMessages.length" :busy="submissionBusy"
           @restore="restoreRequest" @check="checkSubmission" />
         <div v-if="canRetryReads || active.actions.reload" class="codex-recovery-actions">

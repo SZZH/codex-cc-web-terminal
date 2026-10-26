@@ -7,6 +7,7 @@ import { presentCodexItem } from "../src/sessions/codex/itemPresentation.js";
 import { normalizeThreadItem } from "../web/src/lib/thread-item-renderers.js";
 import { presentCodexChatItem } from "../web/src/lib/codex-chat-presentation.js";
 import { buildQuestionAnswer } from "../web/src/lib/codex-question-history.js";
+import { QUESTION_DOCK } from "../web/src/lib/codex-question-dock.js";
 
 const native = (patch = {}) => ({ id: "call_question", type: "agentMessage", delivery: "async", phase: "final_answer",
   text: "Choose a path?\n1. First\n2. Second", questions: [{ title: "Choose a path?", options: ["First", "Second"] }], ...patch });
@@ -75,7 +76,7 @@ function componentUrl(file) {
 }
 const elements = (node, predicate) => [...(predicate(node) ? [node] : []), ...(node.children || []).flatMap((child) => elements(child, predicate))];
 const text = (node) => [node.text || "", ...(node.children || []).map(text)].join(" ");
-async function mount(t, values, name = "ThreadQuestionCard") {
+async function mount(t, values, name = "ThreadQuestionCard", providers = []) {
   const component = (await import(componentUrl(new URL(`../web/src/components/thread-item/${name}.vue`, import.meta.url)))).default;
   const renderer = createRenderer({
     createElement: (type) => ({ type, props: {}, children: [] }), createText: (text) => ({ text }), createComment: (text) => ({ text }),
@@ -88,9 +89,33 @@ async function mount(t, values, name = "ThreadQuestionCard") {
   });
   const root = { children: [] }, props = reactive(values);
   const app = renderer.createApp({ render: () => h(component, props) });
+  for (const [key, value] of providers) app.provide(key, value);
   app.mount(root); await nextTick(); t.after(() => app.unmount());
   return { root, props, elements: (predicate) => elements(root, predicate) };
 }
+
+test("timeline question opens the single floating answer form instead of creating a second draft", async (t) => {
+  const opened = [], bridge = { has: () => true, open: (id) => opened.push(id) };
+  const ui = await mount(t, { question: dto({ status: "pending" }), canRespond: true }, "ThreadQuestionCard", [[QUESTION_DOCK, bridge]]);
+  assert.equal(ui.elements((node) => node.type === "input").length, 0);
+  ui.elements((node) => node.type === "button")[0].props.onClick();
+  assert.deepEqual(opened, ["call_question"]);
+  ui.props.floating = true; await nextTick();
+  assert.ok(ui.elements((node) => node.type === "input").length > 0);
+});
+
+test("floating answers remove completed entries while preserving the remaining native index", async (t) => {
+  const answers = [];
+  const ui = await mount(t, { floating: true, canRespond: true, onAnswer: (value) => answers.push(value),
+    question: dto({ status: "pending", answers: { "0": "First" }, questions: [
+      { id: "0", title: "Already answered", options: [] }, { id: "1", title: "Remaining question", options: [] }
+    ] }) });
+  assert.equal(ui.elements((node) => node.type === "form").length, 1);
+  assert.doesNotMatch(text(ui.root), /Already answered/);
+  ui.elements((node) => node.type === "textarea")[0].props.onInput({ target: { value: "Second answer" } }); await nextTick();
+  ui.elements((node) => node.type === "form")[0].props.onSubmit({ preventDefault() {} });
+  assert.equal(answers[0].index, 1);
+});
 
 test("unknown and closed historical questions remain records without misleading pending actions", async (t) => {
   for (const status of [undefined, "closed"]) {

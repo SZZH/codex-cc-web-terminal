@@ -12,7 +12,7 @@ import { describeMcpForm, initialMcpValues, buildMcpFormResponse } from "../../.
 import { interactionTitle, interactionChoiceLabel } from "../../../lib/codex-interactions/presentation.js";
 
 const props = defineProps({ state: { type: Object, required: true } });
-const emit = defineEmits(["respond", "draft", "check", "refresh"]);
+const emit = defineEmits(["respond", "draft", "check", "refresh", "dismiss"]);
 const activeId = ref(""), validationError = ref(""), dismissed = ref([]);
 const rows = computed(() => {
   return props.state.order.map((id) => props.state.interactions[id]).filter((row) => row && row.status !== "resolved" && !dismissed.value.includes(row.id));
@@ -62,6 +62,7 @@ function openUrl(event) {
   if (disabled.value || !safeUrl.value) { event.preventDefault(); return; }
   updateDraft({ urlOpened: true });
 }
+function dismiss() { dismissed.value.push(activeId.value); emit("dismiss", activeId.value); }
 </script>
 
 <template>
@@ -69,7 +70,7 @@ function openUrl(event) {
     <header class="interaction-header">
       <PixelCompanion :size="28" :mood="busy ? 'loading' : terminal || state.error ? 'error' : 'waiting'" />
       <h2>{{ terminal ? '请求已失效' : title }}</h2><span v-if="status" class="interaction-status" role="status" aria-live="polite">{{ status }}</span>
-      <button v-if="terminal" type="button" class="interaction-close" aria-label="关闭失效交互" title="关闭失效交互" @click="dismissed.push(activeId)">×</button>
+      <button v-if="terminal" type="button" class="interaction-close" aria-label="关闭失效交互" title="关闭失效交互" @click="dismiss">×</button>
       <select v-if="rows.length > 1" :value="activeId" aria-label="选择交互待办" @change="activeId = $event.target.value">
         <option v-for="row in rows" :key="row.id" :value="row.id">{{ interactionChoiceLabel(row) }}</option>
       </select>

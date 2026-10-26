@@ -156,6 +156,7 @@ function observeBottomLayout() {
   }
   const timeline = messageListEl.value?.querySelector?.(".thread-turn-timeline");
   if (timeline) layoutResizeObserver.observe(timeline);
+  if (messageListEl.value) layoutResizeObserver.observe(messageListEl.value);
 }
 
 watch(
@@ -252,6 +253,7 @@ onBeforeUnmount(() => {
         <span class="message-bottom-anchor" aria-hidden="true"></span>
       </section>
 
+      <slot name="attention" />
       <div ref="composerHostEl" class="chat-composer-host" data-app-scroll>
         <p v-if="statusText" ref="statusEl" class="chat-status" role="status" aria-live="polite"><PixelCompanion v-if="runningTask" mood="thinking" :size="24" />{{ statusText }}</p>
         <slot name="composer-top" />

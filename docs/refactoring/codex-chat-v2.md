@@ -458,6 +458,8 @@ root独立混合验收中，6个冷详情读取取消后，active route与本地
 
 ## 提问、审批与交互面板
 
+待处理提问统一由 `CodexQuestionDock` 放在独立 attention 插槽，脱离聊天历史及输入区各自的滚动。原生 RPC 表单复用 `CodexInteractionPanel`，桌面异步问题复用 `ThreadQuestionCard` 和原回答通道；收起保持草稿与提醒，新题重新展开，官方已回答后自动移除。历史题目保留跳转入口，显示窗口外但已加载的题目仍可回答。切换会话销毁悬浮状态，不影响普通聊天草稿。
+
 第二十二轮根据用户截图和当前官方App Server文档，对照本机0.156.1 experimental schema补齐五类用户请求：文字/选项/秘密提问、命令/终端输入审批、文件修改审批、额外权限及MCP表单/URL确认。原自动拒绝/不支持处理保留为无handler fallback，合法V2请求进入独立原连接registry。回答通过专属接口响应原RPC，不进入聊天发送journal或伪造新消息。原socket代次、typed id、多回调、原子单次claim、官方resolved、断线失效和权威快照共同维护多端与刷新一致性。具体接口和支持矩阵见架构文档的“Codex 用户交互”。
 
 新增显式人工审批模式read-only/on-request/user，原三种模式保持；存储往返不猜reviewer、不扩大自定义权限或写桌面全局模式，CC/json_exec边界明确。V2线程config启用普通模式问答，保留模型、reasoning及所有安全选项。原生隔离验收实际收到Plan和Default提问并在回答后resolved/completed；命令按真实availableDecisions取消后interrupted且文件不存在，允许本次后completed且精确写入指定临时文件，没有选择长期规则。首次probe误用未提供的decline被正确拒绝，保留失败记录；shim子进程清理不足后已精确清理自有进程树，后续直接native启动并等待退出，未操作正式模型任务。
