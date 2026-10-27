@@ -65,7 +65,12 @@ async function mount(t, item, extra = {}, componentFile = itemComponentFile, { s
   const probe = { markdown: 0, fence: 0, clears: 0, parserInitializations: 0, sanitized: [], sanitize, highlighter };
   globalThis.__threadItemMarkdownProbe = probe;
   const renderer = createRenderer({
-    createElement: (type) => markRaw({ type, props: {}, children: [] }), createText: (text) => ({ text }), createComment: (text) => ({ text }),
+    createElement: (type) => markRaw({ type, props: {}, children: [], ...(["video", "audio"].includes(type) ? {
+      playCalls: 0, pauseCalls: 0, loadCalls: 0,
+      play() { this.playCalls += 1; return probe.playError ? Promise.reject(probe.playError) : Promise.resolve(); },
+      pause() { this.pauseCalls += 1; }, load() { this.loadCalls += 1; },
+      removeAttribute(name) { delete this.props[name]; }
+    } : {}) }), createText: (text) => ({ text }), createComment: (text) => ({ text }),
     setText: (node, text) => { node.text = text; }, setElementText: (node, text) => { node.text = text; node.children = []; },
     parentNode: (node) => node?.parent || null, nextSibling: (node) => node?.parent?.children[node.parent.children.indexOf(node) + 1] || null,
     insert(node, parent, anchor) { if (node.parent) node.parent.children = node.parent.children.filter((child) => child !== node); node.parent = parent; const index = anchor ? parent.children.indexOf(anchor) : -1; if (index < 0) parent.children.push(node); else parent.children.splice(index, 0, node); },
@@ -594,4 +599,111 @@ test("compiled process primitive inputs still follow source, language, category 
   ui.props.item = processItem(official, { id: "different" }); await nextTick();
   assert.equal(calls.known, beforeIdentity + 2, "identity clearing must release the previous item's fence entries");
   assert.equal(ui.html(), expected.official);
+});
+
+for (const [kind, extension, contentType] of [["video", "mp4", "video/mp4"], ["audio", "mp3", "audio/mpeg"]]) {
+  test(`compiled ${kind} embed loads only after a click and exposes native controls without HTML injection`, async (t) => {
+    const originalFetch = globalThis.fetch, calls = [], id = "Aa_9-bZ0".repeat(4);
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url, ...options });
+      return new Response(JSON.stringify({ id, kind: "file", media: { kind, contentType, url: `/api/previews/${id}/media` } }),
+        { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    t.after(() => { globalThis.fetch = originalFetch; });
+    const ui = await mount(t, primary(`![演示](/tmp/clip.${extension})`));
+    assert.equal(calls.length, 0);
+    assert.equal(ui.all((node) => ["video", "audio"].includes(node.type)).length, 0);
+    assert.equal(ui.all((node) => node.type === "pre").length, 0, "a media-only item must not leak its Markdown source");
+    assert.doesNotMatch(ui.html(), /<video|<audio|<img/);
+    const button = ui.all((node) => node.type === "button" && node.props.class === "media-player-start")[0];
+    await button.props.onClick(); await nextTick();
+    const player = ui.all((node) => node.type === kind)[0];
+    assert.ok(player);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "/api/previews");
+    assert.equal(calls[0].credentials, "same-origin");
+    assert.deepEqual(JSON.parse(calls[0].body), { target: `/tmp/clip.${extension}`, cwd: "/work" });
+    assert.equal(player.props.src, `/api/previews/${id}/media`);
+    assert.ok(Object.hasOwn(player.props, "controls"));
+    assert.ok(Object.hasOwn(player.props, "playsinline"));
+    assert.equal(player.props.preload, "none");
+    assert.equal(player.props.autoplay, undefined);
+    assert.equal(player.playCalls, 1);
+    assert.equal(ui.probe.sanitized[0].config.ALLOWED_TAGS.includes(kind), false,
+      "the native component must remain outside the Markdown HTML sanitizer surface");
+    ui.unmount();
+    assert.equal(player.pauseCalls, 1);
+    assert.equal(player.loadCalls, 1);
+    assert.equal(player.props.src, undefined);
+  });
+}
+
+test("compiled streaming Markdown and title changes preserve an already playing media node", async (t) => {
+  const source = "https://media.example/clip.mp4?signature=abc";
+  const ui = await mount(t, primary(`![Video](${source})\n\nWorking.`));
+  await ui.all((node) => node.type === "button" && node.props.class === "media-player-start")[0].props.onClick();
+  const player = ui.all((node) => node.type === "video")[0];
+  player.currentTime = 12.5;
+  for (let index = 0; index < 6; index++) {
+    ui.props.item = primary(`![Updated ${index}](${source})\n\nWorking. Stream ${index}.`, { status: "inProgress" });
+    await nextTick();
+    assert.equal(ui.all((node) => node.type === "video")[0], player);
+    assert.equal(player.props.src, source);
+    assert.equal(player.currentTime, 12.5);
+    assert.equal(player.pauseCalls, 0);
+    assert.equal(player.loadCalls, 0);
+    assert.equal(player.playCalls, 1);
+  }
+  ui.props.item = primary("![Another](https://media.example/another.mp4)"); await nextTick();
+  assert.equal(player.pauseCalls, 1);
+  assert.equal(player.loadCalls, 1);
+  assert.equal(player.props.src, undefined);
+  assert.equal(ui.all((node) => node.type === "video").length, 0, "changing the artifact returns to explicit click-to-load");
+});
+
+test("mobile autoplay refusal retains usable native controls and codec errors offer a working retry", async (t) => {
+  const ui = await mount(t, primary("![Video](https://media.example/clip.mp4)"));
+  ui.probe.playError = new Error("NotAllowedError: user gesture required");
+  await ui.all((node) => node.type === "button" && node.props.class === "media-player-start")[0].props.onClick();
+  const player = ui.all((node) => node.type === "video")[0];
+  assert.ok(player);
+  assert.ok(Object.hasOwn(player.props, "controls"));
+  assert.equal(ui.all((node) => node.props?.role === "alert").length, 0);
+  player.props.onError({ currentTarget: { error: { code: 4 } } }); await nextTick();
+  const alert = ui.all((node) => node.props?.role === "alert")[0];
+  assert.ok(alert);
+  assert.match(ui.all((node) => node.type === "span" && String(node.text).includes("编码"))[0].text, /当前浏览器无法播放/);
+  ui.probe.playError = null;
+  const retry = ui.all((node) => node.type === "button" && node.text === "重试")[0];
+  await retry.props.onClick(); await nextTick();
+  assert.equal(ui.all((node) => node.props?.role === "alert").length, 0);
+  assert.equal(ui.all((node) => node.type === "video")[0].props.src, "https://media.example/clip.mp4");
+  assert.equal(player.pauseCalls, 1);
+});
+
+test("a media source changed or unmounted during grant creation cannot resurrect the old player", async (t) => {
+  const originalFetch = globalThis.fetch, requests = [], id = "Aa_9-bZ0".repeat(4);
+  globalThis.fetch = (url, options) => new Promise((resolve) => { requests.push({ url, ...options, resolve }); });
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const componentFile = new URL("../web/src/components/preview/MediaPlayer.vue", import.meta.url);
+  const ui = await mount(t, null, { source: { kind: "video", target: "/tmp/first.mp4", title: "First" } }, componentFile);
+  const flush = async () => { for (let index = 0; index < 10; index++) await Promise.resolve(); await nextTick(); };
+  const reply = () => new Response(JSON.stringify({ id, kind: "file", media: { kind: "video", url: `/api/previews/${id}/media`, contentType: "video/mp4" } }),
+    { status: 200, headers: { "Content-Type": "application/json" } });
+  const firstButton = ui.all((node) => node.type === "button")[0];
+  const first = firstButton.props.onClick(); await flush();
+  assert.equal(firstButton.props.disabled, true);
+  await firstButton.props.onClick();
+  assert.equal(requests.length, 1, "a repeated click while waiting must not create duplicate grants");
+  ui.props.source = { kind: "video", target: "/tmp/second.mp4", title: "Second" }; await flush();
+  assert.equal(requests[0].signal.aborted, true);
+  requests[0].resolve(reply()); await first; await flush();
+  assert.equal(ui.all((node) => node.type === "video").length, 0);
+  const second = ui.all((node) => node.type === "button")[0].props.onClick(); await flush();
+  assert.equal(requests.length, 2);
+  assert.equal(JSON.parse(requests[1].body).target, "/tmp/second.mp4");
+  ui.unmount();
+  assert.equal(requests[1].signal.aborted, true);
+  requests[1].resolve(reply()); await second; await flush();
+  assert.equal(ui.all((node) => node.type === "video").length, 0);
 });

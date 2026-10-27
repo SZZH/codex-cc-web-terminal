@@ -1,5 +1,7 @@
 import { PreviewRegistry, previewError } from "../preview/registry.js";
 import { previewOrigin } from "../preview/gateway.js";
+import { servePreviewFile } from "../preview/file.js";
+import { mediaType } from "../preview/media.js";
 
 export function getPreviewRegistry(runtime) {
   return runtime.previewRegistry ||= new PreviewRegistry(runtime.config);
@@ -18,7 +20,19 @@ export async function handlePreviewRoute(ctx, runtime) {
       const entry = registry.register({ target: body.target, cwd: body.cwd, ...(ctx.method === "POST" ? { requestId: body.requestId } : {}) });
       const url = `${previewOrigin(runtime.config, source, entry.port)}/_open/${entry.id}`;
       if (ctx.method === "GET") { ctx.redirect(url); ctx.set("Cache-Control", "no-store"); }
-      else runtime.json(ctx, 201, { id: entry.id, title: entry.title, kind: entry.kind, url, expiresAt: new Date(entry.expiresAt).toISOString() });
+      else {
+        const media = entry.kind === "file" ? mediaType(entry.path) : null;
+        runtime.json(ctx, 201, { id: entry.id, title: entry.title, kind: entry.kind, url, expiresAt: new Date(entry.expiresAt).toISOString(),
+          ...(media ? { media: { ...media, url: `/api/previews/${entry.id}/media` } } : {}) });
+      }
+      return true;
+    }
+    const mediaMatch = /^\/api\/previews\/([a-zA-Z0-9_-]+)\/media$/.exec(ctx.path);
+    if (mediaMatch && ["GET", "HEAD"].includes(ctx.method)) {
+      const entry = registry.get(mediaMatch[1]);
+      if (entry.kind !== "file" || !mediaType(entry.path)) throw previewError("此预览不是可播放的音视频文件。", 403);
+      servePreviewFile(ctx.req, ctx.res, entry, encodeURIComponent(`${entry.id}--${entry.title}`), runtime.config, { mediaOnly: true });
+      ctx.respond = false;
       return true;
     }
     const match = /^\/api\/previews\/([a-zA-Z0-9_-]+)$/.exec(ctx.path);

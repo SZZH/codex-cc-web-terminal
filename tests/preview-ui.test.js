@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { compileScript, parse } from "vue/compiler-sfc";
-import { createRenderer, defineComponent, h, nextTick, ref } from "vue";
+import { createRenderer, defineComponent, h, markRaw, nextTick, ref } from "vue";
 import { createPreviewController } from "../web/src/lib/preview.js";
 
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
@@ -263,10 +263,50 @@ test("unsafe or same-origin viewer responses are rejected instead of embedded", 
   }
 });
 
+const mediaId = "Aa_9-bZ0".repeat(4);
+const mediaPreview = (kind = "video") => ({ ...preview(), id: mediaId, title: kind === "video" ? "演示.mp4" : "录音.mp3",
+  media: { kind, url: `/api/previews/${mediaId}/media`, contentType: kind === "video" ? "video/mp4" : "audio/mpeg" } });
+
+test("valid native media previews become ready without waiting for an iframe and clear when closed", async () => {
+  for (const kind of ["video", "audio"]) {
+    const controller = createPreviewController({ request: async () => mediaPreview(kind) });
+    await controller.open({ target: kind === "video" ? "/tmp/clip.mp4" : "/tmp/audio.mp3" });
+    assert.equal(controller.state.status, "ready");
+    assert.deepEqual({ ...controller.state.media }, mediaPreview(kind).media);
+    assert.equal(controller.state.url, preview().url, "the isolated URL remains available for opening a separate window");
+    controller.close();
+    assert.equal(controller.state.media, null);
+    assert.equal(controller.state.url, "");
+  }
+});
+
+test("preview rejects malicious media responses instead of falling back to an iframe", async () => {
+  for (const result of [
+    { ...mediaPreview(), kind: "service" },
+    ...["javascript:alert(1)", "https://attacker.example/clip.mp4", `//attacker.example/api/previews/${mediaId}/media`,
+      `/api/previews/${mediaId}/media?redirect=evil`, `/api/previews/${"b".repeat(32)}/media`]
+      .map((url) => ({ ...mediaPreview(), media: { ...mediaPreview().media, url } }))
+  ]) {
+    const controller = createPreviewController({ request: async () => result });
+    await controller.open({ target: "/tmp/clip.mp4" });
+    assert.equal(controller.state.status, "error");
+    assert.equal(controller.state.media, null);
+    assert.equal(controller.state.url, "");
+    controller.close();
+  }
+});
+
 function elements(root, match) { return [...(match(root) ? [root] : []), ...(root.children || []).flatMap((node) => elements(node, match))]; }
 function renderer() {
   return createRenderer({
-    createElement: (type) => ({ type, props: {}, children: [], focus() {} }), createText: (text) => ({ text }), createComment: (text) => ({ text }),
+    createElement: (type) => markRaw({ type, props: {}, children: [],
+      focus() { if (globalThis.document) globalThis.document.activeElement = this; },
+      contains(node) { for (let current = node; current; current = current.parent) if (current === this) return true; return false; },
+      matches(selector) { return selector === "video[controls],audio[controls]" && ["video", "audio"].includes(this.type) && Object.hasOwn(this.props, "controls"); },
+      querySelectorAll() { return elements(this, (node) => (node.type === "button" && !node.props.disabled) || (node.type === "a" && node.props.href)
+        || node.type === "iframe" || (["video", "audio"].includes(node.type) && Object.hasOwn(node.props, "controls"))); },
+      pause() {}, load() {}, play: () => Promise.resolve(), removeAttribute(name) { delete this.props[name]; }
+    }), createText: (text) => ({ text }), createComment: (text) => ({ text }),
     setText: (node, text) => { node.text = text; }, setElementText: (node, text) => { node.text = text; node.children = []; },
     parentNode: (node) => node?.parent, nextSibling: (node) => node.parent?.children[node.parent.children.indexOf(node) + 1] || null,
     insert: (node, parent, anchor) => { if (node.parent) node.parent.children = node.parent.children.filter((child) => child !== node); node.parent = parent;
@@ -275,12 +315,15 @@ function renderer() {
     patchProp: (node, key, before, after) => { node.props[key] = after; }
   });
 }
-async function previewHost() {
-  const file = new URL("../web/src/components/preview/PreviewHost.vue", import.meta.url);
+function componentSource(file) {
   const { descriptor } = parse(fs.readFileSync(file, "utf8"), { filename: file.pathname });
   const compiled = compileScript(descriptor, { id: "preview-host-test", inlineTemplate: true }).content.replace(/from\s+["']([^"']+)["']/g,
-    (_, name) => `from ${JSON.stringify(name === "vue" ? import.meta.resolve("vue") : new URL(name, file).href)}`);
-  return (await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`)).default;
+    (_, name) => `from ${JSON.stringify(name.endsWith(".vue") ? componentSource(new URL(name, file))
+      : name.startsWith(".") ? new URL(name, file).href : import.meta.resolve(name))}`);
+  return `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`;
+}
+async function previewHost() {
+  return (await import(componentSource(new URL("../web/src/components/preview/PreviewHost.vue", import.meta.url)))).default;
 }
 
 test("mounted preview retains a live chat and draft through loading, iframe, Escape and retry", async () => {
@@ -313,6 +356,69 @@ test("mounted preview retains a live chat and draft through loading, iframe, Esc
     assert.equal(controller.state.status, "frame-loading");
     assert.equal(chatMounts, 1);
   } finally { render(null, root); globalThis.window = originalWindow; }
+});
+
+test("mounted media preview uses a native player entry and switches cleanly back to document iframe", async () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
+    addEventListener() {}, removeEventListener() {} };
+  let result = mediaPreview();
+  const controller = createPreviewController({ request: async () => result });
+  const Host = await previewHost(), { render } = renderer(), root = { children: [] };
+  try {
+    render(h(Host, { controller }), root);
+    await controller.open({ target: "/tmp/clip.mp4" }); await flush();
+    assert.equal(elements(root, (node) => node.type === "iframe").length, 0);
+    assert.equal(elements(root, (node) => node.props?.class === "media-player-start").length, 1);
+    assert.equal(elements(root, (node) => node.props?.role === "status").length, 0);
+    assert.equal(elements(root, (node) => node.type === "video").length, 0, "previews remain click-to-load");
+    assert.equal(elements(root, (node) => node.type === "p" && node.text === "视频预览").length, 1);
+    result = preview();
+    await controller.open({ target: "/tmp/report.pdf" }); await flush();
+    assert.equal(elements(root, (node) => node.props?.class === "media-player-start").length, 0);
+    assert.equal(elements(root, (node) => node.type === "iframe").length, 1);
+    assert.equal(controller.state.status, "frame-loading");
+    result = mediaPreview("audio");
+    await controller.open({ target: "/tmp/audio.mp3" }); await flush();
+    assert.equal(elements(root, (node) => node.type === "iframe").length, 0);
+    assert.equal(elements(root, (node) => node.type === "p" && node.text === "音频预览").length, 1);
+  } finally { render(null, root); globalThis.window = originalWindow; }
+});
+
+test("mobile preview lets Tab traverse native media controls and recaptures focus only when it leaves the panel", async () => {
+  const originals = { window: globalThis.window, document: globalThis.document, fetch: globalThis.fetch }, listeners = new Map();
+  globalThis.window = { matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
+    addEventListener: (name, callback) => listeners.set(name, callback), removeEventListener: (name) => listeners.delete(name) };
+  globalThis.document = { activeElement: null, querySelector: () => null, querySelectorAll: () => [], hasFocus: () => true };
+  let result = mediaPreview();
+  globalThis.fetch = async () => new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+  const controller = createPreviewController({ request: async () => result });
+  const Host = await previewHost(), { render } = renderer(), root = { children: [] };
+  try {
+    render(h(Host, { controller }), root); await flush();
+    for (const kind of ["video", "audio"]) {
+      result = mediaPreview(kind);
+      await controller.open({ target: kind === "video" ? "/tmp/clip.mp4" : "/tmp/audio.mp3" }); await flush();
+      await elements(root, (node) => node.props?.class === "media-player-start")[0].props.onClick(); await flush();
+      const player = elements(root, (node) => node.type === kind)[0];
+      const close = elements(root, (node) => node.props?.["aria-label"] === "关闭预览")[0];
+      assert.ok(player);
+      let prevented = 0;
+      globalThis.document.activeElement = player;
+      for (const shiftKey of [false, true]) listeners.get("keydown")({ key: "Tab", shiftKey, preventDefault() { prevented += 1; } });
+      assert.equal(prevented, 0, "native shadow controls must receive both forward and backward Tab");
+      assert.equal(globalThis.document.activeElement, player);
+      globalThis.document.activeElement = { type: "outside" };
+      listeners.get("focusin")();
+      assert.equal(globalThis.document.activeElement, close, "focus leaving the modal is still contained");
+      listeners.get("keydown")({ key: "Tab", shiftKey: true, preventDefault() { prevented += 1; } });
+      assert.equal(prevented, 1);
+      assert.equal(globalThis.document.activeElement, player, "ordinary modal edge navigation still wraps");
+    }
+  } finally {
+    render(null, root); await flush();
+    globalThis.window = originals.window; globalThis.document = originals.document; globalThis.fetch = originals.fetch;
+  }
 });
 
 test('service preview release completes before reusing its slot, without double deletion',async()=>{

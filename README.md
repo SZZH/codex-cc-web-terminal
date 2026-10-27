@@ -150,6 +150,11 @@ and temporary, scoped access links; keep private directories outside published
 content. See the [local preview runbook](./docs/operations/local-preview.md) for
 frp/Caddy setup, runtime management and compatibility limits.
 
+Audio and video embeds in chat and local media file previews use native browser
+controls, loading only after a click. Local playback uses authenticated streaming
+with seeking support; codec support depends on the browser, with no server-side
+transcoding.
+
 ## Common Commands
 
 ```bash
@@ -180,6 +185,12 @@ netstat -ano | findstr :5173
 - If you changed `PORT`, use the same port in your phone URL.
 
 ## Changelog
+
+### `v0.4.8`
+
+- Added audio and video playback in chat embeds and file previews, with native playback, seeking, and video fullscreen controls on phones and desktops.
+- Kept history media unloaded until a click, preserved playback during message updates, and stopped playback when closing or switching media.
+- Added authenticated, same-origin media streaming with byte ranges and retry states, while keeping existing file access restrictions.
 
 ### `v0.4.7`
 

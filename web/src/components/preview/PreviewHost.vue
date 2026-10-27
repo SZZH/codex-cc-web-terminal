@@ -1,6 +1,7 @@
 <script setup>
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { localPreview } from "../../lib/preview.js";
+import MediaPlayer from "./MediaPlayer.vue";
 
 const props = defineProps({ controller: { type: Object, default: () => localPreview } });
 const state = props.controller.state;
@@ -21,9 +22,12 @@ function keydown(event) {
   if (!state.open || event.defaultPrevented || nativeDialogOpen()) return;
   if (event.key === "Escape") { event.preventDefault(); props.controller.close(); return; }
   if (event.key !== "Tab" || !ownsFocus()) return;
-  const targets = [...(panel.value?.querySelectorAll("button:not([disabled]),a[href],iframe") || [])];
+  const targets = [...(panel.value?.querySelectorAll("button:not([disabled]),a[href],iframe,video[controls],audio[controls]") || [])];
   const first = targets[0], last = targets.at(-1);
   const active = globalThis.document?.activeElement;
+  // Native controls use shadow focus: let Tab traverse them before focusin
+  // returns focus to the panel when it actually leaves the dialog.
+  if (active?.matches?.("video[controls],audio[controls]")) return;
   if (!panel.value?.contains(active)) { event.preventDefault(); (event.shiftKey ? last : first)?.focus?.({ preventScroll: true }); }
   else if (event.shiftKey && active === first) { event.preventDefault(); last?.focus?.({ preventScroll: true }); }
   else if (!event.shiftKey && active === last) { event.preventDefault(); first?.focus?.({ preventScroll: true }); }
@@ -51,11 +55,12 @@ onBeforeUnmount(() => {
   <aside v-if="state.open" ref="panel" class="preview-host" data-preview-host role="dialog" :aria-modal="compact || undefined" aria-labelledby="local-preview-title">
     <header class="preview-header">
       <button ref="closeButton" class="preview-close" type="button" aria-label="关闭预览" title="关闭预览（Esc）" @click="controller.close()">‹</button>
-      <div class="preview-heading"><h2 id="local-preview-title">{{ state.title }}</h2><p>{{ state.kind === 'service' ? '网页预览' : '文件预览' }}</p></div>
+      <div class="preview-heading"><h2 id="local-preview-title">{{ state.title }}</h2><p>{{ state.media ? (state.media.kind === 'video' ? '视频预览' : '音频预览') : state.kind === 'service' ? '网页预览' : '文件预览' }}</p></div>
       <a class="preview-external" :href="controller.externalHref()" target="_blank" rel="noopener noreferrer">新窗口打开 <span aria-hidden="true">↗</span></a>
     </header>
     <div class="preview-content">
-      <iframe v-if="state.url" :key="state.revision" class="preview-frame" :src="state.url" :title="state.title" referrerpolicy="no-referrer"
+      <div v-if="state.media" class="preview-media"><MediaPlayer :key="state.revision" :source="{ ...state.media, target: state.target, cwd: state.cwd, title: state.title }" /></div>
+      <iframe v-else-if="state.url" :key="state.revision" class="preview-frame" :src="state.url" :title="state.title" referrerpolicy="no-referrer"
         :data-preview-revision="state.revision"
         sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"
         @load="controller.frameLoaded(frameRevision($event))" @error="controller.frameFailed(frameRevision($event))" />
@@ -76,6 +81,7 @@ onBeforeUnmount(() => {
 .preview-heading p { margin: 4px 0 0; color: #938579; font-size: 11px; }
 .preview-external { flex: 0 0 auto; color: #79634f; font-size: 12px; text-decoration: none; }
 .preview-content { position: relative; flex: 1; min-height: 0; }
+.preview-media { display: flex; align-items: center; height: 100%; min-height: 0; overflow: auto; padding: 16px; box-sizing: border-box; }
 .preview-frame { display: block; width: 100%; height: 100%; border: 0; background: white; }
 .preview-message { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: safe center; gap: 12px; min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 28px; background: #fdfbf8; color: #88796b; text-align: center; font-size: 14px; }
 .preview-message > * { flex: 0 0 auto; }

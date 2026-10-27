@@ -1,6 +1,6 @@
 # 本地文件与网页预览运维
 
-Last updated: 2026-10-22
+Last updated: 2026-10-27
 Status: active
 Owner: infra
 
@@ -9,6 +9,16 @@ Owner: infra
 聊天中的本地文件链接、文件变更面板中的文件名，以及明确启动的 loopback 网页服务，可在网页端直接预览。桌面使用侧边面板，手机使用全屏预览；关闭后保留聊天和草稿。文件转换使用 kkFileView 5.0.3，网页请求由独立源网关转发。
 
 本文记录当前 macOS 原生运行方式，以及现有 frp、Caddy 外部访问链路的配置。Office 文档、图片、PDF 和 Markdown 是核心预览场景；Office 使用 LibreOffice 服务端转换，Word/演示文稿使用 PDF，Excel 使用轻量 HTML 表格，减少手机首次加载大型表格编辑器资源。实际格式效果仍取决于文件、字体、打印版式和转换运行时。
+
+## 音视频播放
+
+聊天回复中的 `![视频](output/clip.mp4)`、`![音频](output/voice.mp3)` 显示原生播放器；本地音视频文件链接点击后在现有预览面板中播放。相对路径以会话工作目录解析，支持本地绝对路径和 `file://` 地址。远程 HTTP(S) 嵌入直接由浏览器读取，仍受浏览器混合内容和目标站点限制。
+
+媒体等用户点击播放后才创建来源并请求文件，历史消息不会预加载整段媒体。播放、暂停、进度与视频全屏使用浏览器原生控件，手机使用 `playsinline`；部分手机需要在来源准备完成后再点一次原生播放键。切换来源、关闭面板或移除消息时停止并释放播放资源，文本继续输出不会重建已有播放器。
+
+本地媒体通过已有预览授权生成同源的 `GET/HEAD /api/previews/:id/media`，沿用聊天登录和跨源校验，不需要另一个端口的登录 cookie。创建授权仍要求预览网关就绪；媒体不经过 kkFileView 或 LibreOffice 转码。新窗口入口仍使用隔离预览网关，因此公网访问该入口仍需相应端口可用。
+
+识别视频容器 `mp4`、`m4v`、`mov`、`webm`、`ogv` 和音频容器 `mp3`、`m4a`、`aac`、`wav`、`ogg`、`oga`、`opus`、`flac`。容器扩展名不能保证内部编码可播放，兼容性由浏览器决定；失败时可重试或在新窗口打开、下载播放。服务器流式读取并支持单范围 `Range`、`If-Range`、`HEAD`，不会为播放将整段文件读入内存。
 
 ## 前提条件
 
@@ -134,7 +144,7 @@ handle {
 - 维护代码时可运行现有预览测试：
 
   ```bash
-  node --test tests/previews.test.js tests/preview-ui.test.js tests/markdown-links.test.js
+  node --test tests/previews.test.js tests/preview-ui.test.js tests/markdown-links.test.js tests/markdown-media.test.js tests/media-playback.test.js tests/thread-item-markdown.test.js
   node --test scripts/preview/preview-service.test.mjs scripts/preview/restore-pdfjs.test.mjs
   ```
 

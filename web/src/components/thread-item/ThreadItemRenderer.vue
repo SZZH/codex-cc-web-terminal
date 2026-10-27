@@ -6,6 +6,7 @@ import { preserveCodeScroll } from "../../lib/code-highlighting.js";
 import { handleLocalPreviewLink } from "../../lib/markdown-links.js";
 import { openLocalPreview } from "../../lib/preview.js";
 import ImageLightbox from "./ImageLightbox.vue";
+import MediaPlayer from "../preview/MediaPlayer.vue";
 import ThreadQuestionCard from "./ThreadQuestionCard.vue";
 import ThreadQuestionReply from "./ThreadQuestionReply.vue";
 
@@ -129,15 +130,16 @@ const renderedProcessBody = computed(() => {
 });
 
 const markdownSource = computed(() => String(props.item?.body || "").trim());
-const renderedBody = computed(() => {
+const renderedMarkdown = computed(() => {
   const body = markdownSource.value;
   if (!body) {
-    return "";
+    return { html: "", media: [] };
   }
   if (!shouldRenderMarkdown.value) {
-    return "";
+    return { html: "", media: [] };
   }
-  return DOMPurify.sanitize(renderMarkdown(body), {
+  const env = { media: [] };
+  const html = DOMPurify.sanitize(renderMarkdown(body, env), {
     ALLOWED_TAGS: [
       "p",
       "br",
@@ -170,7 +172,11 @@ const renderedBody = computed(() => {
     ],
     ALLOWED_ATTR: ["href", "target", "rel", "class", "src", "alt", "title", "role", "tabindex", "loading", "decoding", "aria-label"]
   }).trim();
+  return { html, media: env.media };
 });
+const renderedBody = computed(() => renderedMarkdown.value.html);
+const mediaItems = computed(() => renderedMarkdown.value.media);
+
 const imageUrl = computed(() => String(props.item?.imageUrl || "").trim());
 const imageAlt = computed(() => String(props.item?.imageAlt || "image").trim() || "image");
 const imageItems = computed(() => {
@@ -265,9 +271,11 @@ onBeforeUnmount(clearFenceCache);
       v-html="renderedBody"
     ></div>
     <pre
-      v-else-if="!item.question && !item.questionReplies?.length && item.body"
+      v-else-if="!item.question && !item.questionReplies?.length && !mediaItems.length && item.body"
       class="thread-item-body plain-body"
     >{{ item.body }}</pre>
+
+    <MediaPlayer v-for="media in mediaItems" :key="`${item.id}-${media.key}`" :source="media" />
 
     <ImageLightbox v-if="lightboxImage" :image="lightboxImage" :origin="lightboxImage.origin" @close="lightboxImage = null" />
   </article>

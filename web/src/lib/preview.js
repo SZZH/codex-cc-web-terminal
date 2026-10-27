@@ -1,5 +1,6 @@
 import { reactive } from "vue";
 import { request } from "./api.js";
+import { previewMedia } from "./media-playback.js";
 import { localPreviewTarget, previewOpenHref } from "./markdown-links.js";
 
 const newRequestId = () => [...globalThis.crypto.getRandomValues(new Uint8Array(16))].map((value) => value.toString(16).padStart(2, "0")).join("");
@@ -8,7 +9,7 @@ export function createPreviewController({ request: send = request, document: doc
   window: view = globalThis.window, timeoutMs = 20000, setTimer = setTimeout, clearTimer = clearTimeout,
   requestId: createRequestId = newRequestId } = {}) {
   const state = reactive({ open: false, target: "", cwd: "", title: "预览", kind: "", url: "", id: "",
-    expiresAt: null, status: "idle", error: "", revision: 0 });
+    media: null, expiresAt: null, status: "idle", error: "", revision: 0 });
   let abort = null;
   let returnContext = null;
   let releasePending = null;
@@ -37,7 +38,7 @@ export function createPreviewController({ request: send = request, document: doc
     if (!state.open || !returnContext) returnContext = rememberPosition();
     const releasing = releaseService();
     Object.assign(state, { open: true, target: String(target || ""), cwd: String(cwd || ""), title: String(target || "预览").split(/[\\/]/).at(-1) || "预览",
-      status: "loading", error: "", url: "", id: "", kind: "", expiresAt: null });
+      status: "loading", error: "", url: "", id: "", kind: "", media: null, expiresAt: null });
     let timer;
     try {
       if (releasing) {
@@ -62,8 +63,10 @@ export function createPreviewController({ request: send = request, document: doc
       if (!["http:", "https:"].includes(url.protocol) || (view?.location?.origin && url.origin === view.location.origin)) {
         throw new Error("预览服务返回的地址不可用。");
       }
+      const media = previewMedia(result);
+      if (result.media && !media) throw new Error("媒体地址不可用。");
       Object.assign(state, { id: result.id, title: result.title || state.title, kind: result.kind,
-        url: result.url, expiresAt: result.expiresAt, status: "frame-loading" });
+        url: result.url, media, expiresAt: result.expiresAt, status: media ? "ready" : "frame-loading" });
       return result;
     } catch (error) {
       if (revision === state.revision && state.open) {
@@ -78,7 +81,7 @@ export function createPreviewController({ request: send = request, document: doc
     const revision = ++state.revision;
     abort?.abort(); abort = null;
     releaseService();
-    Object.assign(state, { open: false, status: "idle", url: "", error: "" });
+    Object.assign(state, { open: false, status: "idle", url: "", media: null, error: "" });
     const context = returnContext; returnContext = null;
     const generation = positionGeneration;
     cancelPositionRestore();

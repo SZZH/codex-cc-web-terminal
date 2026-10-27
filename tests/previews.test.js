@@ -7,6 +7,7 @@ import http from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import { PreviewRegistry } from "../src/preview/registry.js";
 import { PreviewGateway, previewOrigin } from "../src/preview/gateway.js";
+import { mediaType } from "../src/preview/media.js";
 import { login, startTestServer } from "./helpers/backendTestUtils.js";
 
 async function listen(server) { await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve)); return server.address().port; }
@@ -249,6 +250,132 @@ test("file gateway supports ranges, unchanged caching, related assets and scope 
   assert.equal((await fetch(`${f.origin}/viewer/onlinePreview?url=${forged}`,{headers:{Cookie:cookie}})).status,403);
   fs.writeFileSync(path.join(f.config.dataDir,"auth-sessions.json"),"private");
   assert.equal((await fetch(`${f.origin}/__file/${grant.id}/state/auth-sessions.json`)).status,403);
+});
+
+test("media containers keep their MIME types and open directly without expanding related file access", async (t) => {
+  const f = await fixture(t);
+  const formats = {
+    mp4: ["video", "video/mp4"], m4v: ["video", "video/mp4"], mov: ["video", "video/quicktime"],
+    webm: ["video", "video/webm"], ogv: ["video", "video/ogg"], mp3: ["audio", "audio/mpeg"],
+    m4a: ["audio", "audio/mp4"], aac: ["audio", "audio/aac"], wav: ["audio", "audio/wav"],
+    ogg: ["audio", "audio/ogg"], oga: ["audio", "audio/ogg"], opus: ["audio", "audio/ogg"], flac: ["audio", "audio/flac"]
+  };
+  for (const [extension, [kind, contentType]] of Object.entries(formats)) {
+    const title = `片段 #1.${extension.toUpperCase()}`, target = path.join(f.root, title);
+    fs.writeFileSync(target, "media bytes");
+    assert.deepEqual(mediaType(target), { kind, contentType });
+    assert.deepEqual(mediaType(`https://media.example/${encodeURIComponent(title)}?token=fixture#fragment`), { kind, contentType });
+    const grant = f.registry.register({ target });
+    const open = await fetch(`${f.origin}/_open/${grant.id}`, { redirect: "manual" });
+    assert.equal(open.status, 302);
+    assert.equal(open.headers.get("location"), `/__file/${grant.id}/${encodeURIComponent(`${grant.id}--${title}`)}`);
+    const response = await fetch(new URL(open.headers.get("location"), f.origin));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), contentType);
+    assert.equal(await response.text(), "media bytes");
+  }
+  for (const target of ["report.md", "file.constructor", "file.toString", "https://example.com/%invalid.mp4"]) assert.equal(mediaType(target), null);
+  const document = path.join(f.root, "document.md"); fs.writeFileSync(document, "report");
+  const grant = f.registry.register({ target: document });
+  assert.equal((await fetch(`${f.origin}/__file/${grant.id}/${encodeURIComponent("片段 #1.M4A")}`)).status, 403);
+  const allowedWav = await fetch(`${f.origin}/__file/${grant.id}/${encodeURIComponent("片段 #1.WAV")}`);
+  assert.equal(allowedWav.status, 200); assert.equal(allowedWav.headers.get("content-type"), "audio/wav");
+});
+
+test("authenticated same-origin media supports GET, HEAD, ranges and matching validators", async (t) => {
+  const server = await startTestServer({ sessionManager: { stats: () => ({}) } }); t.after(() => server.close());
+  server.runtime.previewGatewayReady = true;
+  const target = path.join(server.rootDir, "手机 视频.mp4"); fs.writeFileSync(target, "0123456789");
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const headers = { cookie: cookies, origin: server.baseUrl };
+  const created = await fetch(`${server.baseUrl}/api/previews`, { method: "POST", headers, body: JSON.stringify({ target }) });
+  assert.equal(created.status, 201);
+  const grant = await created.json();
+  assert.deepEqual(grant.media, { kind: "video", contentType: "video/mp4", url: `/api/previews/${grant.id}/media` });
+  const endpoint = new URL(grant.media.url, server.baseUrl);
+  assert.equal((await fetch(endpoint)).status, 401);
+  assert.equal((await fetch(endpoint, { method: "HEAD" })).status, 401);
+  assert.equal((await fetch(endpoint, { headers: { ...headers, origin: "https://wrong.example" } })).status, 403);
+  const full = await fetch(endpoint, { headers });
+  assert.equal(full.status, 200); assert.equal(await full.text(), "0123456789");
+  assert.equal(full.headers.get("content-type"), "video/mp4");
+  assert.equal(full.headers.get("content-length"), "10");
+  assert.equal(full.headers.get("accept-ranges"), "bytes");
+  assert.equal(full.headers.get("x-content-type-options"), "nosniff");
+  const head = await fetch(endpoint, { method: "HEAD", headers });
+  assert.equal(head.status, 200); assert.equal(await head.text(), ""); assert.equal(head.headers.get("content-length"), "10");
+  for (const [range, body, contentRange] of [["bytes=0-3", "0123", "bytes 0-3/10"], ["bytes=5-", "56789", "bytes 5-9/10"], ["bytes=-3", "789", "bytes 7-9/10"], ["bytes=7-999", "789", "bytes 7-9/10"], ["bytes=-99", "0123456789", "bytes 0-9/10"]]) {
+    const response = await fetch(endpoint, { headers: { ...headers, range } });
+    assert.equal(response.status, 206, range); assert.equal(await response.text(), body);
+    assert.equal(response.headers.get("content-range"), contentRange);
+    assert.equal(response.headers.get("content-length"), String(body.length));
+  }
+  const rangedHead = await fetch(endpoint, { method: "HEAD", headers: { ...headers, range: "bytes=2-4" } });
+  assert.equal(rangedHead.status, 206); assert.equal(await rangedHead.text(), "");
+  assert.equal(rangedHead.headers.get("content-length"), "3"); assert.equal(rangedHead.headers.get("content-range"), "bytes 2-4/10");
+  for (const range of ["bytes=10-", "bytes=8-3", "bytes=-0", "bytes=-", "bytes=0-1,3-4", "items=0-3", "bytes=9007199254740992-", "bytes=0-9007199254740992", "bytes=-9007199254740992"]) {
+    const response = await fetch(endpoint, { headers: { ...headers, range } });
+    assert.equal(response.status, 416, range); assert.equal(response.headers.get("content-range"), "bytes */10");
+    assert.equal(response.headers.get("content-length"), "0"); assert.equal(await response.text(), "");
+  }
+  for (const ifRange of [full.headers.get("etag"), full.headers.get("last-modified")]) {
+    const response = await fetch(endpoint, { headers: { ...headers, range: "bytes=2-4", "if-range": ifRange } });
+    assert.equal(response.status, 206); assert.equal(await response.text(), "234");
+  }
+  for (const ifRange of ['"stale"', `W/${full.headers.get("etag")}`, "invalid date", "Thu, 01 Jan 1970 00:00:00 GMT", "Fri, 01 Jan 2100 00:00:00 GMT"]) {
+    const response = await fetch(endpoint, { headers: { ...headers, range: "bytes=2-4", "if-range": ifRange } });
+    assert.equal(response.status, 200, ifRange); assert.equal(await response.text(), "0123456789");
+    assert.equal(response.headers.get("content-range"), null);
+  }
+  const unchanged = await fetch(endpoint, { headers: { ...headers, "if-none-match": full.headers.get("etag") } });
+  assert.equal(unchanged.status, 304); assert.equal(await unchanged.text(), "");
+  const empty = path.join(server.rootDir, "empty.wav"); fs.writeFileSync(empty, "");
+  const emptyGrant = server.runtime.previewRegistry.register({ target: empty });
+  const emptyUrl = `${server.baseUrl}/api/previews/${emptyGrant.id}/media`;
+  const emptyResponse = await fetch(emptyUrl, { headers });
+  assert.equal(emptyResponse.status, 200); assert.equal(emptyResponse.headers.get("content-length"), "0"); assert.equal(await emptyResponse.text(), "");
+  const emptyRange = await fetch(emptyUrl, { headers: { ...headers, range: "bytes=0-" } });
+  assert.equal(emptyRange.status, 416); assert.equal(emptyRange.headers.get("content-range"), "bytes */0");
+});
+
+test("media requests enforce grant lifetime, file type and protected path boundaries", async (t) => {
+  const server = await startTestServer({ sessionManager: { stats: () => ({}) } }); t.after(() => server.close());
+  server.runtime.previewGatewayReady = true;
+  const { cookies } = await login(server.baseUrl, server.config.accessToken);
+  const headers = { cookie: cookies, origin: server.baseUrl };
+  const registry = server.runtime.previewRegistry = new PreviewRegistry(server.config);
+  const endpoint = `${server.baseUrl}/api/previews`;
+  const getMedia = (id, options = {}) => fetch(`${endpoint}/${id}/media`, { headers, ...options });
+  assert.equal((await getMedia("invalid")).status, 404);
+  assert.equal((await getMedia("z".repeat(32))).status, 410);
+  assert.equal((await fetch(`${endpoint}/media?path=/tmp/file.mp4`, { headers })).status, 404);
+  const document = path.join(server.rootDir, "notes.txt"); fs.writeFileSync(document, "private text");
+  const documentGrant = registry.register({ target: document });
+  assert.equal((await getMedia(documentGrant.id)).status, 403);
+  const serviceGrant = registry.register({ target: "http://localhost:5173/movie.mp4" });
+  assert.equal((await getMedia(serviceGrant.id)).status, 403);
+  const movie = path.join(server.rootDir, "movie.mp4"); fs.writeFileSync(movie, "media");
+  const expired = registry.register({ target: movie }); expired.expiresAt = Date.now() - 1;
+  assert.equal((await getMedia(expired.id)).status, 410);
+  const revoked = registry.register({ target: movie });
+  assert.equal((await fetch(`${endpoint}/${revoked.id}`, { method: "DELETE", headers })).status, 200);
+  assert.equal((await getMedia(revoked.id)).status, 410);
+  const mediaDir = path.join(server.rootDir, "media"); fs.mkdirSync(mediaDir);
+  const secrets = path.join(server.rootDir, ".ssh"); fs.mkdirSync(secrets);
+  const protectedTargets = [path.join(secrets, "recording.mp4"), path.join(server.config.dataDir, "internal.mp4"), path.join(server.rootDir, "outside.mp4")];
+  for (const [index, protectedTarget] of protectedTargets.entries()) {
+    fs.writeFileSync(protectedTarget, "secret");
+    const selected = path.join(mediaDir, `selected-${index}.mp4`); fs.writeFileSync(selected, "media");
+    const grant = registry.register({ target: selected });
+    fs.unlinkSync(selected); fs.symlinkSync(protectedTarget, selected);
+    assert.equal((await getMedia(grant.id)).status, 403, protectedTarget);
+  }
+  for (const target of protectedTargets.slice(0, 2)) {
+    const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ target }) });
+    assert.equal(response.status, 403);
+  }
+  const removed = registry.register({ target: movie }); fs.unlinkSync(movie);
+  assert.equal((await getMedia(removed.id)).status, 404);
 });
 
 test("service preview proxies paths, JSON APIs, redirects and websocket without chat credentials", async (t) => {

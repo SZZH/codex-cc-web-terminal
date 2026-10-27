@@ -2,6 +2,7 @@ import MarkdownIt from "markdown-it";
 import { codeHighlighter } from "./code-highlighting.js";
 import { configureMarkdownImages } from "./markdown-images.js";
 import { configureMarkdownLinks } from "./markdown-links.js";
+import { configureMarkdownMedia } from "./markdown-media.js";
 
 const MAX_FENCE_ENTRIES = 8;
 const MAX_FENCE_STRING_BYTES = 256 * 1024;
@@ -83,7 +84,7 @@ export function createThreadItemMarkdown({ getCwd = () => "", highlighter = code
     return html;
   }
   let md;
-  function renderMarkdown(body) {
+  function renderMarkdown(body, env = {}) {
     if (!md) {
       md = new MarkdownIt({
         html: false,
@@ -100,8 +101,10 @@ export function createThreadItemMarkdown({ getCwd = () => "", highlighter = code
         `${renderer.renderToken(tokens, index, options)}</div>\n`;
       configureMarkdownImages(md);
       configureMarkdownLinks(md, { getCwd });
+      configureMarkdownMedia(md, { getCwd });
     }
-    return md.render(body);
+    const html = md.render(body, env);
+    return env.media?.length ? html.replace(/<p>\s*<\/p>/g, "") : html;
   }
   return { renderMarkdown, renderCodeFence, clearFenceCache };
 }
