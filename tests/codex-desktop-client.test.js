@@ -95,7 +95,14 @@ test("native async replies recheck owner and return the actual desktop receipt",
   const f = await fixture(t);
   const owner = await f.client.discover("thread");
   const input = answer("选项一");
-  const result = await f.client.steer("thread", { owner, clientUserMessageId: "reply-one", input, expectedTurnId: "previous-turn" });
+  let checked = 0;
+  const result = await f.client.steer("thread", { owner, clientUserMessageId: "reply-one", input, expectedTurnId: "previous-turn",
+    beforeSend: async () => {
+      checked++;
+      assert.equal(f.requests.filter((request) => request.method === "thread-owner-discovery").length, 2);
+      return true;
+    } });
+  assert.equal(checked, 1);
   assert.deepEqual(result, { turnId: "active-turn" });
   assert.equal(f.requests.filter((r) => r.method === "thread-owner-discovery").length, 2);
   const sent = f.requests.at(-1);
@@ -107,6 +114,24 @@ test("native async replies recheck owner and return the actual desktop receipt",
   assert.equal(sent.params.restoreMessage.context.turnTrigger, "send_user_message_async_question");
   assert.equal("expectedTurnId" in sent.params, false, "the private API has no atomic expected-turn parameter");
   assert.equal("hostId" in sent, false, "local follower requests use version 1 without envelope hostId");
+});
+
+test("native question replies stop before mutation when final validation rejects after owner discovery", unix, async (t) => {
+  for (const rejected of [false, true]) await t.test(rejected ? "validation error" : "changed receipt", async (t) => {
+    const f = await fixture(t);
+    const owner = await f.client.discover("thread");
+    let checked = 0;
+    await assert.rejects(f.client.steer("thread", { owner, clientUserMessageId: "reply-one", input: answer(), expectedTurnId: "active-turn",
+      beforeSend: async () => {
+        checked++;
+        assert.equal(f.requests.filter((request) => request.method === "thread-owner-discovery").length, 2);
+        await new Promise((resolve) => setImmediate(resolve));
+        if (rejected) throw Object.assign(new Error("Question source completed during discovery"), { code: "question_turn_changed" });
+        return false;
+      } }), { code: rejected ? "question_turn_changed" : "CODEX_DESKTOP_TURN_CHANGED" });
+    assert.equal(checked, 1);
+    assert.equal(f.requests.some((request) => request.method.startsWith("thread-follower-")), false);
+  });
 });
 
 test("desktop interruption uses v4 with an explicit target and a fresh owner", unix, async (t) => {

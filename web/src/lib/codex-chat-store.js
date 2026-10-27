@@ -68,7 +68,7 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
     threadId, thread: null, turns: {}, turnOrder: [], requests: {}, requestOrder: [], submittedRequestIds: [],
     draft: { text: "", attachments: [] }, epoch: "", seq: 0, revision: 0, presentationRevision: 0,
     connection: "offline", olderCursor: null, hasMore: false, initialized: false, initialHistoryTurnId: "",
-    loading: false, submitting: false, interrupting: false, error: "", historyReadError: "", persistenceError: "",
+    loading: false, submitting: false, interrupting: false, error: "", historyReadError: "", questionSyncError: "", persistenceError: "",
     requestListReady: false, requestListError: "", interactionState: interactions.state
   });
   try {
@@ -123,6 +123,14 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
     return !read || (read.epochGeneration === epochGeneration && (revisions.get(key) || 0) <= read.revision);
   }
   function setDraft(draft) { state.draft = { ...state.draft, ...draft }; touch(undefined, { presentation: false }); persist(); }
+  function updateQuestionHistory(turnId, { questionSync, questionItems }) {
+    const turn = state.turns[turnId];
+    if (!turn) return;
+    Object.assign(turn, copy({ questionSync, questionItems }));
+    // Derived attention state must never invalidate an in-flight authority read
+    // of the turn lifecycle or replace its timeline items/order.
+    touch(`question:${turnId}`);
+  }
   function upsertThread(thread, read) {
     if (!thread || thread.id !== threadId) return;
     const metadataCurrent = canApply("thread", read);
@@ -425,7 +433,7 @@ export function createCodexChatStore(threadId, { storage = null, reactive = (val
       (event.type === "turn.upsert" && isCodexTerminal(payload.turn?.status)) ||
       (event.type === "request.updated" && isCodexTerminal(payload.request?.state)) };
   }
-  return { state, storageKey, beginRead, setDraft, persist, upsertThread, upsertTurn, upsertItem,
+  return { state, storageKey, beginRead, setDraft, persist, upsertThread, upsertTurn, upsertItem, updateQuestionHistory,
     applyTurnsPage, applyItemsPage, applyLatestItemsPage, applyEarlierItemsPage, applyInitialHistory,
     upsertRequest, queueRequest, beginSocket, applyEvent, interactions };
 }

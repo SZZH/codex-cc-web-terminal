@@ -120,13 +120,13 @@ export class CodexDesktopClient {
     return cancellable(pending, signal);
   }
 
-  async steer(threadId, { owner, clientUserMessageId, input, expectedTurnId } = {}) {
+  async steer(threadId, { owner, clientUserMessageId, input, expectedTurnId, beforeSend } = {}) {
     if (expectedTurnId != null && (typeof expectedTurnId !== "string" || !expectedTurnId)) {
       throw failure("CODEX_DESKTOP_INVALID_REPLY", "A stable reply identity is required.");
     }
     // The follower API chooses its active turn and has no atomic expected-turn
     // guard. Return the actual receipt without retrying a different turn.
-    return this.#answer(threadId, { owner, clientUserMessageId, input }, false);
+    return this.#answer(threadId, { owner, clientUserMessageId, input, beforeSend }, false);
   }
 
   async steerMessage(threadId, { owner, clientUserMessageId, input, beforeSend } = {}) {

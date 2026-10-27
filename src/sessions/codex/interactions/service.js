@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { INTERACTION_METHODS, capabilityError, validateInteractionParams, validateInteractionResponse } from "./responses.js";
 import { canonical, dangerousKey, fields, invalid, object, safeObject } from "./validation.js";
+import { latestActivityTimestamp } from "../../history/sessionActivity.js";
 
 const terminal = new Set(["resolved", "unavailable"]);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -133,6 +134,21 @@ export class CodexInteractionService {
     if (!record || terminal.has(record.public.status)) return;
     record.request = null;
     this.update(record, { status, error });
+  }
+
+  reconcileTurns(threadId, turns) {
+    if (this.closed) return;
+    const completed = new Set(turns.filter((turn) =>
+      typeof turn.id === "string" && turn.id && (turn.threadId == null || turn.threadId === threadId)
+      && turn.statusConfirmed !== false && turn.statusSource !== "unconfirmed-history"
+      && (["completed", "failed"].includes(turn.status)
+        || ["interrupted", "aborted", "cancelled"].includes(turn.status) && latestActivityTimestamp(turn.completedAt)))
+      .map((turn) => turn.id));
+    // A terminal history read proves the callback is obsolete, not that its answer was received.
+    for (const record of this.records.values()) {
+      if (record.public.threadId !== threadId || !completed.has(record.public.turnId) || terminal.has(record.public.status)) continue;
+      this.bridge.inbound?.invalidateRequest(record.request, "turn_completed");
+    }
   }
 
   evidenceKey({ threadId, turnId, itemId }) { return JSON.stringify([threadId, turnId, itemId]); }

@@ -8,6 +8,7 @@ import { createCodexChatRuntime } from "../web/src/lib/codex-chat-runtime.js";
 import { codexRequestLabel, presentCodexChatSnapshot, presentCodexQueue } from "../web/src/lib/codex-chat-presentation.js";
 import { buildThreadViewModel } from "../web/src/lib/thread-view-model.js";
 import { buildQuestionAnswer } from "../web/src/lib/codex-question-history.js";
+import { pendingDesktopQuestions } from "../web/src/lib/codex-question-dock.js";
 
 function deferred() {
   let resolve, reject;
@@ -57,9 +58,19 @@ function fixture(handler, options = {}) {
   return { store, runtime, calls, sockets, storage };
 }
 const requestBody = { input: { text: "same", attachments: [] }, options: { model: "test", reasoningEffort: "high", permissionMode: "default" } };
+function completeItemsPage(url, source = []) {
+  const parsed = new URL(url, "https://example.test");
+  const match = parsed.pathname.match(/\/threads\/([^/]+)\/turns\/([^/]+)\/items$/);
+  assert.ok(match, "item fixtures require a thread and turn identity");
+  const after = parsed.searchParams.get("after");
+  const index = after ? source.findIndex((item) => item.id === after) : -1;
+  const items = after ? index < 0 ? [] : source.slice(index + 1) : source;
+  return { threadId: decodeURIComponent(match[1]), turnId: decodeURIComponent(match[2]), items,
+    hasMore: false, nextCursor: null, latestItemId: items.at(-1)?.id || after || null };
+}
 function reads(url) {
   if (url.endsWith("/interactions")) return { interactions: [], epoch: "interactions", revision: 0 };
-  if (url.includes("/items?")) return { items: [], hasMore: false };
+  if (url.includes("/items?")) return completeItemsPage(url);
   if (url.endsWith("/requests")) return { requests: [] };
   if (url.includes("/turns?")) return { threadId: "thread", turns: [], hasMore: false };
   return { thread: { id: "thread", name: "title", cwd: "/tmp" } };
@@ -959,12 +970,17 @@ test("expanding during a pending latest-window read keeps older history deferred
 
 test("latest-window increments follow every forward page without traversing older items or losing a gap", async () => {
   const source = Array.from({ length: 105 }, (_, position) => ({ id: `item-${position}`, type: "agentMessage", position, text: `answer ${position}` }));
-  const pages = [];
+  const pages = [], questionPages = [];
   let advanced = false;
   const { runtime, store } = fixture((url) => {
     if (url.includes("/turns?")) return { turns: [{ id: "turn", status: "inProgress", items: [source[0]] }] };
     if (url.includes("/items?")) {
       const query = new URL(url, "https://example.test").searchParams;
+      if (query.get("limit") === "90") {
+        questionPages.push(query);
+        return completeItemsPage(url, source.slice(0, 70));
+      }
+      assert.equal(query.get("limit"), "30");
       pages.push(query);
       if (query.get("sortDirection") === "desc") return { items: source.slice(40, 70), nextCursor: "older-window", hasMore: true, latestItemId: "item-69" };
       if (query.get("cursor") === "forward-100") return { items: source.slice(100), hasMore: false, latestItemId: "item-104" };
@@ -978,6 +994,9 @@ test("latest-window increments follow every forward page without traversing olde
   try {
     await runtime.open(); await flush();
     assert.equal(pages.length, 1);
+    assert.equal(questionPages.length, 1, "question reconciliation uses one independent bounded page");
+    assert.equal(questionPages[0].has("after"), false, "questions are scanned from the turn beginning");
+    assert.equal(questionPages[0].has("sortDirection"), false);
     advanced = true;
     await runtime.syncItems("turn", { automatic: true });
     assert.equal(pages.length, 3);
@@ -991,6 +1010,7 @@ test("latest-window increments follow every forward page without traversing olde
     await runtime.syncItems("turn", { automatic: true });
     assert.equal(pages.at(-1).get("after"), "item-104");
     assert.equal(pages.some((query) => query.get("cursor") === "older-window"), false);
+    assert.equal(questionPages.length, 1, "timeline hydration does not repeatedly restart question scans");
     assert.deepEqual(store.state.turns.turn.itemOrder, [source[0], ...source.slice(40)].map((item) => item.id));
   } finally { runtime.dispose(); }
 });
@@ -4729,6 +4749,79 @@ function desktopQuestionItem(callId = "call_mobile_question", extra = {}) {
   } } };
 }
 
+test("opening and polling reconcile hidden middle questions without exposing already accepted replies", { timeout: 5000 }, async () => {
+  const source = Array.from({ length: 130 }, (_, position) => ({
+    id: `item-${position}`, type: "commandExecution", position, command: `read ${position}`
+  }));
+  const answered = { ...desktopQuestionItem("call_hidden_answered"), position: 40 };
+  const unanswered = { ...desktopQuestionItem("call_hidden_unanswered"), position: 55 };
+  source[0] = { id: "initial-user", type: "userMessage", position: 0, text: "Continue this task" };
+  source[40] = answered;
+  source[55] = unanswered;
+  source[95] = { id: "accepted-hidden-answer", type: "steeringUserMessage", status: "accepted", position: 95,
+    input: [{ type: "text", text: buildQuestionAnswer(answered.presentation.question, 0, "Keep going") }] };
+  source[129] = { id: "item-129", type: "agentMessage", position: 129, text: "Still working" };
+  const remainder = deferred(), readingRemainder = deferred(), scanPages = [], scanSizes = [];
+  let scanReaders = 0, maximumScanReaders = 0;
+  const { runtime, store, calls } = fixture((url) => {
+    if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: true } } };
+    if (url.includes("/turns?")) return { threadId: "thread", turns: [{ id: "active", status: "inProgress",
+      items: [source[0], source.at(-1)], hasMoreItems: true }], hasMore: false };
+    if (url.includes("/items?")) {
+      const query = new URL(url, "https://example.test").searchParams;
+      if (query.get("limit") === "90") {
+        scanPages.push(query);
+        maximumScanReaders = Math.max(maximumScanReaders, ++scanReaders);
+        let page;
+        if (query.get("cursor") === "question-rest") { readingRemainder.resolve(); page = remainder.promise; }
+        else if (query.has("after")) page = completeItemsPage(url, source);
+        else page = { ...completeItemsPage(url, source.slice(0, 90)), hasMore: true, nextCursor: "question-rest" };
+        return Promise.resolve(page).then((value) => {
+          scanSizes.push(value.items.length);
+          assert.ok(value.items.length <= 90);
+          return value;
+        }).finally(() => { scanReaders--; });
+      }
+      assert.equal(query.get("limit"), "30");
+      if (query.get("sortDirection") === "desc") return {
+        ...completeItemsPage(url, source.slice(-30)), hasMore: true, nextCursor: "older-timeline"
+      };
+      assert.ok(query.has("after"), "the timeline only follows its latest window");
+      return completeItemsPage(url, source);
+    }
+    return reads(url);
+  }, { runtime: { yieldPage: async () => {} } });
+  try {
+    await runtime.open();
+    await readingRemainder.promise;
+    assert.equal(store.state.loading, false, "opening the timeline does not await the question scan");
+    assert.equal(store.state.turns.active.itemsLatestLoaded, true);
+    assert.equal(store.state.turns.active.items[unanswered.id], undefined, "the middle is outside the loaded timeline");
+    assert.equal(store.state.turns.active.questionSync.ready, false);
+    assert.deepEqual(pendingDesktopQuestions(store.state), [], "incomplete evidence cannot expose a question answered on the next page");
+    remainder.resolve(completeItemsPage("/api/v2/codex/threads/thread/turns/active/items?cursor=question-rest", source.slice(90)));
+    await new Promise((resolve) => setImmediate(resolve)); await flush();
+    assert.equal(store.state.turns.active.questionSync.ready, true);
+    assert.equal(store.state.questionSyncError, "");
+    assert.deepEqual(pendingDesktopQuestions(store.state).map((question) => question.callId), [unanswered.id]);
+    assert.equal(store.state.turns.active.items[answered.id], undefined, "question evidence does not expand the timeline window");
+    assert.equal(store.state.turns.active.items[unanswered.id], undefined);
+    assert.deepEqual(scanSizes, [90, 40]);
+
+    source.push({ id: "accepted-last-question", type: "steeringUserMessage", status: "accepted", position: 130,
+      input: [{ type: "text", text: buildQuestionAnswer(unanswered.presentation.question, 0, "Pause") }] });
+    await runtime.pollRequests();
+    await new Promise((resolve) => setImmediate(resolve)); await flush();
+    assert.deepEqual(pendingDesktopQuestions(store.state), [], "polling removes the remaining question after its official accepted answer");
+    assert.deepEqual(scanPages.map((query) => query.get("cursor")), [null, "question-rest", null]);
+    assert.deepEqual(scanPages.map((query) => query.get("after")), [null, null, "item-129"]);
+    assert.deepEqual(scanSizes, [90, 40, 1]);
+    assert.equal(maximumScanReaders, 1, "question pages remain serial and bounded");
+    assert.ok(scanPages.every((query) => query.get("limit") === "90" && !query.has("sortDirection")));
+    assert.equal(calls.some((call) => call.method === "POST"), false);
+  } finally { runtime.dispose(); remainder.resolve({}); }
+});
+
 test("floating question stays outside scrolling history, preserves a folded draft and answers a windowed item", async () => {
   const response = deferred();
   const harness = await mountThreadView({ runtime: { maxPolls: 0, newId: () => "floating-answer" }, request: (url) => {
@@ -4769,13 +4862,22 @@ test("floating question stays outside scrolling history, preserves a folded draf
 });
 
 test("a new pending question reopens the floating reminder and changing threads clears it", async () => {
+  const source = [desktopQuestionItem()];
   const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
-    if (url.includes("/threads/thread/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [desktopQuestionItem()] }] };
+    if (url.includes("/threads/thread/turns?")) return { turns: [{ id: "active", status: "inProgress", items: source }] };
+    if (url.includes("/threads/thread/turns/active/items?")) return completeItemsPage(url, source);
   } });
   const dock = () => elements(harness.root, (node) => node.props?.["aria-label"] === "Codex 悬浮提问")[0];
   try {
     elements(dock(), (node) => node.props?.["aria-label"] === "收起提问")[0].props.onClick(); await flush();
-    harness.store.upsertItem("active", desktopQuestionItem("call_second")); await flush();
+    source.push(desktopQuestionItem("call_second"));
+    harness.store.upsertItem("active", source[1]); await flush();
+    assert.match(nodeText(dock()), /1 个问题等你回答/);
+    assert.equal(harness.chat.props.attentionExpanded, false, "an unverified new item cannot reopen the reminder");
+    await harness.runtime.pollRequests(); await flush();
+    assert.ok(harness.calls.some(({ url }) => url.includes("/items?") &&
+      new URL(url, "https://example.test").searchParams.get("limit") === "90" &&
+      new URL(url, "https://example.test").searchParams.get("after") === source[0].id), "the new question passes incremental history reconciliation");
     assert.match(nodeText(dock()), /2 个问题等你回答/);
     assert.equal(elements(dock(), (node) => node.props?.["aria-label"] === "收起提问").length, 1);
     harness.switchThread("other"); await flush();
@@ -4812,7 +4914,7 @@ for (const initialCapability of [false, undefined]) test(`ended questions do not
   const { runtime, store, calls } = fixture((url) => {
     if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: initialCapability } } };
     if (url.includes("/turns?")) return { turns: [{ id: "ended", status: "completed", items: [question], hasMoreItems: false }] };
-    if (url.includes("/items?")) return { items: [question], hasMore: false };
+    if (url.includes("/items?")) return completeItemsPage(url, [question]);
     return reads(url);
   }, { runtime: { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   try {
@@ -4838,7 +4940,7 @@ test("active question capability failures retry while lifecycle reads continue",
       return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: metadataReads > failAt, desktopInterrupt: true } } };
     }
     if (url.includes("/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [question], hasMoreItems: false }] };
-    if (url.includes("/items?")) return { items: [question], hasMore: false };
+    if (url.includes("/items?")) return completeItemsPage(url, [question]);
     return reads(url);
   }, { runtime: { pollMs: 10000, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   try {
@@ -4868,7 +4970,7 @@ test("returning to the foreground immediately rechecks an unavailable question c
   const { runtime, store } = fixture((url) => {
     if (url.endsWith("/threads/thread")) { metadataReads += 1; return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: available } } }; }
     if (url.includes("/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [question], hasMoreItems: false }] };
-    if (url.includes("/items?")) return { items: [question], hasMore: false };
+    if (url.includes("/items?")) return completeItemsPage(url, [question]);
     return reads(url);
   }, { runtime: { visibility, pollMs: 10000, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   try {
@@ -4892,7 +4994,7 @@ test("hidden question capability probes retain the thirty-second floor and ignor
       return metadataReads > 1 ? pending.promise : { thread: { id: "thread", capabilities: { desktopQuestionAnswers: false } } };
     }
     if (url.includes("/turns?")) return { turns: [{ id: "active", status: "inProgress", items: [question], hasMoreItems: false }] };
-    if (url.includes("/items?")) return { items: [question], hasMore: false };
+    if (url.includes("/items?")) return completeItemsPage(url, [question]);
     return reads(url);
   }, { runtime: { visibility: { hidden: true }, pollMs: 10000, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   await runtime.open(); sockets[0].onopen(); await flush();
@@ -4913,7 +5015,7 @@ test("answered desktop questions do not keep an otherwise idle capability probe 
   const { runtime, calls } = fixture((url) => {
     if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: false } } };
     if (url.includes("/turns?")) return { turns: [{ id: "ended", status: "completed", items: [question, answered], hasMoreItems: false }] };
-    if (url.includes("/items?")) return { items: [question, answered], hasMore: false };
+    if (url.includes("/items?")) return completeItemsPage(url, [question, answered]);
     return reads(url);
   }, { runtime: { now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, maxPolls: Infinity } });
   try {
@@ -5421,7 +5523,7 @@ for (const source of ["socket", "http", "next-turn"]) test(`desktop question clo
   const harness = await mountThreadView({ runtime: { maxPolls: 0 }, request: (url) => {
     if (url.endsWith("/threads/thread")) return { thread: { id: "thread", capabilities: { desktopQuestionAnswers: true } } };
     if (url.includes("/turns?")) return { turns: [{ id: latestId, status, items: latestId === "active" ? [question] : [] }], hasMore: false };
-    if (url.includes("/items?")) return { items: latestId === "active" ? [question] : [], hasMore: false };
+    if (url.includes("/items?")) return completeItemsPage(url, url.includes("/turns/active/") ? [question] : []);
   } });
   const dock = () => elements(harness.root, (node) => node.props?.["aria-label"] === "Codex 悬浮提问")[0];
   try {

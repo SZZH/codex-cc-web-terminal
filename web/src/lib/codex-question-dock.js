@@ -10,7 +10,7 @@ export function pendingDesktopQuestions(state) {
   for (const turnId of state.turnOrder) {
     const turn = state.turns[turnId];
     if (!turn) continue;
-    for (const item of Object.values(turn.items)) {
+    for (const item of Object.values({ ...turn.questionItems, ...turn.items })) {
       const source = item.presentation?.question;
       if (source?.source !== "desktop" || source.delivery !== "async" || !source.callId || seen.has(source.callId)) continue;
       seen.add(source.callId);

@@ -9,6 +9,7 @@ import { presentCodexItem } from "../src/sessions/codex/itemPresentation.js";
 
 const body = { clientRequestId: "answer-request-1", expectedTurnId: "turn-1", index: 0, answer: "茶" };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+const noWrites = (f) => assert.deepEqual([f.sends.length, f.starts.length, f.rpc.length], [0, 0, 0]);
 function fixture(t, options = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-question-"));
   const sends = [], starts = [], rpc = [];
@@ -23,7 +24,12 @@ function fixture(t, options = {}) {
   };
   const desktopClient = { discover: async () => owner, shutdown() {},
     startQuestion: async (...args) => { starts.push(args); return { turnId: "new-turn" }; },
-    steer: async (...args) => { sends.push(args); return options.steer ? options.steer(...args) : { turnId: "turn-1" }; }, ...options.client };
+    steer: async (...args) => {
+      await options.beforeSteer?.(...args);
+      if (args[1].beforeSend && !await args[1].beforeSend()) throw new Error("Answer state changed before native write");
+      sends.push(args);
+      return options.steer ? options.steer(...args) : { turnId: "turn-1" };
+    }, ...options.client };
   const service = new CodexThreadService({ config: { dataDir }, bridge, reader, desktopClient,
     sessionManager: {}, recoveryMs: 60_000 });
   t.after(() => { service.shutdown(); fs.rmSync(dataDir, { recursive: true, force: true }); });
@@ -189,15 +195,91 @@ test("desktop owner turn changes are reported using the returned actual turn, wi
   assert.equal(receipt.turnId, "turn-2");
 });
 
-test("an unanswered question in a completed turn starts a native continuation instead of entering the queue", async (t) => {
-  const f = fixture(t, { reader: { listTurns: async () => ({ turns: [{ id: "turn-1", status: "completed" }], hasMore: false }) } });
+test("a delayed answer arriving after its source turn ends never starts a continuation", async (t) => {
+  for (const status of ["completed", "failed", "interrupted", "aborted", "unknown"]) await t.test(status, async (t) => {
+    const f = fixture(t, { reader: { listTurns: async () => ({ turns: [{ id: "turn-1", status }], hasMore: false }) } });
+    await assert.rejects(f.respond(), { code: "question_turn_changed", status: 409 });
+    noWrites(f);
+    assert.equal(f.service.requests.list("thread-1").length, 0);
+  });
+});
+
+test("an old question cannot steer a newer active turn or start after a newer completed turn", async (t) => {
+  for (const status of ["inProgress", "running", "completed"]) await t.test(status, async (t) => {
+    const f = fixture(t, { reader: { listTurns: async () => ({ turns: [
+      { id: "turn-1", status: "completed" }, { id: "turn-2", status }
+    ], hasMore: false }) } });
+    await assert.rejects(f.respond(), { code: "question_turn_changed" });
+    noWrites(f);
+    assert.equal(f.service.requests.list("thread-1").length, 0);
+  });
+});
+
+test("completion during asynchronous owner, question or answer validation rejects the delayed answer", async (t) => {
+  for (const boundary of ["owner", "question", "answers"]) await t.test(boundary, async (t) => {
+    let status = "inProgress", release, entered;
+    const reached = new Promise((resolve) => { entered = resolve; });
+    const hold = () => new Promise((resolve) => { release = resolve; entered(); });
+    const f = fixture(t, { reader: { listTurns: async () => ({ turns: [{ id: "turn-1", status }] }) } });
+    const target = boundary === "owner" ? f.desktopClient : f.reader;
+    const method = boundary === "owner" ? "discover" : boundary === "question" ? "rawItem" : "listItems";
+    const read = target[method];
+    target[method] = async (...args) => { await hold(); return read(...args); };
+    const pending = f.respond();
+    await reached;
+    status = "completed";
+    release();
+    await assert.rejects(pending, { code: "question_turn_changed" });
+    noWrites(f);
+    assert.equal(f.service.requests.list("thread-1").length, 0);
+  });
+});
+
+test("receipt persistence and native owner discovery cannot bypass the final source-turn check", async (t) => {
+  for (const boundary of ["receipt", "owner"]) for (const successor of [false, true]) {
+    await t.test(`${boundary}: ${successor ? "newer active turn" : "source completed"}`, async (t) => {
+      let current = { id: "turn-1", status: "inProgress" };
+      const transition = () => { current = successor ? { id: "turn-2", status: "inProgress" } : { id: "turn-1", status: "completed" }; };
+      const f = fixture(t, { reader: { listTurns: async () => ({ turns: [current] }) },
+        beforeSteer: boundary === "owner" ? async () => { await tick(); transition(); } : undefined });
+      const update = f.service.desktopQuestions.update;
+      f.service.desktopQuestions.update = (...args) => {
+        const receipt = update(...args);
+        if (boundary === "receipt" && args[2].state === "dispatching") transition();
+        return receipt;
+      };
+      await f.respond(); await tick(); await tick();
+      noWrites(f);
+      const receipt = f.service.requests.get("thread-1", body.clientRequestId);
+      assert.equal(receipt.state, "rejected");
+      assert.equal(receipt.error.code, "question_turn_changed");
+    });
+  }
+});
+
+test("accepted and uncertain answers replay their existing receipts after the source ends", async (t) => {
+  for (const uncertain of [false, true]) await t.test(uncertain ? "unknown" : "accepted", async (t) => {
+    const f = fixture(t, { steer: async () => {
+      if (uncertain) throw Object.assign(new Error("lost reply"), { uncertain: true });
+      return { turnId: "turn-1" };
+    } });
+    await f.respond(); await tick();
+    const saved = f.service.requests.get("thread-1", body.clientRequestId);
+    assert.equal(saved.state, uncertain ? "unknown" : "accepted");
+    f.reader.listTurns = async () => { throw new Error("Receipt replay must not revalidate the ended source"); };
+    assert.deepEqual(await f.respond(), saved);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.starts.length + f.rpc.length, 0);
+    await assert.rejects(f.respond({ clientRequestId: "answer-request-2" }), { code: "question_answer_conflict" });
+  });
+});
+
+test("a receipt made unknown before native dispatch remains locked for recovery", async (t) => {
+  const f = fixture(t, { beforeSteer: () => f.service.handleDisconnect() });
   await f.respond(); await tick();
-  assert.equal(f.sends.length, 0);
-  assert.equal(f.starts.length, 1);
-  assert.equal(f.rpc.length, 0);
-  const receipt = f.service.requests.get("thread-1", body.clientRequestId);
-  assert.equal(receipt.state, "accepted");
-  assert.equal(receipt.turnId, "new-turn");
+  assert.equal(f.service.requests.get("thread-1", body.clientRequestId).state, "unknown");
+  await f.respond();
+  noWrites(f);
 });
 
 test("a question answered in a later turn is not re-submitted from an old card", async (t) => {
@@ -211,7 +293,7 @@ test("a question answered in a later turn is not re-submitted from an old card",
 
 test("a new turn appearing after the answer-history check invalidates the scanned range", async (t) => {
   let reads = 0;
-  const f = fixture(t, { reader: { listTurns: async () => ({ turns: [{ id: ++reads === 1 ? "turn-1" : "answered-later", status: "completed" }], hasMore: false }) } });
+  const f = fixture(t, { reader: { listTurns: async () => ({ turns: [{ id: ++reads === 1 ? "turn-1" : "answered-later", status: "inProgress" }], hasMore: false }) } });
   await assert.rejects(f.respond(), { code: "question_history_changed" });
   assert.equal(f.sends.length + f.starts.length, 0);
 });

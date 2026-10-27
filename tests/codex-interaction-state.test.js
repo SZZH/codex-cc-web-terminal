@@ -54,6 +54,65 @@ test("the first websocket epoch invalidates an HTTP snapshot started before its 
   assert.equal(store.state.interactions.current.status, "pending");
 });
 
+test("interaction read identities survive current snapshots but expire on removal and handle reuse", () => {
+  const store = createCodexInteractionState("thread");
+  store.applySnapshot(envelope([interaction()]));
+  const old = store.beginRead("one");
+  store.applySnapshot(envelope([interaction()], 2));
+  assert.equal(store.isReadCurrent(old), true);
+  store.applySnapshot(envelope([], 3));
+  assert.equal(store.isReadCurrent(old), false);
+  assert.equal(store.state.interactions.one.status, "unavailable");
+  assert.equal(store.applyUpdate({ interaction: interaction("one", { status: "submitted", version: 8 }), epoch: "registry", revision: 8 }, old), false);
+  store.applySnapshot(envelope([interaction()], 4));
+  assert.equal(store.state.interactions.one.status, "unavailable");
+  store.applySnapshot(envelope([], 5));
+  store.applySnapshot(envelope([interaction("one", { itemId: "replacement-item" })], 6));
+  assert.equal(store.isReadCurrent(old), false);
+  assert.equal(store.isReadCurrent(store.beginRead("one")), true);
+  assert.equal(store.state.interactions.one.itemId, "replacement-item");
+  store.dispose();
+});
+
+test("a new epoch owns handle versions and clears all previous local response state", () => {
+  const store = createCodexInteractionState("thread");
+  store.applySnapshot(envelope([interaction("one", { status: "resolved", version: 9 })], 9));
+  const old = store.beginRead("one");
+  store.state.actions.one = { status: "unknown", responseId: "old-response" };
+  store.state.responseErrors.one = "old error";
+  store.applyUpdate({ interaction: interaction("one", { itemId: "replacement-item" }), epoch: "replacement", revision: 1 });
+  assert.equal(store.isReadCurrent(old), false);
+  assert.equal(store.state.interactions.one.status, "pending");
+  assert.equal(store.state.interactions.one.itemId, "replacement-item");
+  assert.equal(store.state.actions.one, undefined);
+  assert.equal(store.state.responseErrors.one, undefined);
+  assert.equal(store.state.revision, 1);
+  store.dispose();
+});
+
+test("accepted snapshots remove orphan and terminal actions while preserving active unknown submissions", () => {
+  const store = createCodexInteractionState("thread");
+  store.applySnapshot(envelope([interaction(), interaction("terminal", { status: "resolved" })]));
+  store.state.actions.one = { status: "unknown", responseId: "current-response" };
+  for (const id of ["orphan", "terminal"]) {
+    store.state.actions[id] = { status: "unknown", responseId: "old-response" };
+    store.state.responseErrors[id] = "old error";
+    store.state.drafts[id] = { answer: "old answer" };
+  }
+  store.applySnapshot(envelope([interaction()], 0));
+  assert.equal(store.state.actions.orphan.status, "unknown");
+  store.applySnapshot(envelope([interaction()], 2));
+  assert.deepEqual(Object.keys(store.state.actions), ["one"]);
+  assert.equal(store.state.actions.one.status, "unknown");
+  assert.deepEqual(Object.keys(store.state.responseErrors), []);
+  assert.deepEqual(Object.keys(store.state.drafts), []);
+  store.applySnapshot(envelope([interaction("one", { status: "unknown", version: 2 })], 3));
+  assert.equal(store.state.actions.one.status, "unknown");
+  store.applySnapshot(envelope([interaction("one", { status: "resolved", version: 3 })], 4));
+  assert.equal(store.state.actions.one, undefined);
+  store.dispose();
+});
+
 test("invalid and cross-thread snapshots preserve known pending interactions", () => {
   const store = createCodexInteractionState("thread");
   store.applySnapshot(envelope([interaction()]));

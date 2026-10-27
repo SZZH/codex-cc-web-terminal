@@ -61,9 +61,9 @@ const canAnswerQuestions = computed(() => canSubmit.value &&
 const canSend = computed(() => canSubmit.value &&
   canSendComposerMessage(state.value?.draft.text, composerOptions.value.attachments));
 const statusText = computed(() => state.value?.persistenceError || active.value?.optionError.value || state.value?.requestListError ||
-  (state.value?.errorOwner === "older" && active.value?.olderError.value ? "" : state.value?.error) || state.value?.historyReadError ||
+  (state.value?.errorOwner === "older" && active.value?.olderError.value ? "" : state.value?.error) || state.value?.historyReadError || state.value?.questionSyncError ||
   state.value?.thread?.syncError || active.value?.notice.value || active.value?.configError.value || (state.value?.connection === "offline" ? "实时连接恢复中，消息与发送状态会自动同步。" : ""));
-const canRetryReads = computed(() => Boolean(state.value?.historyReadError || state.value?.requestListError ||
+const canRetryReads = computed(() => Boolean(state.value?.historyReadError || state.value?.questionSyncError || state.value?.requestListError ||
   active.value?.optionError.value || active.value?.configError.value));
 const displayModel = computed(() => active.value?.buildDisplayModel(snapshot.value || {}, { assistantName: "Codex" }) || { turns: [] });
 const hasDisplayItems = computed(() => displayModel.value.turns.some((turn) =>

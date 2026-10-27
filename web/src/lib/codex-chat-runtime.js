@@ -10,6 +10,7 @@ import { createCodexRuntimeErrors } from "./codex-runtime-errors.js";
 import { createCodexInteractionRuntime } from "./codex-interactions/runtime.js";
 import { createCodexConnection } from "./codex-connection.js";
 import { pendingDesktopQuestions } from "./codex-question-dock.js";
+import { createCodexQuestionSync } from "./codex-question-sync.js";
 
 export function createCodexChatRuntime({ store, request, createSocket,
   location = globalThis.location, newId = () => globalThis.crypto?.randomUUID?.() || `request-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -44,6 +45,7 @@ export function createCodexChatRuntime({ store, request, createSocket,
   const cancellations = new Map();
   const interactions = createCodexInteractionRuntime({ store: store.interactions, base, call,
     isDisposed: () => disposed, onSettled: () => schedulePoll() });
+  const questions = createCodexQuestionSync({ store, call, base, isDisposed: () => disposed, yieldPage });
   const { loadItems } = createCodexHistoryItems({ store, call, base, isDisposed: () => disposed,
     onItems: (turnId) => { void syncVisibleDetails(turnId); } });
   const { loadOlder, hasOlderHistory } = createCodexHistoryWindow({ store, call, base, loadItems, errors, isDisposed: () => disposed });
@@ -52,9 +54,10 @@ export function createCodexChatRuntime({ store, request, createSocket,
   const { hydrateSummaryTurns, syncItems, syncLatestItems, setProcessExpanded, setTurnVisibility } = hydration;
   const { refreshLatest, refreshMetadata, refreshLatestTurns, readRequestList, needsRecovery: needsHistoryRecovery,
     dispose: disposeReads } = createCodexReadRefresh({
-    store, call, base, isDisposed: () => disposed, onTurns: hydrateSummaryTurns,
+    store, call, base, isDisposed: () => disposed, onTurns: (turns) => { void questions.refresh(); return hydrateSummaryTurns(turns); },
     serverRequest, onSettled: schedulePoll, reconcileDismissedRequests, refreshInteractions: interactions.refresh,
-    supportsInitialHistory, checkInitialHistorySupport, onInitialItems: syncVisibleDetails,
+    supportsInitialHistory, checkInitialHistorySupport,
+    onInitialItems: (turnId) => { void questions.refresh(); return syncVisibleDetails(turnId); },
     onMetadataRead: () => { nextCapabilityReadAt = now() + 10_000; }
   });
 
@@ -83,6 +86,7 @@ export function createCodexChatRuntime({ store, request, createSocket,
             reconcile: isCodexTerminal(state.turns[result.metadataTurnId].status) });
         }
         if (!result.ignored) { errors.succeed(eventToken); void syncVisibleDetails(); }
+        if (!result.ignored && (result.sync || result.metadataTurnId || event.type === "turn.upsert")) void questions.refresh();
         schedulePoll();
       } catch (error) { errors.fail(eventToken, error); }
     }
@@ -465,6 +469,7 @@ export function createCodexChatRuntime({ store, request, createSocket,
     disposed = true; store.beginSocket(); connection.dispose();
     errors.dispose();
     interactions.dispose();
+    questions.dispose();
     disposeReads();
     readRequests.dispose();
     visibility?.removeEventListener?.("visibilitychange", visibilityChanged);

@@ -181,6 +181,12 @@ netstat -ano | findstr :5173
 
 ## Changelog
 
+### `v0.4.7`
+
+- Rejected delayed question answers after their source turn ends or changes, with another validation immediately before desktop dispatch.
+- Cleared native question panels when history confirms completion even if the live notification is missing, and prevented late responses from reviving expired interactions.
+- Reconciled questions independently of the visible history window using bounded background reads, so long conversations reveal unanswered questions without repeating accepted desktop answers.
+
 ### `v0.4.6`
 
 - Synchronized question reminders with the current desktop turn: completed, stopped, and superseded questions leave the floating panel and remain as read-only history, restoring the mobile composer without clearing drafts.

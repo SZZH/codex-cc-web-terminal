@@ -11,6 +11,7 @@ import { CodexThreadService } from "../src/sessions/codex/threadService.js";
 import { createBaseConfig } from "./helpers/backendTestUtils.js";
 import { describeMcpForm, buildMcpFormResponse } from "../web/src/lib/codex-interactions/form.js";
 import { capabilityError } from "../src/sessions/codex/interactions/responses.js";
+import { handleCodexV2Route } from "../src/routes/codexV2.js";
 
 function fixture(t, options = {}) {
   const { send, ...serviceOptions } = options;
@@ -152,6 +153,109 @@ test("file evidence and turn terminal cleanup do not clear standalone MCP callba
   f.bridge.emit("notification", { method: "thread/closed", params: { threadId: "thread-123" } });
   assert.equal(f.service.get("thread-123", standalone.id).interaction.status, "unavailable");
 });
+
+for (const state of ["pending", "submitting", "submitted", "unknown"]) {
+  test(`confirmed history closes ${state} callbacks without claiming an answer or replaying responses`, async (t) => {
+    let callback;
+    const f = fixture(t, { send: (done) => {
+      callback = done;
+      if (state !== "submitting") done(state === "unknown" ? new Error("write uncertain") : undefined);
+    } });
+    const entry = f.receive("item/tool/requestUserInput", { isBlocking: true, questions: [] });
+    const answer = { responseId: randomUUID(), response: { answers: {} } };
+    const response = state === "pending" ? null : f.service.respond("thread-123", entry.id, answer);
+    if (state !== "submitting") await response;
+    assert.equal(f.service.get("thread-123", entry.id).interaction.status, state);
+    const previous = f.service.list("thread-123");
+    f.service.reconcileTurns("thread-123", [{ id: "turn-123", status: "completed", statusSource: "history", statusConfirmed: true }]);
+    const closed = f.service.get("thread-123", entry.id);
+    assert.equal(closed.interaction.status, "unavailable");
+    assert.equal(closed.interaction.error.code, "turn_completed");
+    assert.equal(closed.epoch, previous.epoch);
+    assert.ok(closed.revision > previous.revision);
+    assert.equal(f.service.records.get(entry.id).request, null);
+    assert.equal(f.bridge.inbound.requests.size, 0);
+    if (response) {
+      if (state === "submitting") assert.equal((await response).interaction.status, "unavailable");
+      assert.equal((await f.service.respond("thread-123", entry.id, answer)).interaction.status, "unavailable");
+      callback();
+      callback(new Error("late failure"));
+    } else {
+      await assert.rejects(f.service.respond("thread-123", entry.id, answer), (error) => error.code === "interaction_unavailable");
+    }
+    f.bridge.emit("notification", { method: "serverRequest/resolved", params: { threadId: "thread-123", requestId: f.messages[0]?.id } });
+    f.service.reconcileTurns("thread-123", [{ id: "turn-123", status: "completed" }]);
+    assert.deepEqual(f.service.get("thread-123", entry.id), closed);
+    assert.equal(f.messages.length, state === "pending" ? 0 : 1);
+    assert.equal(f.events.at(-1)[2].interaction.status, "unavailable");
+  });
+}
+
+test("history cleanup requires confirmed terminal evidence for the exact thread and turn", (t) => {
+  const f = fixture(t, { ownsThread: () => true });
+  const original = f.receive("item/fileChange/requestApproval");
+  f.receive("item/fileChange/requestApproval", { turnId: "other-turn" });
+  f.receive("mcpServer/elicitation/request", { turnId: null, serverName: "auth", mode: "url", elicitationId: "auth", url: "https://example.com", message: "Open" });
+  f.receive("item/fileChange/requestApproval", { threadId: "other-thread" });
+  const before = f.service.list("thread-123");
+  for (const turn of [
+    { status: "inProgress" }, { status: "unknown", statusConfirmed: false },
+    { status: "completed", statusConfirmed: false }, { status: "failed", statusSource: "unconfirmed-history" },
+    { status: "interrupted" }, { status: "aborted", completedAt: null }, { status: "cancelled", completedAt: "invalid" },
+    { status: "completed", threadId: "other-thread" }, { id: "different-turn", status: "completed" }
+  ]) f.service.reconcileTurns("thread-123", [{ id: "turn-123", ...turn }]);
+  f.service.reconcileTurns("unrelated-thread", [{ id: "turn-123", status: "completed" }]);
+  assert.deepEqual(f.service.list("thread-123"), before);
+  f.service.reconcileTurns("thread-123", [{ id: "turn-123", status: "interrupted", statusConfirmed: true,
+    statusSource: "history", completedAt: 1792130410 }]);
+  assert.equal(f.service.get("thread-123", original.id).interaction.error.code, "turn_completed");
+  assert.ok(f.service.list("thread-123").interactions.filter((entry) => entry.id !== original.id).every((entry) => entry.status === "pending"));
+  assert.equal(f.service.list("other-thread").interactions[0].status, "pending");
+});
+
+for (const resource of ["turns", "initial-history"]) {
+  test(`${resource} HTTP read reconciles real native interactions before the next interaction snapshot`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-interaction-history-"));
+    const config = createBaseConfig(root);
+    const bridge = new AppServerBridge(config);
+    const messages = [];
+    const turn = { id: "turn-123", status: "interrupted", completedAt: null, items: [], itemsView: "summary" };
+    bridge.bindSocket({ readyState: 1, on() {}, send(payload, done) { messages.push(JSON.parse(payload)); done?.(); } });
+    bridge.ensureReady = async () => {};
+    bridge.request = async (method) => {
+      if (method === "thread/read") return { thread: { id: "thread-123", cwd: root, historyMode: "paginated", status: { type: "notLoaded" } } };
+      if (method === "thread/turns/list") return { data: [structuredClone(turn)], nextCursor: null };
+      if (method === "thread/items/list") return { data: [], nextCursor: null };
+      throw new Error(`Unexpected RPC: ${method}`);
+    };
+    const service = new CodexThreadService({ config, bridge, sessionManager: { codexModelCatalog: () => [] } });
+    t.after(() => { service.shutdown(); bridge.resetConnectionState(); fs.rmSync(root, { recursive: true, force: true }); });
+    service.loaded.add("thread-123");
+    const runtime = { codexThreads: service, requireAuthorized: () => true,
+      json: (ctx, status, body) => { ctx.status = status; ctx.body = body; } };
+    const get = async (suffix) => {
+      const ctx = { url: `/api/v2/codex/threads/thread-123/${suffix}`, method: "GET" };
+      assert.equal(await handleCodexV2Route(ctx, runtime), true);
+      assert.equal(ctx.status, 200, ctx.body?.error);
+      return ctx.body;
+    };
+    bridge.handleMessage(JSON.stringify({ id: "native-question", method: "item/tool/requestUserInput",
+      params: { threadId: "thread-123", turnId: "turn-123", itemId: "question", isBlocking: true, questions: [] } }));
+    const entry = (await get("interactions")).interactions[0];
+    await service.interactions.respond("thread-123", entry.id, { responseId: randomUUID(), response: { answers: {} } });
+    const uncertain = await get(resource);
+    assert.equal((uncertain.turns || uncertain.turnsPage.turns)[0].status, "unknown");
+    assert.equal((await get("interactions")).interactions[0].status, "submitted");
+    Object.assign(turn, { status: "completed", completedAt: 1792130410, statusSource: "history", statusConfirmed: true });
+    await get(resource);
+    const recovered = (await get("interactions")).interactions[0];
+    assert.equal(recovered.status, "unavailable");
+    assert.equal(recovered.error.code, "turn_completed");
+    assert.equal(bridge.inbound.requests.size, 0);
+    assert.equal(messages.length, 1, "history recovery must not send another answer");
+    assert.deepEqual(service.requests.list("thread-123"), [], "native cleanup cannot depend on a durable message receipt");
+  });
+}
 
 for (const method of ["item/fileChange/requestApproval", "item/commandExecution/requestApproval"]) {
   test(`${method} accepts exactly the four plain decisions`, () => {

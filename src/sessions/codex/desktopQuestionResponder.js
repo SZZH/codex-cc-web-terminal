@@ -5,6 +5,11 @@ const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const active = (turn) => ["inProgress", "running"].includes(turn?.status);
 const identity = (callId, index) => JSON.stringify(["request_user_input_async", callId, index]);
 
+function assertCurrentTurn(turn, expectedTurnId) {
+  if (turn?.id !== expectedTurnId || !active(turn))
+    throw fail("此问题所属回复已结束或已切换，请刷新会话。", "question_turn_changed");
+}
+
 function validate(callId, body) {
   if (!/^call_[\w-]{1,500}$/.test(callId || "") || !body ||
     Object.keys(body).some((key) => !["clientRequestId", "expectedTurnId", "index", "answer"].includes(key)) ||
@@ -81,8 +86,7 @@ export class DesktopQuestionResponder {
     const latestTurn = latest.turns?.at(-1);
     if (latestTurn?.id !== page.turns.at(-1)?.id)
       throw fail("会话刚刚有新回复，请稍后重新提交回答。", "question_history_changed");
-    if (!latestTurn || !["inProgress", "running", "completed", "failed", "interrupted", "aborted"].includes(latestTurn.status))
-      throw fail("会话状态尚未确认，请刷新后回答。", "question_turn_changed");
+    assertCurrentTurn(latestTurn, reply.expectedTurnId);
     if (this.isClosed()) throw fail("服务正在重启，请稍后重试。", "service_unavailable", 503);
     const text = `<send_user_message_question_reply>\n${JSON.stringify([{ questionItemId: identity(reply.callId, reply.index), question: entry.title, answer: reply.answer }])}\n</send_user_message_question_reply>`;
     const receipt = this.requests.receive(threadId, { clientRequestId, input: { text, attachments: [] }, options: {},
@@ -90,13 +94,13 @@ export class DesktopQuestionResponder {
     this.update(threadId, receipt.id, { executionRoute: "desktopQuestion", error: null });
     // The durable dispatch marker precedes all IPC writes, including after restart.
     const dispatching = this.update(threadId, receipt.id, { state: "dispatching" });
-    void this.dispatch(dispatching, owner, active(latestTurn));
+    void this.dispatch(dispatching, owner);
     return dispatching;
   }
 
   async assertUnanswered(threadId, reply, page, signal) {
-    // Replies remain valid after their source turn ends, and their accepted
-    // user message can belong to any subsequent turn. Scan only on submission.
+    // An earlier delivery can be recorded in a subsequent turn, including
+    // legacy continuations. Preserve duplicate checks across that history.
     const turnCursors = new Set();
     for (;;) {
       for (const turn of [...(page.turns || [])].reverse()) {
@@ -127,14 +131,23 @@ export class DesktopQuestionResponder {
     }
   }
 
-  async dispatch(receipt, owner, running) {
+  async dispatch(receipt, owner) {
     const key = JSON.stringify([receipt.threadId, receipt.id]);
     if (this.sending.has(key)) return;
     this.sending.add(key);
+    let ready = false;
     try {
-      const send = running ? this.client.steer.bind(this.client) : this.client.startQuestion.bind(this.client);
-      const result = await send(receipt.threadId, { owner, clientUserMessageId: receipt.id,
-        expectedTurnId: receipt.expectedTurnId, input: [{ type: "text", text: receipt.input.text, text_elements: [] }] });
+      const result = await this.client.steer(receipt.threadId, { owner, clientUserMessageId: receipt.id,
+        expectedTurnId: receipt.expectedTurnId, input: [{ type: "text", text: receipt.input.text, text_elements: [] }],
+        beforeSend: async () => {
+          // Receipt persistence and native owner discovery can outlive the source
+          // turn. Recheck after both; follower IPC still has no atomic turn guard.
+          const latest = await this.reader.listTurns(receipt.threadId, { limit: 1, signal: AbortSignal.timeout(8_000) });
+          if (this.isClosed()) throw fail("服务正在重启，请稍后重试。", "service_unavailable", 503);
+          assertCurrentTurn(latest.turns?.at(-1), receipt.expectedTurnId);
+          ready = this.requests.get(receipt.threadId, receipt.id)?.state === "dispatching";
+          return ready;
+        } });
       if (!result?.turnId) throw Object.assign(fail("回答接收状态尚未确认。"), { uncertain: true });
       const current = this.requests.get(receipt.threadId, receipt.id);
       if (!["dispatching", "unknown"].includes(current?.state)) return;
@@ -142,6 +155,7 @@ export class DesktopQuestionResponder {
     } catch (error) {
       const current = this.requests.get(receipt.threadId, receipt.id);
       if (!["dispatching", "unknown"].includes(current?.state)) return;
+      if (current.state === "unknown" && !ready) return;
       const uncertain = Boolean(error.uncertain);
       this.update(receipt.threadId, receipt.id, { state: uncertain ? "unknown" : "rejected", error: {
         code: uncertain ? "confirmation_required" : error.code || "desktop_answer_rejected",

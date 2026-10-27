@@ -107,6 +107,170 @@ test("a multi-client resolved event wins a late failed response without leaving 
   runtime.dispose();
 });
 
+test("late POST failures and successes cannot revive actions after removal or an epoch reset", async (t) => {
+  for (const epoch of ["registry", "replacement"]) for (const outcome of ["failure", "success"]) {
+    await t.test(`${epoch}: ${outcome}`, async () => {
+      const pending = deferred();
+      const { runtime, store, calls } = fixture(() => pending.promise);
+      store.setDraft("one", { question: "secret" });
+      const response = runtime.respond("one", { answers: {} });
+      store.applySnapshot({ interactions: [], epoch, revision: 2 });
+      store.applySnapshot({ interactions: [], epoch, revision: 3 });
+      if (outcome === "failure") pending.reject(new Error("late connection lost"));
+      else pending.resolve(packet(row({ status: "submitted", version: 8 })));
+      assert.equal(await response, null);
+      assert.equal(store.state.interactions.one, undefined);
+      assert.deepEqual(Object.keys(store.state.actions), []);
+      assert.deepEqual(Object.keys(store.state.responseErrors), []);
+      assert.deepEqual(Object.keys(store.state.drafts), []);
+      assert.equal(runtime.needsRecovery(), false);
+      assert.equal(calls.length, 1);
+      runtime.dispose();
+    });
+  }
+});
+
+test("late POST completion cannot change or deduplicate a replacement request with the same handle", async (t) => {
+  for (const outcome of ["failure", "success"]) await t.test(outcome, async () => {
+    const old = deferred(), current = deferred();
+    const { runtime, store, calls } = fixture(() => calls.length === 1 ? old.promise : current.promise);
+    const previous = runtime.respond("one", { answers: {} });
+    store.applySnapshot({ interactions: [row({ itemId: "replacement-item" })], epoch: "replacement", revision: 1 });
+    store.setDraft("one", { question: "new answer" });
+    const next = runtime.respond("one", { answers: {} });
+    assert.notEqual(previous, next);
+    assert.equal(calls.length, 2);
+    if (outcome === "failure") old.reject(Object.assign(new Error("old rejection"), { status: 400 }));
+    else old.resolve(packet(row({ status: "submitted", version: 8 })));
+    await previous;
+    assert.equal(store.state.epoch, "replacement");
+    assert.equal(store.state.interactions.one.itemId, "replacement-item");
+    assert.equal(store.state.actions.one.status, "submitting");
+    assert.equal(store.state.drafts.one.question, "new answer");
+    assert.equal(store.state.responseErrors.one, undefined);
+    assert.equal(runtime.respond("one", { answers: {} }), next);
+    current.resolve({ ...packet(row({ itemId: "replacement-item", status: "submitted", version: 2 })), epoch: "replacement" });
+    await next;
+    assert.equal(store.state.interactions.one.status, "submitted");
+    runtime.dispose();
+  });
+});
+
+test("late checks cannot publish errors or restore rows after removal or an epoch reset", async (t) => {
+  for (const epoch of ["registry", "replacement"]) for (const outcome of ["failure", "success"]) {
+    await t.test(`${epoch}: ${outcome}`, async () => {
+      const pending = deferred();
+      const { runtime, store } = fixture(() => pending.promise);
+      const check = runtime.check("one");
+      store.applySnapshot({ interactions: [], epoch, revision: 2 });
+      store.applySnapshot({ interactions: [], epoch, revision: 3 });
+      if (outcome === "failure") pending.reject(Object.assign(new Error("gone"), { status: 404 }));
+      else pending.resolve(packet(row({ status: "resolved", version: 8 })));
+      assert.equal(await check, null);
+      assert.equal(store.state.interactions.one, undefined);
+      assert.deepEqual(Object.keys(store.state.responseErrors), []);
+      assert.equal(runtime.needsRecovery(), false);
+      runtime.dispose();
+    });
+  }
+});
+
+test("disposed response and check operations cannot restore local state", async (t) => {
+  for (const method of ["respond", "check"]) for (const outcome of ["failure", "success"]) {
+    await t.test(`${method}: ${outcome}`, async () => {
+      const pending = deferred();
+      const { runtime, store, calls } = fixture(() => pending.promise);
+      store.setDraft("one", { question: "secret" });
+      const operation = runtime[method]("one", { answers: {} });
+      runtime.dispose();
+      if (outcome === "failure") pending.reject(new Error("late failure"));
+      else pending.resolve(packet(row({ status: "submitted", version: 2 })));
+      assert.equal(await operation, null);
+      assert.equal(store.state.interactions.one.status, "pending");
+      assert.deepEqual(Object.keys(store.state.actions), []);
+      assert.deepEqual(Object.keys(store.state.responseErrors), []);
+      assert.deepEqual(Object.keys(store.state.drafts), []);
+      assert.equal(runtime.needsRecovery(), false);
+      assert.equal(calls.length, 1);
+    });
+  }
+});
+
+test("an old check cannot deduplicate or clear a replacement check using the same handle", async () => {
+  const old = deferred(), current = deferred();
+  const { runtime, store, calls } = fixture(() => calls.length === 1 ? old.promise : current.promise);
+  const previous = runtime.check("one");
+  store.applySnapshot({ interactions: [], epoch: "registry", revision: 2 });
+  store.applySnapshot({ interactions: [], epoch: "registry", revision: 3 });
+  store.applySnapshot({ interactions: [row({ itemId: "replacement-item" })], epoch: "registry", revision: 4 });
+  const next = runtime.check("one");
+  assert.notEqual(previous, next);
+  assert.equal(calls.length, 2);
+  old.reject(Object.assign(new Error("old handle gone"), { status: 404 }));
+  await previous;
+  assert.equal(store.state.responseErrors.one, undefined);
+  assert.equal(runtime.check("one"), next);
+  current.resolve(packet(row({ itemId: "replacement-item", status: "resolved", version: 2 }), 5));
+  await next;
+  assert.equal(store.state.interactions.one.status, "resolved");
+  runtime.dispose();
+});
+
+test("a failed check started before a new submission cannot overwrite that submission", async () => {
+  const reading = deferred(), posting = deferred();
+  const { runtime, store } = fixture((url, options) => options.method === "POST" ? posting.promise : reading.promise);
+  const check = runtime.check("one");
+  const response = runtime.respond("one", { answers: {} });
+  reading.reject(new Error("old read failed"));
+  await check;
+  assert.equal(store.state.actions.one.status, "submitting");
+  assert.equal(store.state.responseErrors.one, undefined);
+  posting.resolve(packet(row({ status: "submitted", version: 2 })));
+  await response;
+  runtime.dispose();
+});
+
+test("a server submitting event preserves the current POST result after clearing its local action", async () => {
+  const pending = deferred();
+  const { runtime, store } = fixture(() => pending.promise);
+  const response = runtime.respond("one", { answers: {} });
+  store.applyUpdate(packet(row({ status: "submitting", version: 2 })));
+  assert.equal(store.state.actions.one, undefined);
+  pending.resolve(packet(row({ status: "submitted", version: 3 })));
+  await response;
+  assert.equal(store.state.interactions.one.status, "submitted");
+  runtime.dispose();
+});
+
+test("current unknown delivery stays locked through failed checks and pending snapshots", async () => {
+  const { runtime, store, calls } = fixture((url, options) => {
+    if (options.method === "POST") throw new Error("delivery uncertain");
+    throw Object.assign(new Error("not found"), { status: 404 });
+  });
+  await runtime.respond("one", { answers: {} });
+  store.applySnapshot({ interactions: [row()], epoch: "registry", revision: 2 });
+  assert.equal(store.state.actions.one.status, "unknown");
+  assert.equal(await runtime.respond("one", { answers: {} }), null);
+  assert.equal(calls.filter((call) => call.method === "POST").length, 1);
+  assert.equal(runtime.needsRecovery(), true);
+  store.applySnapshot({ interactions: [], epoch: "registry", revision: 3 });
+  assert.equal(store.state.actions.one, undefined);
+  assert.equal(runtime.needsRecovery(), false);
+  runtime.dispose();
+});
+
+test("a failed refresh from the previous epoch cannot create a persistent recovery error", async () => {
+  const pending = deferred();
+  const { runtime, store } = fixture(() => pending.promise);
+  const refresh = runtime.refresh();
+  store.applySnapshot({ interactions: [], epoch: "replacement", revision: 1 });
+  pending.reject(new Error("old read failed"));
+  await refresh;
+  assert.equal(store.state.error, "");
+  assert.equal(runtime.needsRecovery(), false);
+  runtime.dispose();
+});
+
 test("the real chat runtime refreshes interactions on open reconnect foreground sync and explicit reads while preserving composer state", async () => {
   const store = createCodexChatStore("thread"), calls = [], sockets = [], listeners = new Map();
   store.state.draft = { text: "draft stays", attachments: [{ id: "picture", uploadedId: "image" }] };

@@ -588,6 +588,7 @@ export class CodexThreadService {
   }
 
   reconcileRequests(threadId, turns, requests = this.requests.list(threadId)) {
+    this.interactions.reconcileTurns(threadId, turns);
     // Removed queue receipts are no longer pending. Exact official identities
     // can still reveal consumption, including after the recent journal window.
     const matched = new Map(requests.map((request) => [request.id, request]));

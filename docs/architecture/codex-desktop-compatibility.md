@@ -123,13 +123,13 @@ metadata 与 turns 各自保留读取失败和代次，汇总为 `historyReadErr
 | MCP 表单 | 标准primitive、required、数值/长度/数量/format、单多选与标题；兼容同结构的openai/form/openaiForm和安全根注解 |
 | MCP URL | 安全HTTP(S)链接，明确打开后再确认，打开本身不是授权完成；支持拒绝/取消 |
 
-`availableDecisions` 存在时其中内嵌的 typed 规则本身就是权威原提案，不要求可空 `proposed*` 冗余重复；回答必须精确等于原可选值，不能改写规则。列表不存在时才依据 proposal 构造决定。回答先原子claim，再向原socket至多写一次；同responseId/内容摘要重试只取回执，其他答复冲突。发送callback成功仅submitted，官方 `serverRequest/resolved` 才resolved。未知发送只GET核对，不自动重放；断线/线程关闭/对应turn终态使句柄失效，null-turn独立MCP不随无关turn清理。无人类回答超时；无网页观察者仍保留回调，网页切走不自动批准或中断。
+`availableDecisions` 存在时其中内嵌的 typed 规则本身就是权威原提案，不要求可空 `proposed*` 冗余重复；回答必须精确等于原可选值，不能改写规则。列表不存在时才依据 proposal 构造决定。回答先原子claim，再向原socket至多写一次；同responseId/内容摘要重试只取回执，其他答复冲突。发送callback成功仅submitted，官方 `serverRequest/resolved` 才resolved。未知发送只GET核对，不自动重放；断线/线程关闭/对应turn终态使句柄失效；即使完成通知缺失，HTTP 历史读取确认的终态也会将同轮未决交互标为 unavailable/turn_completed，不伪造已回答。无结束证据的中断投影不能清理交互，null-turn独立MCP不随无关turn清理。无人类回答超时；无网页观察者仍保留回调，网页切走不自动批准或中断。
 
 pending最多128、每线程32，终态最多256；展示参数512KiB、回答1MiB、对象深度64，fileChange证据最多32项。超过容量明确拒绝新请求，不静默覆盖已有。只接管本V2已加载或网页持有执行的官方请求，不从历史、桌面等待标记或任意threadId制造响应权；桌面其他连接及尚未关联的独立子线程仍由原端处理。动态工具、外部token刷新、attestation属于宿主能力，不开放浏览器通用RPC；时钟请求可由主机响应。
 
 V2新建/恢复线程仅在线程config启用 `features.default_mode_request_user_input`，本机0.156.1已验证普通Default模式实际提问并继续；保留原reasoning/模型/权限，不修改全局配置。新增 `manual-review` 为read-only/on-request/user，旧三模式不变。SQLite/rollout共同识别受支持的只读策略+on-request；未知或自定义窄权限不被提升，SQLite不含reviewer所以不声称完整恢复任意外部策略。人工模式不写猜测的桌面全局agent-mode，CC/claude/json_exec明确拒绝。仅Codex V2透传四选项，旧组件仍默认三项。
 
-前端独立interaction state/runtime和composer-top面板复用原WS序列门禁、读取期限及单一轮询。registry epoch/revision/version防旧快照复活；初始、重连、前台、缺口和显式核对从服务端恢复，不持久化审批或秘密答案。普通草稿/附件、设置保存、回执初读与unknown发送屏障保持。面板默认两个常用操作、其他决策及证据按需展开，使用可读语义标签；resolved自动撤去，submitted/unknown保留核对。长正文和短屏宿主各自内部滚动，不增加document滚动或抢草稿焦点。
+前端独立interaction state/runtime和composer-top面板复用原WS序列门禁、读取期限及单一轮询。registry epoch/revision/version 与交互身份共同防止旧快照、迟到 POST/GET 和旧失败回调复活已移除请求；权威移除清理本地 action，有效 unknown 回执继续锁定，旧操作的清理也不能删除新请求；初始、重连、前台、缺口和显式核对从服务端恢复，不持久化审批或秘密答案。普通草稿/附件、设置保存、回执初读与unknown发送屏障保持。面板默认两个常用操作、其他决策及证据按需展开，使用可读语义标签；resolved自动撤去，submitted/unknown保留核对。长正文和短屏宿主各自内部滚动，不增加document滚动或抢草稿焦点。
 
 当前不引入Ajv，未知嵌套/ref/pattern等复杂扩展schema明确禁accept，仍可拒绝/取消；设备 `openai/userVerification` 无真实proof能力，也不能用普通按钮假确认。这些边界不等于支持任意扩展表单、设备验证或跨桌面连接审批。
 
@@ -137,13 +137,15 @@ V2新建/恢复线程仅在线程config启用 `features.default_mode_request_use
 
 `CodexQuestionDock` 将待回答问题与原生交互固定在消息流和可滚动输入区之外，沿用现有暖色和像素状态图标。新问题自动展开，收起后保留数量提醒；长内容在面板内滚动。当前活动问题在历史中只提供打开悬浮区的入口，避免两份回答草稿。回答前校验与提醒共用 `pendingDesktopQuestions`，读取全部已加载 item，不受正文显示窗口裁剪影响；原始题目索引保持不变。官方回答或来源轮退出最新活动状态后撤去提醒，实时事件与已有 HTTP 轮次核对共用同一投影。结束提醒不清除未确认回答回执，也不放开发送屏障；后到的旧问题不能重新展开。原生交互仅在 `resolved` 或明确 `turn_completed` / `thread_closed` 时自动撤去，断线、未知结果和其他失效状态仍保留核对。该选择器不额外拉取全部旧历史，尚未加载的问题不在本次保证范围内。
 
+`codex-question-sync` 为当前活动轮维护独立的提问/回答索引，首屏完成后后台串行分页，每页最多 90 条；不把扫描到的过程输出装入可见时间线，扫描完成后按尾锚只读增量。新问题完成对应历史核对后才可操作，避免先弹出已回答的问题；未读完或失败不推断为未回答，保留游标重试并显示错误。未接受的原生回答按 ID 每次最多补查 4 条详情，覆盖尾锚之前的状态变化；长回答封装按需读取单条详情。扫描派生状态使用独立 revision 域，不能让进行中的 HTTP 终态读取失效；切轮、epoch 变化和销毁取消旧扫描。
+
 640px 及以下视口中，展开提问会临时隐藏普通输入区，为问题和选项让出剩余高度；输入组件保持挂载，点击“返回聊天”或所有问题处理完毕后恢复，普通草稿和排队状态不清空。标题压为一行，内嵌表单移除重复装饰但保留题干、选项说明与响应状态；短内容自然收缩，长内容由单层正文滚动及底部提交操作承载。
 
 桌面 owner 存在且支持不可信应用输入时，metadata 发布 `capabilities.desktopQuestionAnswers`。网页通过受认证和同源校验的 `POST /api/v2/codex/threads/:threadId/questions/:callId/respond` 提交请求身份、来源轮、问题索引和回答；服务端读取官方原始问题构造原生回答封装，不接受任意 prompt、IPC 方法、目标客户端或权限设置。显式提交才分页核对来源问题之后的全部相关历史，遇到截断的用户消息读取完整详情；历史不完整、已回答或最新轮发生变化均拒绝发送，不以首屏未加载推断未回答。
 
 前端 capabilities 使用独立版本保护，metadata 等待期间的 status/name 更新不能丢弃新的回答能力；旧能力响应和旧连接 epoch 仍不能覆盖新值。当前活动轮有已加载未回答桌面问题且能力缺失或不可用时，通过现有调度每 10 秒重试 metadata，后台至少间隔 30 秒，回到前台立即检查；活动轮仍通过已有有界轮次和消息读取同步状态。明确可用、已回答或问题不再活动后停止该能力探测，旧历史问题不会让空闲会话持续轮询。临时初始化、发送门禁和能力不可用统一显示“回答暂不可用”，不再误报必须在桌面作答。服务更新不会替换已打开页面内的脚本，长时间停留的旧页面仍需重新加载一次。
 
-回答沿当前桌面 owner 的本机通道提交：有活动轮时使用 `thread-follower-steer-turn` v1，空闲时使用 `thread-follower-start-turn` v2，并继承原会话设置。问题回答不进入普通跟进队列，不占用输入框草稿，不扩大普通停止/引导能力。该适配基于桌面 26.1013.40934 的原生协议，已验证 macOS 私有 Unix socket；没有有效私有 socket 或 owner 时不提供该能力，不声称 Windows 或其他版本均兼容。桌面升级后需回归协议。
+回答沿当前桌面 owner 的本机通道提交，只允许最新且仍活动的来源轮使用 `thread-follower-steer-turn` v1；结束或切入新轮后拒绝迟到回答，不自动 start-turn。回执落盘及 owner 重查后，在 native 写入前再次核对原轮身份和状态。问题回答不进入普通跟进队列，不占用输入框草稿，不扩大普通停止/引导能力。该适配基于桌面 26.1013.40934 的原生协议，已验证 macOS 私有 Unix socket；没有有效私有 socket 或 owner 时不提供该能力，不声称 Windows 或其他版本均兼容。桌面升级后需回归协议。
 
 问题级单飞和持久请求指纹防止多标签页重复提交；写入前持久化派发状态，重启不把回答当普通消息派发。断线或确认丢失只核对，不自动重发、不降级到普通队列。恢复器每次最多读取一页轮次和一页消息，跨 tick 保存进度并覆盖后续轮，仅精确官方 clientId 可确认接收。明确失败可回问题卡重试，未知回执沿用发送锁定；失败回答不能恢复为输入框中的原始封装。官方 IPC 没有原子 expectedTurnId 条件，发送前重查仍不能完全消除 owner 切轮竞态，因此以返回的实际 turnId 和官方历史为准。
 

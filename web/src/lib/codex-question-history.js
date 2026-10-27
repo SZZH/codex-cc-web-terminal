@@ -56,7 +56,7 @@ export function questionUserText(item) {
 
 export function createQuestionHistory(state) {
   const answered = new Map(), pending = new Map();
-  for (const turn of Object.values(state.turns)) for (const item of Object.values(turn.items)) {
+  for (const turn of Object.values(state.turns)) for (const item of [...Object.values(turn.questionItems || {}), ...Object.values(turn.items)]) {
     if (!["userMessage", "steeringUserMessage"].includes(item.type) || ["failed", "rejected", "cancelled"].includes(item.status)) continue;
     if (item.type === "steeringUserMessage" && item.status !== "accepted") continue;
     for (const reply of parseQuestionReplies(questionUserText(item)) || []) answered.set(key(reply.callId, reply.index), reply.answer);
@@ -78,7 +78,9 @@ export function createQuestionHistory(state) {
     const pendingResponse = remaining.length > 0 && remaining.every((entry) => Object.hasOwn(pendingResponses, entry.id));
     // Attention belongs to the current running turn. Ending attention does not
     // manufacture an answer or discard an uncertain response receipt.
-    const active = ["inProgress", "running"].includes(turnStatus) && (!turnId || turnId === state.turnOrder.at(-1));
+    const turn = state.turns[turnId];
+    const reconciled = !turn?.questionSync || turn.questionSync.ready && Object.hasOwn(turn.questionItems || {}, question.callId);
+    const active = ["inProgress", "running"].includes(turnStatus) && (!turnId || turnId === state.turnOrder.at(-1)) && reconciled;
     return { ...question, active, answers, pendingResponses, pendingResponse,
       responseState: remaining.map((entry) => pendingResponses[entry.id]).find(Boolean) || "",
       status: remaining.length === 0 ? "answered" : "pending" };
